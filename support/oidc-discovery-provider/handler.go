@@ -71,6 +71,16 @@ func (h *Handler) serveWellKnown(w http.ResponseWriter, r *http.Request) {
 		Host:   r.Host,
 		Path:   "/keys",
 	}
+	AuthorizeURI := url.URL{
+                Scheme: urlScheme,
+                Host:   r.Host,
+                Path:   "/authorize",
+       }
+        TokenURI := url.URL{
+                Scheme: urlScheme,
+                Host:   r.Host,
+                Path:   "/token",
+       }
 
 	doc := struct {
 		Issuer  string `json:"issuer"`
@@ -78,6 +88,7 @@ func (h *Handler) serveWellKnown(w http.ResponseWriter, r *http.Request) {
 
 		// The following are required fields that we'll just hardcode response
 		// to based on SPIRE capabilities, etc.
+		TokenEndpoint                    string   `json:"token_endpoint"`
 		AuthorizationEndpoint            string   `json:"authorization_endpoint"`
 		ResponseTypesSupported           []string `json:"response_types_supported"`
 		SubjectTypesSupported            []string `json:"subject_types_supported"`
@@ -85,10 +96,10 @@ func (h *Handler) serveWellKnown(w http.ResponseWriter, r *http.Request) {
 	}{
 		Issuer:  issuerURL.String(),
 		JWKSURI: jwksURI.String(),
-
-		AuthorizationEndpoint:            "",
+                TokenEndpoint:                    TokenURI.String(),
+		AuthorizationEndpoint:            AuthorizeURI.String(),
 		ResponseTypesSupported:           []string{"id_token"},
-		SubjectTypesSupported:            []string{},
+		SubjectTypesSupported:            []string{"public"},
 		IDTokenSigningAlgValuesSupported: []string{"RS256", "ES256", "ES384"},
 	}
 
