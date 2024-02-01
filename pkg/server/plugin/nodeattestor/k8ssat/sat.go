@@ -14,7 +14,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gofrs/uuid"
+	"github.com/go-jose/go-jose/v3/jwt"
+	"github.com/gofrs/uuid/v5"
 	hclog "github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/hcl"
 	nodeattestorv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/plugin/server/nodeattestor/v1"
@@ -25,7 +26,6 @@ import (
 	nodeattestorbase "github.com/spiffe/spire/pkg/server/plugin/nodeattestor/base"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"gopkg.in/square/go-jose.v2/jwt"
 	authv1 "k8s.io/api/authentication/v1"
 )
 
@@ -261,7 +261,7 @@ func (p *AttestorPlugin) getNamesFromClaims(claims *k8s.SATClaims) (namespace st
 	return namespace, serviceAccountName, nil
 }
 
-func (p *AttestorPlugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) (*configv1.ConfigureResponse, error) {
+func (p *AttestorPlugin) Configure(_ context.Context, req *configv1.ConfigureRequest) (*configv1.ConfigureResponse, error) {
 	hclConfig := new(AttestorConfig)
 	if err := hcl.Decode(hclConfig, req.HclConfiguration); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "unable to decode configuration: %v", err)
@@ -339,7 +339,7 @@ func (p *AttestorPlugin) setConfig(config *attestorConfig) {
 	p.config = config
 }
 
-func verifyTokenSignature(keys []crypto.PublicKey, token *jwt.JSONWebToken, claims interface{}) (err error) {
+func verifyTokenSignature(keys []crypto.PublicKey, token *jwt.JSONWebToken, claims any) (err error) {
 	var lastErr error
 	for _, key := range keys {
 		if err := token.Claims(key, claims); err != nil {

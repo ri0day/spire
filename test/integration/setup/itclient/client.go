@@ -2,7 +2,7 @@ package itclient
 
 import (
 	"context"
-	"crypto/ecdsa"
+	"crypto"
 	"crypto/tls"
 	"crypto/x509"
 	"flag"
@@ -68,7 +68,7 @@ func New(ctx context.Context) *Client {
 func NewInsecure(ctx context.Context) *Client {
 	flag.Parse()
 	tlsConfig := tls.Config{
-		InsecureSkipVerify: true, // nolint: gosec // this is intentional for the integration test
+		InsecureSkipVerify: true, //nolint: gosec // this is intentional for the integration test
 	}
 	conn, err := grpc.DialContext(ctx, *serverAddrFlag, grpc.WithTransportCredentials(credentials.NewTLS(&tlsConfig)))
 	if err != nil {
@@ -81,7 +81,7 @@ func NewInsecure(ctx context.Context) *Client {
 	}
 }
 
-func NewWithCert(ctx context.Context, cert *x509.Certificate, key *ecdsa.PrivateKey) *Client {
+func NewWithCert(ctx context.Context, cert *x509.Certificate, key crypto.Signer) *Client {
 	flag.Parse()
 
 	tlsConfig := tls.Config{
@@ -91,7 +91,7 @@ func NewWithCert(ctx context.Context, cert *x509.Certificate, key *ecdsa.Private
 				PrivateKey:  key,
 			}, nil
 		},
-		InsecureSkipVerify: true, // nolint: gosec // this is intentional for the integration test
+		InsecureSkipVerify: true, //nolint: gosec // this is intentional for the integration test
 	}
 	conn, err := grpc.DialContext(ctx, *serverAddrFlag, grpc.WithTransportCredentials(credentials.NewTLS(&tlsConfig)))
 	if err != nil {
@@ -147,6 +147,14 @@ func (c *LocalServerClient) AgentClient() agent.AgentClient {
 	return agent.NewAgentClient(c.connection)
 }
 
+func (c *LocalServerClient) BundleClient() bundle.BundleClient {
+	return bundle.NewBundleClient(c.connection)
+}
+
+func (c *LocalServerClient) EntryClient() entry.EntryClient {
+	return entry.NewEntryClient(c.connection)
+}
+
 func (c *LocalServerClient) Release() {
 	c.connection.Close()
 }
@@ -165,18 +173,18 @@ func NewLocalServerClient(ctx context.Context) *LocalServerClient {
 
 type logger struct{}
 
-func (l *logger) Debugf(format string, args ...interface{}) {
+func (l *logger) Debugf(format string, args ...any) {
 	log.Printf(format, args...)
 }
 
-func (l *logger) Infof(format string, args ...interface{}) {
+func (l *logger) Infof(format string, args ...any) {
 	log.Printf(format, args...)
 }
 
-func (l *logger) Warnf(format string, args ...interface{}) {
+func (l *logger) Warnf(format string, args ...any) {
 	log.Printf(format, args...)
 }
 
-func (l *logger) Errorf(format string, args ...interface{}) {
+func (l *logger) Errorf(format string, args ...any) {
 	log.Printf(format, args...)
 }

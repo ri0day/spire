@@ -12,6 +12,10 @@ import (
 	"github.com/spiffe/spire/proto/spire/common"
 )
 
+const (
+	hintMaximumLength = 1024
+)
+
 // RegistrationEntriesToProto converts RegistrationEntry's into Entry's
 func RegistrationEntriesToProto(es []*common.RegistrationEntry) ([]*types.Entry, error) {
 	if es == nil {
@@ -52,7 +56,7 @@ func RegistrationEntryToProto(e *common.RegistrationEntry) (*types.Entry, error)
 			if err != nil {
 				return nil, fmt.Errorf("invalid federated trust domain: %w", err)
 			}
-			federatesWith = append(federatesWith, td.String())
+			federatesWith = append(federatesWith, td.Name())
 		}
 	}
 
@@ -61,7 +65,7 @@ func RegistrationEntryToProto(e *common.RegistrationEntry) (*types.Entry, error)
 		SpiffeId:       ProtoFromID(spiffeID),
 		ParentId:       ProtoFromID(parentID),
 		Selectors:      ProtoFromSelectors(e.Selectors),
-		Ttl:            e.Ttl,
+		X509SvidTtl:    e.X509SvidTtl,
 		FederatesWith:  federatesWith,
 		Admin:          e.Admin,
 		Downstream:     e.Downstream,
@@ -69,6 +73,9 @@ func RegistrationEntryToProto(e *common.RegistrationEntry) (*types.Entry, error)
 		DnsNames:       append([]string(nil), e.DnsNames...),
 		RevisionNumber: e.RevisionNumber,
 		StoreSvid:      e.StoreSvid,
+		JwtSvidTtl:     e.JwtSvidTtl,
+		Hint:           e.Hint,
+		CreatedAt:      e.CreatedAt,
 	}, nil
 }
 
@@ -156,11 +163,6 @@ func ProtoToRegistrationEntryWithMask(ctx context.Context, td spiffeid.TrustDoma
 		}
 	}
 
-	var ttl int32
-	if mask.Ttl {
-		ttl = e.Ttl
-	}
-
 	var revisionNumber int64
 	if mask.RevisionNumber {
 		revisionNumber = e.RevisionNumber
@@ -171,6 +173,23 @@ func ProtoToRegistrationEntryWithMask(ctx context.Context, td spiffeid.TrustDoma
 		storeSVID = e.StoreSvid
 	}
 
+	var x509SvidTTL int32
+	if mask.X509SvidTtl {
+		x509SvidTTL = e.X509SvidTtl
+	}
+
+	var jwtSvidTTL int32
+	if mask.JwtSvidTtl {
+		jwtSvidTTL = e.JwtSvidTtl
+	}
+
+	var hint string
+	if mask.Hint {
+		if len(e.Hint) > hintMaximumLength {
+			return nil, fmt.Errorf("hint is too long, max length is %d characters", hintMaximumLength)
+		}
+		hint = e.Hint
+	}
 	return &common.RegistrationEntry{
 		EntryId:        e.Id,
 		ParentId:       parentID.String(),
@@ -181,8 +200,10 @@ func ProtoToRegistrationEntryWithMask(ctx context.Context, td spiffeid.TrustDoma
 		EntryExpiry:    expiresAt,
 		FederatesWith:  federatesWith,
 		Selectors:      selectors,
-		Ttl:            ttl,
 		RevisionNumber: revisionNumber,
 		StoreSvid:      storeSVID,
+		X509SvidTtl:    x509SvidTTL,
+		JwtSvidTtl:     jwtSvidTTL,
+		Hint:           hint,
 	}, nil
 }

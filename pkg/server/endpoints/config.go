@@ -1,6 +1,7 @@
 package endpoints
 
 import (
+	"context"
 	"crypto"
 	"crypto/x509"
 	"errors"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/andres-erbsen/clock"
 	"github.com/sirupsen/logrus"
+	"github.com/spiffe/go-spiffe/v2/bundle/spiffebundle"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/spire/pkg/common/bundleutil"
 	"github.com/spiffe/spire/pkg/common/telemetry"
@@ -23,11 +25,11 @@ import (
 	"github.com/spiffe/spire/pkg/server/authpolicy"
 	bundle_client "github.com/spiffe/spire/pkg/server/bundle/client"
 	"github.com/spiffe/spire/pkg/server/ca"
+	"github.com/spiffe/spire/pkg/server/ca/manager"
 	"github.com/spiffe/spire/pkg/server/cache/dscache"
 	"github.com/spiffe/spire/pkg/server/catalog"
 	"github.com/spiffe/spire/pkg/server/endpoints/bundle"
 	"github.com/spiffe/spire/pkg/server/svid"
-	"golang.org/x/net/context"
 )
 
 // Config is a configuration for endpoints
@@ -50,14 +52,11 @@ type Config struct {
 	// Server CA for signing SVIDs
 	ServerCA ca.ServerCA
 
-	// TTL to use when signing agent SVIDs
-	AgentTTL time.Duration
-
 	// Bundle endpoint configuration
 	BundleEndpoint bundle.EndpointConfig
 
-	// CA Manager
-	Manager *ca.Manager
+	// JWTKey publisher
+	JWTKeyPublisher manager.JwtKeyPublisher
 
 	// Makes policy decisions
 	AuthPolicyEngine *authpolicy.Engine
@@ -74,6 +73,12 @@ type Config struct {
 
 	// CacheReloadInterval controls how often the in-memory entry cache reloads
 	CacheReloadInterval time.Duration
+
+	// EventsBasedCache enabled event driven cache reloads
+	EventsBasedCache bool
+
+	// PruneEventsOlderThan controls how long events can live before they are pruned
+	PruneEventsOlderThan time.Duration
 
 	AuditLogEnabled bool
 
@@ -104,7 +109,7 @@ func (c *Config) maybeMakeBundleEndpointServer() Server {
 	return bundle.NewServer(bundle.ServerConfig{
 		Log:     c.Log.WithField(telemetry.SubsystemName, "bundle_endpoint"),
 		Address: c.BundleEndpoint.Address.String(),
-		Getter: bundle.GetterFunc(func(ctx context.Context) (*bundleutil.Bundle, error) {
+		Getter: bundle.GetterFunc(func(ctx context.Context) (*spiffebundle.Bundle, error) {
 			commonBundle, err := ds.FetchBundle(dscache.WithCache(ctx), c.TrustDomain.IDString())
 			if err != nil {
 				return nil, err
@@ -112,21 +117,21 @@ func (c *Config) maybeMakeBundleEndpointServer() Server {
 			if commonBundle == nil {
 				return nil, errors.New("trust domain bundle not found")
 			}
-			return bundleutil.BundleFromProto(commonBundle)
+			return bundleutil.SPIFFEBundleFromProto(commonBundle)
 		}),
-		ServerAuth: serverAuth,
+		RefreshHint: c.BundleEndpoint.RefreshHint,
+		ServerAuth:  serverAuth,
 	})
 }
 
 func (c *Config) makeAPIServers(entryFetcher api.AuthorizedEntryFetcher) APIServers {
 	ds := c.Catalog.GetDataStore()
-	upstreamPublisher := UpstreamPublisher(c.Manager)
+	upstreamPublisher := UpstreamPublisher(c.JWTKeyPublisher)
 
 	return APIServers{
 		AgentServer: agentv1.New(agentv1.Config{
 			DataStore:   ds,
 			ServerCA:    c.ServerCA,
-			AgentTTL:    c.AgentTTL,
 			TrustDomain: c.TrustDomain,
 			Catalog:     c.Catalog,
 			Clock:       c.Clock,

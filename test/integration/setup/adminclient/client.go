@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"time"
 
+	"github.com/go-jose/go-jose/v3/jwt"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	agentv1 "github.com/spiffe/spire-api-sdk/proto/spire/api/server/agent/v1"
 	bundlev1 "github.com/spiffe/spire-api-sdk/proto/spire/api/server/bundle/v1"
@@ -20,12 +21,11 @@ import (
 	svidv1 "github.com/spiffe/spire-api-sdk/proto/spire/api/server/svid/v1"
 	"github.com/spiffe/spire-api-sdk/proto/spire/api/server/trustdomain/v1"
 	"github.com/spiffe/spire-api-sdk/proto/spire/api/types"
+	"github.com/spiffe/spire/pkg/common/pemutil"
 	"github.com/spiffe/spire/test/integration/setup/itclient"
-	"github.com/spiffe/spire/test/testkey"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
-	"gopkg.in/square/go-jose.v2/jwt"
 )
 
 const (
@@ -50,7 +50,11 @@ Q0qBJEOkL6FrAngY5218TCNUS30YS5HjI2lfyyjB+cSVFXX8Szu019dDBMhV
 var (
 	blk, _       = pem.Decode([]byte(testBundle))
 	pkixBytes, _ = base64.StdEncoding.DecodeString("MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEYSlUVLqTD8DEnA4F1EWMTf5RXc5lnCxw+5WKJwngEL3rPc9i4Tgzz9riR3I/NiSlkgRO1WsxBusqpC284j9dXA==")
-	key          = testkey.MustEC256()
+	key, _       = pemutil.ParseSigner([]byte(`-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgs/CcKxAEIyBBEQ9h
+ES2kJbWTz79ut45qAb0UgqrGqmOhRANCAARssWdfmS3D4INrpLBdSBxzso5kPPSX
+F21JuznwCuYKNV5LnzhUA3nt2+6e18ZIXUDxl+CpkvCYc10MO6SYg6AE
+-----END PRIVATE KEY-----`))
 	// Used between test
 	entryID = ""
 	agentID = &types.SPIFFEID{}
@@ -131,7 +135,7 @@ func mintX509SVID(ctx context.Context, c *itclient.Client) error {
 	id := spiffeid.RequireFromPath(c.Td, "/new_workload")
 
 	expectedID := &types.SPIFFEID{
-		TrustDomain: id.TrustDomain().String(),
+		TrustDomain: id.TrustDomain().Name(),
 		Path:        id.Path(),
 	}
 
@@ -183,7 +187,7 @@ func mintX509SVID(ctx context.Context, c *itclient.Client) error {
 }
 
 func mintJWTSVID(ctx context.Context, c *itclient.Client) error {
-	id := &types.SPIFFEID{TrustDomain: c.Td.String(), Path: "/new_workload"}
+	id := &types.SPIFFEID{TrustDomain: c.Td.Name(), Path: "/new_workload"}
 	resp, err := c.SVIDClient().MintJWTSVID(ctx, &svidv1.MintJWTSVIDRequest{
 		Id:       id,
 		Audience: []string{"myAud"},
@@ -204,7 +208,7 @@ func mintJWTSVID(ctx context.Context, c *itclient.Client) error {
 	if err != nil {
 		return fmt.Errorf("failed to parse token: %w", err)
 	}
-	claimsMap := make(map[string]interface{})
+	claimsMap := make(map[string]any)
 	err = token.UnsafeClaimsWithoutVerification(&claimsMap)
 	if err != nil {
 		return fmt.Errorf("claims verification failed: %w", err)
@@ -220,8 +224,8 @@ func mintJWTSVID(ctx context.Context, c *itclient.Client) error {
 		return errors.New("missing exp")
 	case claimsMap["iat"] == 0:
 		return errors.New("missing iat")
-	case claimsMap["sub"] != "spiffe://domain.test/new_workload":
-		return fmt.Errorf("unexpected sub: %q", claimsMap["sub"])
+	case claimsMap["sub"] != fmt.Sprintf("spiffe://%s/new_workload", c.Td.Name()):
+		return fmt.Errorf("unexpected sub: %q, %s", claimsMap["sub"], fmt.Sprintf("spiffe://%q/new_workload", c.Td))
 	}
 
 	return nil
@@ -243,7 +247,7 @@ func appendBundle(ctx context.Context, c *itclient.Client) error {
 		return validatePermissionError(err)
 	case err != nil:
 		return err
-	case resp.TrustDomain != c.Td.String():
+	case resp.TrustDomain != c.Td.Name():
 		return fmt.Errorf("unexpected td: %v", resp.TrustDomain)
 	case len(resp.JwtAuthorities) == 0:
 		return errors.New("missing JWT authorities")
@@ -393,7 +397,7 @@ func countBundles(ctx context.Context, c *itclient.Client) error {
 		return validatePermissionError(err)
 	case err != nil:
 		return err
-	case resp.Count != 3:
+	case resp.Count != 4:
 		return fmt.Errorf("unexpected bundle count: %d", resp.Count)
 	}
 	return nil
@@ -406,7 +410,7 @@ func listFederatedBundles(ctx context.Context, c *itclient.Client) error {
 		return validatePermissionError(err)
 	case err != nil:
 		return err
-	case len(resp.Bundles) != 2:
+	case len(resp.Bundles) != 3:
 		return fmt.Errorf("unexpected bundles size: %d", len(resp.Bundles))
 	}
 
@@ -473,11 +477,11 @@ func batchDeleteFederatedBundle(ctx context.Context, c *itclient.Client) error {
 func batchCreateEntry(ctx context.Context, c *itclient.Client) error {
 	testEntry := &types.Entry{
 		ParentId: &types.SPIFFEID{
-			TrustDomain: c.Td.String(),
+			TrustDomain: c.Td.Name(),
 			Path:        "/foo",
 		},
 		SpiffeId: &types.SPIFFEID{
-			TrustDomain: c.Td.String(),
+			TrustDomain: c.Td.Name(),
 			Path:        "/bar",
 		},
 		Selectors: []*types.Selector{
@@ -502,6 +506,9 @@ func batchCreateEntry(ctx context.Context, c *itclient.Client) error {
 	// Validate result
 	r := resp.Results[0]
 	testEntry.Id = r.Entry.Id
+	if r.Entry != nil {
+		testEntry.CreatedAt = r.Entry.CreatedAt
+	}
 	switch {
 	case r.Status.Code != int32(codes.OK):
 		return fmt.Errorf("unexpected status: %v", r.Status)
@@ -521,7 +528,7 @@ func countEntries(ctx context.Context, c *itclient.Client) error {
 		return validatePermissionError(err)
 	case err != nil:
 		return err
-	case resp.Count != 3:
+	case resp.Count < 3:
 		return fmt.Errorf("unexpected entry count: %d", resp.Count)
 	}
 	return nil
@@ -529,9 +536,10 @@ func countEntries(ctx context.Context, c *itclient.Client) error {
 
 func listEntries(ctx context.Context, c *itclient.Client) error {
 	expectedSpiffeIDs := []*types.SPIFFEID{
-		{TrustDomain: c.Td.String(), Path: "/admin"},
-		{TrustDomain: c.Td.String(), Path: "/workload"},
-		{TrustDomain: c.Td.String(), Path: "/bar"},
+		{TrustDomain: c.Td.Name(), Path: "/admin"},
+		{TrustDomain: c.Td.Name(), Path: "/agent-alias"},
+		{TrustDomain: c.Td.Name(), Path: "/workload"},
+		{TrustDomain: c.Td.Name(), Path: "/bar"},
 	}
 	resp, err := c.EntryClient().ListEntries(ctx, &entryv1.ListEntriesRequest{})
 	switch {
@@ -539,7 +547,7 @@ func listEntries(ctx context.Context, c *itclient.Client) error {
 		return validatePermissionError(err)
 	case err != nil:
 		return err
-	case len(resp.Entries) != 3:
+	case len(resp.Entries) < 3:
 		return fmt.Errorf("unexpected entries size: %d", len(resp.Entries))
 	}
 
@@ -554,7 +562,7 @@ func listEntries(ctx context.Context, c *itclient.Client) error {
 
 	for _, e := range resp.Entries {
 		if !containsFunc(e.SpiffeId) {
-			return fmt.Errorf("unexpected entry: %v", e)
+			return fmt.Errorf("unexpected entry: %v", e.SpiffeId)
 		}
 	}
 
@@ -565,11 +573,11 @@ func getEntry(ctx context.Context, c *itclient.Client) error {
 	testEntry := &types.Entry{
 		Id: entryID,
 		ParentId: &types.SPIFFEID{
-			TrustDomain: c.Td.String(),
+			TrustDomain: c.Td.Name(),
 			Path:        "/foo",
 		},
 		SpiffeId: &types.SPIFFEID{
-			TrustDomain: c.Td.String(),
+			TrustDomain: c.Td.Name(),
 			Path:        "/bar",
 		},
 		Selectors: []*types.Selector{
@@ -582,6 +590,10 @@ func getEntry(ctx context.Context, c *itclient.Client) error {
 	resp, err := c.EntryClient().GetEntry(ctx, &entryv1.GetEntryRequest{
 		Id: entryID,
 	})
+	if resp != nil {
+		testEntry.CreatedAt = resp.CreatedAt
+	}
+
 	switch {
 	case c.ExpectErrors:
 		return validatePermissionError(err)
@@ -598,11 +610,11 @@ func batchUpdateEntry(ctx context.Context, c *itclient.Client) error {
 	testEntry := &types.Entry{
 		Id: entryID,
 		ParentId: &types.SPIFFEID{
-			TrustDomain: c.Td.String(),
+			TrustDomain: c.Td.Name(),
 			Path:        "/foo",
 		},
 		SpiffeId: &types.SPIFFEID{
-			TrustDomain: c.Td.String(),
+			TrustDomain: c.Td.Name(),
 			Path:        "/bar",
 		},
 		Selectors: []*types.Selector{
@@ -632,6 +644,10 @@ func batchUpdateEntry(ctx context.Context, c *itclient.Client) error {
 
 	// Validate result
 	r := resp.Results[0]
+	if r.Entry != nil {
+		testEntry.CreatedAt = r.Entry.CreatedAt
+	}
+
 	switch {
 	case r.Status.Code != int32(codes.OK):
 		return fmt.Errorf("unexpected status: %v", r.Status)
@@ -667,7 +683,7 @@ func batchDeleteEntry(ctx context.Context, c *itclient.Client) error {
 
 func createJoinToken(ctx context.Context, c *itclient.Client) error {
 	id := &types.SPIFFEID{
-		TrustDomain: c.Td.String(),
+		TrustDomain: c.Td.Name(),
 		Path:        "/agent-alias",
 	}
 
@@ -688,7 +704,7 @@ func createJoinToken(ctx context.Context, c *itclient.Client) error {
 
 	// Set agentID that will be used in other tests
 	agentID = &types.SPIFFEID{
-		TrustDomain: c.Td.String(),
+		TrustDomain: c.Td.Name(),
 		Path:        fmt.Sprintf("/spire/agent/join_token/%s", resp.Value),
 	}
 

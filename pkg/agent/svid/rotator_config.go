@@ -14,6 +14,8 @@ import (
 	"github.com/spiffe/spire/pkg/agent/common/backoff"
 	"github.com/spiffe/spire/pkg/agent/manager/cache"
 	"github.com/spiffe/spire/pkg/agent/plugin/keymanager"
+	"github.com/spiffe/spire/pkg/agent/plugin/nodeattestor"
+	"github.com/spiffe/spire/pkg/common/rotationutil"
 	"github.com/spiffe/spire/pkg/common/telemetry"
 )
 
@@ -25,6 +27,8 @@ type RotatorConfig struct {
 	Metrics        telemetry.Metrics
 	TrustDomain    spiffeid.TrustDomain
 	ServerAddr     string
+	NodeAttestor   nodeattestor.NodeAttestor
+	Reattestable   bool
 
 	// Initial SVID and key
 	SVID    []*x509.Certificate
@@ -37,6 +41,8 @@ type RotatorConfig struct {
 
 	// Clk is the clock that the rotator will use to create a ticker
 	Clk clock.Clock
+
+	RotationStrategy *rotationutil.RotationStrategy
 }
 
 func NewRotator(c *RotatorConfig) (Rotator, client.Client) {
@@ -53,8 +59,9 @@ func newRotator(c *RotatorConfig) (*rotator, client.Client) {
 	}
 
 	state := observer.NewProperty(State{
-		SVID: c.SVID,
-		Key:  c.SVIDKey,
+		SVID:         c.SVID,
+		Key:          c.SVIDKey,
+		Reattestable: c.Reattestable,
 	})
 
 	rotMtx := new(sync.RWMutex)
@@ -74,7 +81,7 @@ func newRotator(c *RotatorConfig) (*rotator, client.Client) {
 
 			var rootCAs []*x509.Certificate
 			if bundle := bundles[c.TrustDomain]; bundle != nil {
-				rootCAs = bundle.RootCAs()
+				rootCAs = bundle.X509Authorities()
 			}
 			return s.SVID, s.Key, rootCAs
 		},

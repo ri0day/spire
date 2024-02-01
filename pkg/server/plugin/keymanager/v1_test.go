@@ -7,7 +7,6 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"errors"
-	"fmt"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -235,7 +234,7 @@ func TestV1SignData(t *testing.T) {
 		signerOpts       crypto.SignerOpts
 		signature        string
 		fingerprint      string
-		expectSignerOpts interface{}
+		expectSignerOpts any
 		expectCode       codes.Code
 		expectMessage    string
 	}{
@@ -331,7 +330,7 @@ func loadV1Plugin(t *testing.T, plugin fakeV1Plugin) keymanager.KeyManager {
 type fakeV1Plugin struct {
 	keymanagerv1.UnimplementedKeyManagerServer
 
-	expectSignerOpts interface{}
+	expectSignerOpts any
 
 	generateKeyResponse   *keymanagerv1.GenerateKeyResponse
 	generateKeyErr        error
@@ -343,7 +342,7 @@ type fakeV1Plugin struct {
 	signDataErr           error
 }
 
-func (p *fakeV1Plugin) GenerateKey(ctx context.Context, req *keymanagerv1.GenerateKeyRequest) (*keymanagerv1.GenerateKeyResponse, error) {
+func (p *fakeV1Plugin) GenerateKey(_ context.Context, req *keymanagerv1.GenerateKeyRequest) (*keymanagerv1.GenerateKeyResponse, error) {
 	if req.KeyId != "foo" {
 		return nil, status.Error(codes.InvalidArgument, "unexpected key id")
 	}
@@ -353,18 +352,18 @@ func (p *fakeV1Plugin) GenerateKey(ctx context.Context, req *keymanagerv1.Genera
 	return p.generateKeyResponse, p.generateKeyErr
 }
 
-func (p *fakeV1Plugin) GetPublicKey(ctx context.Context, req *keymanagerv1.GetPublicKeyRequest) (*keymanagerv1.GetPublicKeyResponse, error) {
+func (p *fakeV1Plugin) GetPublicKey(_ context.Context, req *keymanagerv1.GetPublicKeyRequest) (*keymanagerv1.GetPublicKeyResponse, error) {
 	if req.KeyId != "foo" {
 		return nil, status.Error(codes.InvalidArgument, "unexpected key id")
 	}
 	return p.getPublicKeyResponse, p.getPublicKeyErr
 }
 
-func (p *fakeV1Plugin) GetPublicKeys(ctx context.Context, req *keymanagerv1.GetPublicKeysRequest) (*keymanagerv1.GetPublicKeysResponse, error) {
+func (p *fakeV1Plugin) GetPublicKeys(context.Context, *keymanagerv1.GetPublicKeysRequest) (*keymanagerv1.GetPublicKeysResponse, error) {
 	return p.getPublicKeysResponse, p.getPublicKeysErr
 }
 
-func (p *fakeV1Plugin) SignData(ctx context.Context, req *keymanagerv1.SignDataRequest) (*keymanagerv1.SignDataResponse, error) {
+func (p *fakeV1Plugin) SignData(_ context.Context, req *keymanagerv1.SignDataRequest) (*keymanagerv1.SignDataResponse, error) {
 	if req.KeyId != "foo" {
 		return nil, status.Error(codes.InvalidArgument, "unexpected key id")
 	}
@@ -373,7 +372,6 @@ func (p *fakeV1Plugin) SignData(ctx context.Context, req *keymanagerv1.SignDataR
 	}
 
 	if diff := cmp.Diff(p.expectSignerOpts, req.GetSignerOpts(), protocmp.Transform()); diff != "" {
-		fmt.Println("DIFF", diff)
 		return nil, status.Errorf(codes.InvalidArgument, "unexpected signer opts %s", diff)
 	}
 

@@ -1,5 +1,4 @@
 //go:build windows
-// +build windows
 
 package endpoints
 
@@ -18,7 +17,7 @@ import (
 	"google.golang.org/grpc"
 )
 
-func getTestAddr(t *testing.T) net.Addr {
+func getTestAddr(*testing.T) net.Addr {
 	return spiretest.GetRandNamedPipeAddr()
 }
 

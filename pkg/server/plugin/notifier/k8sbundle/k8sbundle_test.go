@@ -14,9 +14,11 @@ import (
 	"time"
 
 	"github.com/hashicorp/hcl"
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	identityproviderv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/hostservice/server/identityprovider/v1"
 	plugintypes "github.com/spiffe/spire-plugin-sdk/proto/spire/plugin/types"
 	configv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/service/common/config/v1"
+	"github.com/spiffe/spire/pkg/common/pemutil"
 	"github.com/spiffe/spire/pkg/server/plugin/notifier"
 	"github.com/spiffe/spire/proto/spire/common"
 	"github.com/spiffe/spire/test/fakes/fakeidentityprovider"
@@ -45,6 +47,18 @@ import (
 )
 
 var (
+	td      = spiffeid.RequireTrustDomainFromString("example.org")
+	rootPEM = []byte(`-----BEGIN CERTIFICATE-----
+MIIBRzCB76ADAgECAgEBMAoGCCqGSM49BAMCMBMxETAPBgNVBAMTCEFnZW50IENB
+MCAYDzAwMDEwMTAxMDAwMDAwWhcNMjEwNTI2MjE1MDA5WjATMREwDwYDVQQDEwhB
+Z2VudCBDQTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABNRTee0Z/+omKGAVU3Ns
+NkOrpvcU4gZ3C6ilHSfYUiF2o+YCdsuLZb8UFbEVB4VR1H7Ez629IPEASK1k0KW+
+KHajMjAwMA8GA1UdEwEB/wQFMAMBAf8wHQYDVR0OBBYEFAXjxsTxL8UIBZl5lheq
+qaDOcBhNMAoGCCqGSM49BAMCA0cAMEQCIGTDiqcBaFomiRIfRNtLNTl5wFIQMlcB
+MWnIPs59/JF8AiBeKSM/rkL2igQchDTvlJJWsyk9YL8UZI/XfZO7907TWA==
+-----END CERTIFICATE-----`)
+	root, _ = pemutil.ParseCertificate(rootPEM)
+
 	testBundle = &plugintypes.Bundle{
 		X509Authorities: []*plugintypes.X509Certificate{
 			{Asn1: []byte("FOO")},
@@ -60,8 +74,8 @@ var (
 	}
 
 	commonBundle = &common.Bundle{
-		TrustDomainId: "spiffe://example.org",
-		RootCas:       []*common.Certificate{{DerBytes: []byte("1")}},
+		TrustDomainId: td.IDString(),
+		RootCas:       []*common.Certificate{{DerBytes: root.Raw}},
 	}
 
 	coreConfig = &configv1.CoreConfiguration{TrustDomain: "test.example.org"}
@@ -523,7 +537,7 @@ func TestConfigureWithMalformedConfiguration(t *testing.T) {
 	spiretest.RequireGRPCStatusContains(t, err, codes.InvalidArgument, "unable to decode configuration")
 }
 
-func TestBundleFailsToLoadIfHostServicesUnavailabler(t *testing.T) {
+func TestBundleFailsToLoadIfHostServicesUnavailable(t *testing.T) {
 	var err error
 	plugintest.Load(t, BuiltIn(), nil,
 		plugintest.CaptureLoadError(&err))
@@ -709,14 +723,14 @@ func newFakeKubeClient(config *pluginConfig, configMaps ...*corev1.ConfigMap) *f
 	return fake
 }
 
-func (c *fakeKubeClient) Get(ctx context.Context, namespace, configMap string) (runtime.Object, error) {
+func (c *fakeKubeClient) Get(_ context.Context, namespace, configMap string) (runtime.Object, error) {
 	entry := c.getConfigMap(namespace, configMap)
 	if entry == nil {
 		return nil, errors.New("not found")
 	}
 	return entry, nil
 }
-func (c *fakeKubeClient) GetList(ctx context.Context) (runtime.Object, error) {
+func (c *fakeKubeClient) GetList(context.Context) (runtime.Object, error) {
 	list := c.getConfigMapList()
 	if list.Items == nil {
 		return nil, errors.New("not found")
@@ -724,7 +738,7 @@ func (c *fakeKubeClient) GetList(ctx context.Context) (runtime.Object, error) {
 	return list, nil
 }
 
-func (c *fakeKubeClient) CreatePatch(ctx context.Context, obj runtime.Object, resp *identityproviderv1.FetchX509IdentityResponse) (runtime.Object, error) {
+func (c *fakeKubeClient) CreatePatch(_ context.Context, obj runtime.Object, resp *identityproviderv1.FetchX509IdentityResponse) (runtime.Object, error) {
 	configMap, ok := obj.(*corev1.ConfigMap)
 	if !ok {
 		return nil, status.Error(codes.InvalidArgument, "wrong type, expecting config map")
@@ -739,7 +753,7 @@ func (c *fakeKubeClient) CreatePatch(ctx context.Context, obj runtime.Object, re
 	}, nil
 }
 
-func (c *fakeKubeClient) Patch(ctx context.Context, namespace, configMap string, patchBytes []byte) error {
+func (c *fakeKubeClient) Patch(_ context.Context, namespace, configMap string, patchBytes []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -773,8 +787,8 @@ func (c *fakeKubeClient) Patch(ctx context.Context, namespace, configMap string,
 	return nil
 }
 
-func (c *fakeKubeClient) Informer(callback informerCallback) cache.SharedIndexInformer {
-	return nil
+func (c *fakeKubeClient) Informer(informerCallback) (cache.SharedIndexInformer, error) {
+	return nil, nil
 }
 
 func (c *fakeKubeClient) getConfigMap(namespace, configMap string) *corev1.ConfigMap {

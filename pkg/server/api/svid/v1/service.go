@@ -23,7 +23,7 @@ import (
 )
 
 // RegisterService registers the service on the gRPC server.
-func RegisterService(s *grpc.Server, service *Service) {
+func RegisterService(s grpc.ServiceRegistrar, service *Service) {
 	svidv1.RegisterSVIDServer(s, service)
 }
 
@@ -97,11 +97,11 @@ func (s *Service) MintX509SVID(ctx context.Context, req *svidv1.MintX509SVIDRequ
 		}
 	}
 
-	x509SVID, err := s.ca.SignX509SVID(ctx, ca.X509SVIDParams{
-		SpiffeID:  id,
+	x509SVID, err := s.ca.SignWorkloadX509SVID(ctx, ca.WorkloadX509SVIDParams{
+		SPIFFEID:  id,
 		PublicKey: csr.PublicKey,
 		TTL:       time.Duration(req.Ttl) * time.Second,
-		DNSList:   csr.DNSNames,
+		DNSNames:  csr.DNSNames,
 		Subject:   csr.Subject,
 	})
 	if err != nil {
@@ -115,11 +115,12 @@ func (s *Service) MintX509SVID(ctx context.Context, req *svidv1.MintX509SVIDRequ
 	}
 
 	rpccontext.AddRPCAuditFields(ctx, logrus.Fields{
-		telemetry.ExpiresAt: x509SVID[0].NotAfter.Unix(),
+		telemetry.ExpiresAt: x509SVID[0].NotAfter.Format(time.RFC3339),
 	})
 
 	rpccontext.AuditRPCWithFields(ctx, commonX509SVIDLogFields)
 	log.WithField(telemetry.Expiration, x509SVID[0].NotAfter.Format(time.RFC3339)).
+		WithField(telemetry.SerialNumber, x509SVID[0].SerialNumber.String()).
 		WithFields(commonX509SVIDLogFields).
 		Debug("Signed X509 SVID")
 
@@ -250,11 +251,11 @@ func (s *Service) newX509SVID(ctx context.Context, param *svidv1.NewX509SVIDPara
 	}
 	log = log.WithField(telemetry.SPIFFEID, spiffeID.String())
 
-	x509Svid, err := s.ca.SignX509SVID(ctx, ca.X509SVIDParams{
-		SpiffeID:  spiffeID,
+	x509Svid, err := s.ca.SignWorkloadX509SVID(ctx, ca.WorkloadX509SVIDParams{
+		SPIFFEID:  spiffeID,
 		PublicKey: csr.PublicKey,
-		DNSList:   entry.DnsNames,
-		TTL:       time.Duration(entry.Ttl) * time.Second,
+		DNSNames:  entry.DnsNames,
+		TTL:       time.Duration(entry.X509SvidTtl) * time.Second,
 	})
 	if err != nil {
 		return &svidv1.BatchNewX509SVIDResponse_Result{
@@ -263,6 +264,8 @@ func (s *Service) newX509SVID(ctx context.Context, param *svidv1.NewX509SVIDPara
 	}
 
 	log.WithField(telemetry.Expiration, x509Svid[0].NotAfter.Format(time.RFC3339)).
+		WithField(telemetry.SerialNumber, x509Svid[0].SerialNumber.String()).
+		WithField(telemetry.RevisionNumber, entry.RevisionNumber).
 		Debug("Signed X509 SVID")
 
 	return &svidv1.BatchNewX509SVIDResponse_Result{
@@ -289,8 +292,8 @@ func (s *Service) mintJWTSVID(ctx context.Context, protoID *types.SPIFFEID, audi
 		return nil, api.MakeErr(log, codes.InvalidArgument, "at least one audience is required", nil)
 	}
 
-	token, err := s.ca.SignJWTSVID(ctx, ca.JWTSVIDParams{
-		SpiffeID: id,
+	token, err := s.ca.SignWorkloadJWTSVID(ctx, ca.WorkloadJWTSVIDParams{
+		SPIFFEID: id,
 		TTL:      time.Duration(ttl) * time.Second,
 		Audience: audience,
 	})
@@ -338,12 +341,12 @@ func (s *Service) NewJWTSVID(ctx context.Context, req *svidv1.NewJWTSVIDRequest)
 		return nil, api.MakeErr(log, codes.NotFound, "entry not found or not authorized", nil)
 	}
 
-	jwtsvid, err := s.mintJWTSVID(ctx, entry.SpiffeId, req.Audience, entry.Ttl)
+	jwtsvid, err := s.mintJWTSVID(ctx, entry.SpiffeId, req.Audience, entry.JwtSvidTtl)
 	if err != nil {
 		return nil, err
 	}
 	rpccontext.AuditRPCWithFields(ctx, logrus.Fields{
-		telemetry.TTL: entry.Ttl,
+		telemetry.TTL: entry.JwtSvidTtl,
 	})
 
 	return &svidv1.NewJWTSVIDResponse{
@@ -374,10 +377,9 @@ func (s *Service) NewDownstreamX509CA(ctx context.Context, req *svidv1.NewDownst
 		return nil, err
 	}
 
-	x509CASvid, err := s.ca.SignX509CASVID(ctx, ca.X509CASVIDParams{
-		SpiffeID:  s.td.ID(),
+	x509CASvid, err := s.ca.SignDownstreamX509CA(ctx, ca.DownstreamX509CAParams{
 		PublicKey: csr.PublicKey,
-		TTL:       time.Duration(entry.Ttl) * time.Second,
+		TTL:       time.Duration(entry.X509SvidTtl) * time.Second,
 	})
 	if err != nil {
 		return nil, api.MakeErr(log, codes.Internal, "failed to sign downstream X.509 CA", err)

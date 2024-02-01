@@ -1,5 +1,4 @@
 //go:build windows
-// +build windows
 
 package sddl
 
@@ -10,6 +9,14 @@ const (
 	// accessed by the owner of the file, granting full access
 	// to the creator owner only.
 	PrivateFile = "D:P(A;;FA;;;OW)"
+
+	// PubliclyReadableFile describes a security descriptor using
+	// the security descriptor definition language (SDDL) that is meant
+	// to be used to define the access control to files that need to
+	// be publicly readable but writable only by the owner of the file.
+	// The security descriptor grants full access to the creator owner
+	// and read access to everyone.
+	PubliclyReadableFile = "D:P(A;;FA;;;OW)(A;;FR;;;WD)"
 
 	// PrivateListener describes a security descriptor using the
 	// security descriptor definition language (SDDL) that is meant

@@ -8,26 +8,38 @@ import (
 
 var (
 	stringSetPool = sync.Pool{
-		New: func() interface{} {
+		New: func() any {
 			return make(stringSet)
 		},
 	}
 
 	subscriberSetPool = sync.Pool{
-		New: func() interface{} {
+		New: func() any {
 			return make(subscriberSet)
 		},
 	}
 
 	selectorSetPool = sync.Pool{
-		New: func() interface{} {
+		New: func() any {
 			return make(selectorSet)
 		},
 	}
 
 	recordSetPool = sync.Pool{
-		New: func() interface{} {
+		New: func() any {
 			return make(recordSet)
+		},
+	}
+
+	lruCacheRecordSetPool = sync.Pool{
+		New: func() any {
+			return make(lruCacheRecordSet)
+		},
+	}
+
+	lruCacheSubscriberSetPool = sync.Pool{
+		New: func() any {
+			return make(lruCacheSubscriberSet)
 		},
 	}
 )
@@ -35,9 +47,8 @@ var (
 // unique set of strings, allocated from a pool
 type stringSet map[string]struct{}
 
-func allocStringSet(ss ...string) (stringSet, func()) {
+func allocStringSet() (stringSet, func()) {
 	set := stringSetPool.Get().(stringSet)
-	set.Merge(ss...)
 	return set, func() {
 		clearStringSet(set)
 		stringSetPool.Put(set)
@@ -145,6 +156,40 @@ func allocRecordSet() (recordSet, func()) {
 }
 
 func clearRecordSet(set recordSet) {
+	for k := range set {
+		delete(set, k)
+	}
+}
+
+// unique set of LRU cache records, allocated from a pool
+type lruCacheRecordSet map[*lruCacheRecord]struct{}
+
+func allocLRUCacheRecordSet() (lruCacheRecordSet, func()) {
+	set := lruCacheRecordSetPool.Get().(lruCacheRecordSet)
+	return set, func() {
+		clearLRUCacheRecordSet(set)
+		lruCacheRecordSetPool.Put(set)
+	}
+}
+
+func clearLRUCacheRecordSet(set lruCacheRecordSet) {
+	for k := range set {
+		delete(set, k)
+	}
+}
+
+// unique set of LRU cache subscribers, allocated from a pool
+type lruCacheSubscriberSet map[*lruCacheSubscriber]struct{}
+
+func allocLRUCacheSubscriberSet() (lruCacheSubscriberSet, func()) {
+	set := lruCacheSubscriberSetPool.Get().(lruCacheSubscriberSet)
+	return set, func() {
+		clearLRUCacheSubscriberSet(set)
+		lruCacheSubscriberSetPool.Put(set)
+	}
+}
+
+func clearLRUCacheSubscriberSet(set lruCacheSubscriberSet) {
 	for k := range set {
 		delete(set, k)
 	}

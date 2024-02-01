@@ -130,7 +130,7 @@ func TestMintX509CA(t *testing.T) {
 	svidCert, svidKey, err := s.MarshalRaw()
 	require.NoError(t, err)
 
-	// Create sever's CA
+	// Create server's CA
 	serverCert, serverKey := ca.CreateX509Certificate(
 		testca.WithID(spiffeid.RequireFromPath(trustDomain, "/spire/server")),
 	)
@@ -157,7 +157,7 @@ func TestMintX509CA(t *testing.T) {
 			},
 			customServerAddr: "localhost",
 			expectCode:       codes.Internal,
-			expectMsgPrefix:  `upstreamauthority(spire): unable to request a new Downstream X509CA: rpc error: code = Unavailable desc = connection error: desc = "transport: Error while dialing dial tcp :0`,
+			expectMsgPrefix:  `upstreamauthority(spire): unable to request a new Downstream X509CA: rpc error: code = Unavailable desc = connection error: desc = "transport: Error while dialing: dial tcp :0`,
 		},
 		{
 			name: "invalid scheme",
@@ -227,8 +227,8 @@ func TestMintX509CA(t *testing.T) {
 			// Setup servers
 			server := testHandler{}
 			server.startTestServers(t, ca, serverCert, serverKey, svidCert, svidKey)
-			server.sAPIServer.err = c.sAPIError
-			server.sAPIServer.downstreamResponse = c.downstreamResp
+			server.sAPIServer.setError(c.sAPIError)
+			server.sAPIServer.setDownstreamResponse(c.downstreamResp)
 
 			serverAddr := server.sAPIServer.addr
 			workloadAPIAddr := server.wAPIServer.workloadAPIAddr
@@ -356,7 +356,7 @@ func TestPublishJWTKey(t *testing.T) {
 	// Fail to push JWT authority
 	ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	server.sAPIServer.err = errors.New("some error")
+	server.sAPIServer.setError(errors.New("some error"))
 	upstreamJwtKeys, _, err = ua.PublishJWTKey(ctx, &common.PublicKey{
 		Kid:       "kid-2",
 		PkixBytes: pkixBytes,

@@ -1,3 +1,5 @@
+//go:build !darwin
+
 package tpmsimulator
 
 import (
@@ -14,7 +16,7 @@ import (
 
 	"github.com/google/go-tpm-tools/client"
 	"github.com/google/go-tpm-tools/simulator"
-	"github.com/google/go-tpm/tpm2"
+	"github.com/google/go-tpm/legacy/tpm2"
 	"github.com/spiffe/spire/pkg/agent/plugin/nodeattestor/tpmdevid/tpmutil"
 	"github.com/spiffe/spire/pkg/common/pemutil"
 )
@@ -376,7 +378,7 @@ func (s *TPMSimulator) createOrdinaryKey(keyType KeyType, parentKeyPassword, key
 	return privateBlob, publicBlob, nil
 }
 
-func (p *ProvisioningAuthority) issueCertificate(publicKey interface{}) (*x509.Certificate, error) {
+func (p *ProvisioningAuthority) issueCertificate(publicKey any) (*x509.Certificate, error) {
 	var cert *x509.Certificate
 	var privateKey *rsa.PrivateKey
 
@@ -406,7 +408,7 @@ func createRootCertificate(key *rsa.PrivateKey, tmpl *x509.Certificate) (*x509.C
 	return createCertificate(&key.PublicKey, tmpl, key, tmpl)
 }
 
-func createCertificate(key interface{}, tmpl *x509.Certificate, parentKey *rsa.PrivateKey, parent *x509.Certificate) (*x509.Certificate, error) {
+func createCertificate(key any, tmpl *x509.Certificate, parentKey *rsa.PrivateKey, parent *x509.Certificate) (*x509.Certificate, error) {
 	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, parent, key, parentKey)
 	if err != nil {
 		return nil, err

@@ -16,10 +16,10 @@ import (
 	envoy_type_v3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"github.com/imdario/mergo"
 	"github.com/sirupsen/logrus/hooks/test"
+	"github.com/spiffe/go-spiffe/v2/bundle/spiffebundle"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/spire/pkg/agent/manager/cache"
 	"github.com/spiffe/spire/pkg/common/api/middleware"
-	"github.com/spiffe/spire/pkg/common/bundleutil"
 	"github.com/spiffe/spire/pkg/common/peertracker"
 	"github.com/spiffe/spire/pkg/common/pemutil"
 	"github.com/spiffe/spire/proto/spire/common"
@@ -36,9 +36,9 @@ import (
 )
 
 var (
-	tdBundle = bundleutil.BundleFromRootCA(spiffeid.RequireTrustDomainFromString("domain.test"), &x509.Certificate{
+	tdBundle = spiffebundle.FromX509Authorities(spiffeid.RequireTrustDomainFromString("domain.test"), []*x509.Certificate{{
 		Raw: []byte("BUNDLE"),
-	})
+	}})
 	tdCustomValidationConfig, _ = anypb.New(&tls_v3.SPIFFECertValidatorConfig{
 		TrustDomains: []*tls_v3.SPIFFECertValidatorConfig_TrustDomain{
 			{
@@ -74,19 +74,6 @@ var (
 			},
 		},
 	}
-
-	tdValidationContext2 = &tls_v3.Secret{
-		Name: "ROOTCA",
-		Type: &tls_v3.Secret_ValidationContext{
-			ValidationContext: &tls_v3.CertificateValidationContext{
-				TrustedCa: &core_v3.DataSource{
-					Specifier: &core_v3.DataSource_InlineBytes{
-						InlineBytes: []byte("-----BEGIN CERTIFICATE-----\nQlVORExF\n-----END CERTIFICATE-----\n"),
-					},
-				},
-			},
-		},
-	}
 	tdValidationContext2SpiffeValidator = &tls_v3.Secret{
 		Name: "ROOTCA",
 		Type: &tls_v3.Secret_ValidationContext{
@@ -112,9 +99,9 @@ var (
 		},
 	}
 
-	fedBundle = bundleutil.BundleFromRootCA(spiffeid.RequireTrustDomainFromString("otherdomain.test"), &x509.Certificate{
+	fedBundle = spiffebundle.FromX509Authorities(spiffeid.RequireTrustDomainFromString("otherdomain.test"), []*x509.Certificate{{
 		Raw: []byte("FEDBUNDLE"),
-	})
+	}})
 	fedCustomValidationConfig, _ = anypb.New(&tls_v3.SPIFFECertValidatorConfig{
 		TrustDomains: []*tls_v3.SPIFFECertValidatorConfig_TrustDomain{
 			{
@@ -323,14 +310,12 @@ func TestStreamSecrets(t *testing.T) {
 			expectSecrets: []*tls_v3.Secret{tdValidationContextSpiffeValidator},
 		},
 		{
-			name: "Default TrustDomain bundle: RootCA",
+			name: "Default TrustDomain bundle: SPIFFE",
 			req: &discovery_v3.DiscoveryRequest{
-				ResourceNames: []string{"ROOTCA"},
-				Node: &core_v3.Node{
-					UserAgentVersionType: userAgentVersionTypeV17,
-				},
+				ResourceNames: []string{"spiffe://domain.test"},
+				Node:          &core_v3.Node{},
 			},
-			expectSecrets: []*tls_v3.Secret{tdValidationContext2},
+			expectSecrets: []*tls_v3.Secret{tdValidationContextSpiffeValidator},
 		},
 		{
 			name: "Default TrustDomain bundle: SPIFFE",
@@ -669,6 +654,40 @@ func TestStreamSecretsStreaming(t *testing.T) {
 	requireSecrets(t, resp, workloadTLSCertificate2)
 }
 
+func TestStreamSecretsStreamingKeepNodeInformation(t *testing.T) {
+	test := setupTest(t)
+	defer test.server.Stop()
+
+	stream, err := test.handler.StreamSecrets(context.Background())
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, stream.CloseSend())
+	}()
+
+	test.sendAndWait(stream, &discovery_v3.DiscoveryRequest{
+		ResourceNames: []string{"spiffe://domain.test/workload"},
+		Node: &core_v3.Node{
+			UserAgentVersionType: userAgentVersionTypeV17,
+		},
+	})
+	resp, err := stream.Recv()
+	require.NoError(t, err)
+	require.NotEmpty(t, resp.VersionInfo)
+	require.NotEmpty(t, resp.Nonce)
+	requireSecrets(t, resp, workloadTLSCertificate1)
+
+	// Update request
+	test.sendAndWait(stream, &discovery_v3.DiscoveryRequest{
+		ResourceNames: []string{"spiffe://domain.test/workload"},
+		ResponseNonce: resp.Nonce,
+	})
+	test.setWorkloadUpdate(workloadCert2)
+
+	resp, err = stream.Recv()
+	require.NoError(t, err)
+	requireSecrets(t, resp, workloadTLSCertificate2)
+}
+
 func TestStreamSecretsApplicationDoesNotSpin(t *testing.T) {
 	test := setupTest(t)
 	defer test.server.Stop()
@@ -829,6 +848,21 @@ func TestStreamSecretsBadNonce(t *testing.T) {
 	resp, err = stream.Recv()
 	require.NoError(t, err)
 	requireSecrets(t, resp, workloadTLSCertificate2)
+}
+
+func TestStreamSecretsErrInSubscribeToCacheChanges(t *testing.T) {
+	test := setupErrTest(t)
+	defer test.server.Stop()
+
+	stream, err := test.handler.StreamSecrets(context.Background())
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, stream.CloseSend())
+	}()
+
+	resp, err := stream.Recv()
+	require.Error(t, err)
+	require.Nil(t, resp)
 }
 
 func TestFetchSecrets(t *testing.T) {
@@ -1174,11 +1208,16 @@ func DeltaSecretsTest(t *testing.T) {
 }
 
 func setupTest(t *testing.T) *handlerTest {
-	return setupTestWithConfig(t, Config{})
+	return setupTestWithManager(t, Config{}, NewFakeManager(t))
 }
 
-func setupTestWithConfig(t *testing.T, c Config) *handlerTest {
+func setupErrTest(t *testing.T) *handlerTest {
 	manager := NewFakeManager(t)
+	manager.err = errors.New("bad-error")
+	return setupTestWithManager(t, Config{}, manager)
+}
+
+func setupTestWithManager(t *testing.T, c Config, manager *FakeManager) *handlerTest {
 	defaultConfig := Config{
 		Manager:                     manager,
 		Attestor:                    FakeAttestor(workloadSelectors),
@@ -1220,6 +1259,11 @@ func setupTestWithConfig(t *testing.T, c Config) *handlerTest {
 	return test
 }
 
+func setupTestWithConfig(t *testing.T, c Config) *handlerTest {
+	manager := NewFakeManager(t)
+	return setupTestWithManager(t, c, manager)
+}
+
 type handlerTest struct {
 	t *testing.T
 
@@ -1247,7 +1291,7 @@ func (h *handlerTest) setWorkloadUpdate(workloadCert *x509.Certificate) {
 				},
 			},
 			Bundle: tdBundle,
-			FederatedBundles: map[spiffeid.TrustDomain]*bundleutil.Bundle{
+			FederatedBundles: map[spiffeid.TrustDomain]*spiffebundle.Bundle{
 				spiffeid.RequireTrustDomainFromString("otherdomain.test"): fedBundle,
 			},
 		}
@@ -1268,7 +1312,7 @@ func (h *handlerTest) sendAndWait(stream secret_v3.SecretDiscoveryService_Stream
 
 type FakeAttestor []*common.Selector
 
-func (a FakeAttestor) Attest(ctx context.Context) ([]*common.Selector, error) {
+func (a FakeAttestor) Attest(context.Context) ([]*common.Selector, error) {
 	return ([]*common.Selector)(a), nil
 }
 
@@ -1279,6 +1323,7 @@ type FakeManager struct {
 	upd  *cache.WorkloadUpdate
 	next int
 	subs map[int]chan *cache.WorkloadUpdate
+	err  error
 }
 
 func NewFakeManager(t *testing.T) *FakeManager {
@@ -1288,7 +1333,10 @@ func NewFakeManager(t *testing.T) *FakeManager {
 	}
 }
 
-func (m *FakeManager) SubscribeToCacheChanges(selectors cache.Selectors) cache.Subscriber {
+func (m *FakeManager) SubscribeToCacheChanges(_ context.Context, selectors cache.Selectors) (cache.Subscriber, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
 	require.Equal(m.t, workloadSelectors, selectors)
 
 	updch := make(chan *cache.WorkloadUpdate, 1)
@@ -1304,10 +1352,10 @@ func (m *FakeManager) SubscribeToCacheChanges(selectors cache.Selectors) cache.S
 	return NewFakeSubscriber(updch, func() {
 		delete(m.subs, key)
 		close(updch)
-	})
+	}), nil
 }
 
-func (m *FakeManager) FetchWorkloadUpdate(selectors []*common.Selector) *cache.WorkloadUpdate {
+func (m *FakeManager) FetchWorkloadUpdate([]*common.Selector) *cache.WorkloadUpdate {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.upd
@@ -1350,7 +1398,7 @@ func (s *FakeSubscriber) Finish() {
 
 type FakeCreds struct{}
 
-func (c FakeCreds) ClientHandshake(_ context.Context, _ string, conn net.Conn) (net.Conn, credentials.AuthInfo, error) {
+func (c FakeCreds) ClientHandshake(context.Context, string, net.Conn) (net.Conn, credentials.AuthInfo, error) {
 	return nil, nil, errors.New("unexpected")
 }
 

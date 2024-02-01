@@ -1,6 +1,7 @@
 package dscache
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"testing"
@@ -14,7 +15,6 @@ import (
 	"github.com/spiffe/spire/test/spiretest"
 	"github.com/spiffe/spire/test/testca"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/net/context"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -198,12 +198,14 @@ func getBundles(t *testing.T, td string) (*common.Bundle, *common.Bundle) {
 	bundle1 := &common.Bundle{
 		TrustDomainId:  td,
 		RefreshHint:    1,
+		SequenceNumber: 2,
 		RootCas:        roots,
 		JwtSigningKeys: keys,
 	}
 
 	bundle2 := proto.Clone(bundle1).(*common.Bundle)
 	bundle2.RefreshHint = 2
+	bundle2.SequenceNumber = 5
 
 	return bundle1, bundle2
 }

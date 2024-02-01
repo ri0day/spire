@@ -24,40 +24,41 @@ import (
 	ds_sql "github.com/spiffe/spire/pkg/server/datastore/sqlstore"
 	"github.com/spiffe/spire/pkg/server/hostservice/agentstore"
 	"github.com/spiffe/spire/pkg/server/hostservice/identityprovider"
+	"github.com/spiffe/spire/pkg/server/plugin/bundlepublisher"
+	"github.com/spiffe/spire/pkg/server/plugin/credentialcomposer"
 	"github.com/spiffe/spire/pkg/server/plugin/keymanager"
 	"github.com/spiffe/spire/pkg/server/plugin/nodeattestor"
 	"github.com/spiffe/spire/pkg/server/plugin/nodeattestor/jointoken"
-	"github.com/spiffe/spire/pkg/server/plugin/noderesolver"
 	"github.com/spiffe/spire/pkg/server/plugin/notifier"
 	"github.com/spiffe/spire/pkg/server/plugin/upstreamauthority"
 )
 
 const (
-	dataStoreType         = "DataStore"
-	keyManagerType        = "KeyManager"
-	nodeAttestorType      = "NodeAttestor"
-	nodeResolverType      = "NodeResolver"
-	notifierType          = "Notifier"
-	upstreamAuthorityType = "UpstreamAuthority"
+	bundlePublisherType    = "BundlePublisher"
+	credentialComposerType = "CredentialComposer" //nolint: gosec // this is not a hardcoded credential...
+	dataStoreType          = "DataStore"
+	keyManagerType         = "KeyManager"
+	nodeAttestorType       = "NodeAttestor"
+	notifierType           = "Notifier"
+	upstreamAuthorityType  = "UpstreamAuthority"
 )
 
 type Catalog interface {
+	GetBundlePublishers() []bundlepublisher.BundlePublisher
+	GetCredentialComposers() []credentialcomposer.CredentialComposer
 	GetDataStore() datastore.DataStore
 	GetNodeAttestorNamed(name string) (nodeattestor.NodeAttestor, bool)
-	GetNodeResolverNamed(name string) (noderesolver.NodeResolver, bool)
 	GetKeyManager() keymanager.KeyManager
 	GetNotifiers() []notifier.Notifier
 	GetUpstreamAuthority() (upstreamauthority.UpstreamAuthority, bool)
 }
 
-type HCLPluginConfigMap = catalog.HCLPluginConfigMap
-
-type HCLPluginConfig = catalog.HCLPluginConfig
+type PluginConfigs = catalog.PluginConfigs
 
 type Config struct {
-	Log          logrus.FieldLogger
-	TrustDomain  spiffeid.TrustDomain
-	PluginConfig HCLPluginConfigMap
+	Log           logrus.FieldLogger
+	TrustDomain   spiffeid.TrustDomain
+	PluginConfigs PluginConfigs
 
 	Metrics          telemetry.Metrics
 	IdentityProvider *identityprovider.IdentityProvider
@@ -68,10 +69,11 @@ type Config struct {
 type datastoreRepository struct{ datastore.Repository }
 
 type Repository struct {
+	bundlePublisherRepository
+	credentialComposerRepository
 	datastoreRepository
 	keyManagerRepository
 	nodeAttestorRepository
-	nodeResolverRepository
 	notifierRepository
 	upstreamAuthorityRepository
 
@@ -82,11 +84,12 @@ type Repository struct {
 
 func (repo *Repository) Plugins() map[string]catalog.PluginRepo {
 	return map[string]catalog.PluginRepo{
-		keyManagerType:        &repo.keyManagerRepository,
-		nodeAttestorType:      &repo.nodeAttestorRepository,
-		nodeResolverType:      &repo.nodeResolverRepository,
-		notifierType:          &repo.notifierRepository,
-		upstreamAuthorityType: &repo.upstreamAuthorityRepository,
+		bundlePublisherType:    &repo.bundlePublisherRepository,
+		credentialComposerType: &repo.credentialComposerRepository,
+		keyManagerType:         &repo.keyManagerRepository,
+		nodeAttestorType:       &repo.nodeAttestorRepository,
+		notifierType:           &repo.notifierRepository,
+		upstreamAuthorityType:  &repo.upstreamAuthorityRepository,
 	}
 }
 
@@ -117,10 +120,8 @@ func (repo *Repository) Close() {
 }
 
 func Load(ctx context.Context, config Config) (_ *Repository, err error) {
-	// DEPRECATE: make this an error in SPIRE 1.5
-	if c, ok := config.PluginConfig[nodeAttestorType][jointoken.PluginName]; ok && c.IsEnabled() && c.IsExternal() {
-		config.Log.Warn("The built-in join_token node attestor cannot be overridden by an external plugin. The external plugin will be ignored; this will be a configuration error in a future release.")
-		config.PluginConfig[nodeAttestorType][jointoken.PluginName] = catalog.HCLPluginConfig{}
+	if c, ok := config.PluginConfigs.Find(nodeAttestorType, jointoken.PluginName); ok && c.IsEnabled() && c.IsExternal() {
+		return nil, fmt.Errorf("the built-in join_token node attestor cannot be overridden by an external plugin")
 	}
 
 	repo := &Repository{
@@ -134,18 +135,12 @@ func Load(ctx context.Context, config Config) (_ *Repository, err error) {
 
 	// Strip out the Datastore plugin configuration and load the SQL plugin
 	// directly. This allows us to bypass gRPC and get rid of response limits.
-	dataStoreConfig := config.PluginConfig[dataStoreType]
-	delete(config.PluginConfig, dataStoreType)
-	sqlDataStore, err := loadSQLDataStore(ctx, config.Log, dataStoreConfig)
+	dataStoreConfigs, pluginConfigs := config.PluginConfigs.FilterByType(dataStoreType)
+	sqlDataStore, err := loadSQLDataStore(ctx, config, dataStoreConfigs)
 	if err != nil {
 		return nil, err
 	}
 	repo.dataStoreCloser = sqlDataStore
-
-	pluginConfigs, err := catalog.PluginConfigsFromHCL(config.PluginConfig)
-	if err != nil {
-		return nil, err
-	}
 
 	repo.catalogCloser, err = catalog.Load(ctx, catalog.Config{
 		Log: config.Log,
@@ -177,30 +172,24 @@ func Load(ctx context.Context, config Config) (_ *Repository, err error) {
 	return repo, nil
 }
 
-func loadSQLDataStore(ctx context.Context, log logrus.FieldLogger, datastoreConfig map[string]catalog.HCLPluginConfig) (*ds_sql.Plugin, error) {
+func loadSQLDataStore(ctx context.Context, config Config, datastoreConfigs catalog.PluginConfigs) (*ds_sql.Plugin, error) {
 	switch {
-	case len(datastoreConfig) == 0:
+	case len(datastoreConfigs) == 0:
 		return nil, errors.New("expecting a DataStore plugin")
-	case len(datastoreConfig) > 1:
+	case len(datastoreConfigs) > 1:
 		return nil, errors.New("only one DataStore plugin is allowed")
 	}
 
-	sqlHCLConfig, ok := datastoreConfig[ds_sql.PluginName]
-	if !ok {
+	sqlConfig := datastoreConfigs[0]
+
+	if sqlConfig.Name != ds_sql.PluginName {
+		return nil, fmt.Errorf("pluggability for the DataStore is deprecated; only the built-in %q plugin is supported", ds_sql.PluginName)
+	}
+	if sqlConfig.IsExternal() {
 		return nil, fmt.Errorf("pluggability for the DataStore is deprecated; only the built-in %q plugin is supported", ds_sql.PluginName)
 	}
 
-	sqlConfig, err := catalog.PluginConfigFromHCL(dataStoreType, ds_sql.PluginName, sqlHCLConfig)
-	if err != nil {
-		return nil, err
-	}
-
-	// Is the plugin external?
-	if sqlConfig.Path != "" {
-		return nil, fmt.Errorf("pluggability for the DataStore is deprecated; only the built-in %q plugin is supported", ds_sql.PluginName)
-	}
-
-	ds := ds_sql.New(log.WithField(telemetry.SubsystemName, sqlConfig.Name))
+	ds := ds_sql.New(config.Log.WithField(telemetry.SubsystemName, sqlConfig.Name))
 	if err := ds.Configure(ctx, sqlConfig.Data); err != nil {
 		return nil, err
 	}

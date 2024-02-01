@@ -6,14 +6,14 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
+	"github.com/spiffe/go-spiffe/v2/bundle/spiffebundle"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/spire/pkg/agent/manager/cache"
-	"github.com/spiffe/spire/pkg/common/bundleutil"
 	"github.com/spiffe/spire/pkg/common/telemetry"
 	"github.com/spiffe/spire/proto/spire/common"
 )
 
-// Record holds the latests cached SVID with its context
+// Record holds the latest cached SVID with its context
 type Record struct {
 	// ID holds entry ID
 	ID string
@@ -26,7 +26,7 @@ type Record struct {
 	// Revision is the current cache record version
 	Revision int64
 	// Bundles holds trust domain bundle together with federated bundle
-	Bundles map[spiffeid.TrustDomain]*bundleutil.Bundle
+	Bundles map[spiffeid.TrustDomain]*spiffebundle.Bundle
 	// HandledEntry holds the previous entry revision. It is useful to define
 	// what changed between versions.
 	HandledEntry *common.RegistrationEntry
@@ -53,9 +53,9 @@ type Cache struct {
 
 	mtx sync.RWMutex
 
-	// bundles holds the latests bundles
-	bundles map[spiffeid.TrustDomain]*bundleutil.Bundle
-	// records holds all the latests SVIDs with its entries
+	// bundles holds the latest bundles
+	bundles map[spiffeid.TrustDomain]*spiffebundle.Bundle
+	// records holds all the latest SVIDs with its entries
 	records map[string]*cachedRecord
 
 	// staleEntries holds stale registration entries
@@ -66,13 +66,13 @@ func New(config *Config) *Cache {
 	return &Cache{
 		c:            config,
 		records:      make(map[string]*cachedRecord),
-		bundles:      make(map[spiffeid.TrustDomain]*bundleutil.Bundle),
+		bundles:      make(map[spiffeid.TrustDomain]*spiffebundle.Bundle),
 		staleEntries: make(map[string]bool),
 	}
 }
 
-// UpdateEntries using `UpdateEntries` updates and validates latests entries,
-// record's revision number is incremented on each record baed on:
+// UpdateEntries using `UpdateEntries` updates and validates latest entries,
+// record's revision number is incremented on each record based on:
 // - Knowledge or when the SVID for that entry changes
 // - Knowledge when the bundle changes
 // - Knowledge when a federated bundle related to an storable entry changes
@@ -100,7 +100,7 @@ func (c *Cache) UpdateEntries(update *cache.UpdateEntries, checkSVID func(*commo
 	bundleChanged := make(map[spiffeid.TrustDomain]bool)
 	for id, bundle := range update.Bundles {
 		existing, ok := c.bundles[id]
-		if !(ok && existing.EqualTo(bundle)) {
+		if !(ok && existing.Equal(bundle)) {
 			if !ok {
 				c.c.Log.WithField(telemetry.TrustDomainID, id).Debug("Bundle added")
 			} else {
@@ -188,7 +188,7 @@ func (c *Cache) UpdateEntries(update *cache.UpdateEntries, checkSVID func(*commo
 	}
 }
 
-// UpdateSVIDs updates cache with latests SVIDs
+// UpdateSVIDs updates cache with latest SVIDs
 func (c *Cache) UpdateSVIDs(update *cache.UpdateSVIDs) {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
@@ -239,8 +239,8 @@ func (c *Cache) GetStaleEntries() []*cache.StaleEntry {
 		}
 
 		staleEntries = append(staleEntries, &cache.StaleEntry{
-			Entry:     record.entry,
-			ExpiresAt: expiresAt,
+			Entry:         record.entry,
+			SVIDExpiresAt: expiresAt,
 		})
 	}
 
@@ -268,7 +268,7 @@ func (c *Cache) ReadyToStore() []*Record {
 	return records
 }
 
-// HandledRecord updates handled revision, and sets the latests processed entry
+// HandledRecord updates handled revision, and sets the latest processed entry
 func (c *Cache) HandledRecord(handledEntry *common.RegistrationEntry, revision int64) {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
@@ -354,7 +354,7 @@ func isBundleRemoved(federatesWith []string, bundleRemoved map[spiffeid.TrustDom
 }
 
 // recordFromCache parses cache record into storable Record
-func recordFromCache(r *cachedRecord, bundles map[spiffeid.TrustDomain]*bundleutil.Bundle) *Record {
+func recordFromCache(r *cachedRecord, bundles map[spiffeid.TrustDomain]*spiffebundle.Bundle) *Record {
 	var expiresAt time.Time
 	if r.svid != nil {
 		expiresAt = r.svid.Chain[0].NotAfter

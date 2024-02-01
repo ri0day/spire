@@ -1,16 +1,17 @@
 package endpoints
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
-	"fmt"
 	"net"
 	"os"
 	"time"
 
+	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
 	"github.com/spiffe/spire/pkg/server/cache/entrycache"
-	"golang.org/x/net/context"
+	"github.com/spiffe/spire/pkg/server/endpoints/bundle"
 	"golang.org/x/net/http2"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -30,9 +31,9 @@ import (
 	"github.com/spiffe/spire/pkg/common/peertracker"
 	"github.com/spiffe/spire/pkg/common/telemetry"
 	"github.com/spiffe/spire/pkg/common/util"
+	"github.com/spiffe/spire/pkg/server/api"
 	"github.com/spiffe/spire/pkg/server/api/middleware"
 	"github.com/spiffe/spire/pkg/server/authpolicy"
-	"github.com/spiffe/spire/pkg/server/cache/dscache"
 	"github.com/spiffe/spire/pkg/server/datastore"
 	"github.com/spiffe/spire/pkg/server/svid"
 )
@@ -46,6 +47,9 @@ const (
 	// This is the default amount of time between two reloads of the in-memory
 	// entry cache.
 	defaultCacheReloadInterval = 5 * time.Second
+
+	// This is the default amoount of time events live before they are pruned
+	defaultPruneEventsOlderThan = 12 * time.Hour
 )
 
 // Server manages gRPC and HTTP endpoint lifecycle
@@ -63,12 +67,14 @@ type Endpoints struct {
 	SVIDObserver                 svid.Observer
 	TrustDomain                  spiffeid.TrustDomain
 	DataStore                    datastore.DataStore
+	BundleCache                  *bundle.Cache
 	APIServers                   APIServers
 	BundleEndpointServer         Server
 	Log                          logrus.FieldLogger
 	Metrics                      telemetry.Metrics
 	RateLimit                    RateLimitConfig
 	EntryFetcherCacheRebuildTask func(context.Context) error
+	EntryFetcherPruneEventsTask  func(context.Context) error
 	AuditLogEnabled              bool
 	AuthPolicyEngine             *authpolicy.Engine
 	AdminIDs                     []spiffeid.ID
@@ -103,19 +109,39 @@ func New(ctx context.Context, c Config) (*Endpoints, error) {
 		return nil, errors.New("policy engine not provided for new endpoint")
 	}
 
-	buildCacheFn := func(ctx context.Context) (_ entrycache.Cache, err error) {
-		call := telemetry.StartCall(c.Metrics, telemetry.Entry, telemetry.Cache, telemetry.Reload)
-		defer call.Done(&err)
-		return entrycache.BuildFromDataStore(ctx, c.Catalog.GetDataStore())
-	}
-
 	if c.CacheReloadInterval == 0 {
 		c.CacheReloadInterval = defaultCacheReloadInterval
 	}
+	if c.PruneEventsOlderThan == 0 {
+		c.PruneEventsOlderThan = defaultPruneEventsOlderThan
+	}
 
-	ef, err := NewAuthorizedEntryFetcherWithFullCache(ctx, buildCacheFn, c.Log, c.Clock, c.CacheReloadInterval)
-	if err != nil {
-		return nil, err
+	ds := c.Catalog.GetDataStore()
+
+	var ef api.AuthorizedEntryFetcher
+	var cacheRebuildTask, pruneEventsTask func(context.Context) error
+	if c.EventsBasedCache {
+		efEventsBasedCache, err := NewAuthorizedEntryFetcherWithEventsBasedCache(ctx, c.Log, c.Clock, ds, c.CacheReloadInterval, c.PruneEventsOlderThan)
+		if err != nil {
+			return nil, err
+		}
+		cacheRebuildTask = efEventsBasedCache.RunUpdateCacheTask
+		pruneEventsTask = efEventsBasedCache.PruneEventsTask
+		ef = efEventsBasedCache
+	} else {
+		buildCacheFn := func(ctx context.Context) (_ entrycache.Cache, err error) {
+			call := telemetry.StartCall(c.Metrics, telemetry.Entry, telemetry.Cache, telemetry.Reload)
+			defer call.Done(&err)
+			return entrycache.BuildFromDataStore(ctx, c.Catalog.GetDataStore())
+		}
+
+		efFullCache, err := NewAuthorizedEntryFetcherWithFullCache(ctx, buildCacheFn, c.Log, c.Clock, ds, c.CacheReloadInterval, c.PruneEventsOlderThan)
+		if err != nil {
+			return nil, err
+		}
+		cacheRebuildTask = efFullCache.RunRebuildCacheTask
+		pruneEventsTask = efFullCache.PruneEventsTask
+		ef = efFullCache
 	}
 
 	return &Endpoints{
@@ -123,13 +149,15 @@ func New(ctx context.Context, c Config) (*Endpoints, error) {
 		LocalAddr:                    c.LocalAddr,
 		SVIDObserver:                 c.SVIDObserver,
 		TrustDomain:                  c.TrustDomain,
-		DataStore:                    c.Catalog.GetDataStore(),
+		DataStore:                    ds,
+		BundleCache:                  bundle.NewCache(ds, c.Clock),
 		APIServers:                   c.makeAPIServers(ef),
 		BundleEndpointServer:         c.maybeMakeBundleEndpointServer(),
 		Log:                          c.Log,
 		Metrics:                      c.Metrics,
 		RateLimit:                    c.RateLimit,
-		EntryFetcherCacheRebuildTask: ef.RunRebuildCacheTask,
+		EntryFetcherCacheRebuildTask: cacheRebuildTask,
+		EntryFetcherPruneEventsTask:  pruneEventsTask,
 		AuditLogEnabled:              c.AuditLogEnabled,
 		AuthPolicyEngine:             c.AuthPolicyEngine,
 		AdminIDs:                     c.AdminIDs,
@@ -175,6 +203,10 @@ func (e *Endpoints) ListenAndServe(ctx context.Context) error {
 
 	if e.BundleEndpointServer != nil {
 		tasks = append(tasks, e.BundleEndpointServer.ListenAndServe)
+	}
+
+	if e.EntryFetcherPruneEventsTask != nil {
+		tasks = append(tasks, e.EntryFetcherPruneEventsTask)
 	}
 
 	err := util.RunTasks(ctx, tasks...)
@@ -223,7 +255,8 @@ func (e *Endpoints) runTCPServer(ctx context.Context, server *grpc.Server) error
 	defer l.Close()
 	log := e.Log.WithFields(logrus.Fields{
 		telemetry.Network: l.Addr().Network(),
-		telemetry.Address: l.Addr().String()})
+		telemetry.Address: l.Addr().String(),
+	})
 
 	// Skip use of tomb here so we don't pollute a clean shutdown with errors
 	log.Info("Starting Server APIs")
@@ -266,7 +299,8 @@ func (e *Endpoints) runLocalAccess(ctx context.Context, server *grpc.Server) err
 
 	log := e.Log.WithFields(logrus.Fields{
 		telemetry.Network: l.Addr().Network(),
-		telemetry.Address: l.Addr().String()})
+		telemetry.Address: l.Addr().String(),
+	})
 
 	// Skip use of tomb here so we don't pollute a clean shutdown with errors
 	log.Info("Starting Server APIs")
@@ -289,65 +323,22 @@ func (e *Endpoints) runLocalAccess(ctx context.Context, server *grpc.Server) err
 // getTLSConfig returns a TLS Config hook for the gRPC server
 func (e *Endpoints) getTLSConfig(ctx context.Context) func(*tls.ClientHelloInfo) (*tls.Config, error) {
 	return func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
-		certs, roots, err := e.getCerts(ctx)
-		if err != nil {
-			e.Log.WithError(err).WithField(telemetry.Address, hello.Conn.RemoteAddr().String()).Error("Could not generate TLS config for gRPC client")
-			return nil, err
-		}
+		svidSrc := newX509SVIDSource(func() svid.State {
+			return e.SVIDObserver.State()
+		})
+		bundleSrc := newBundleSource(func(td spiffeid.TrustDomain) ([]*x509.Certificate, error) {
+			return e.bundleGetter(ctx, td)
+		})
 
-		return &tls.Config{
-			// Not all server APIs required a client certificate. Though if one
-			// is presented, verify it.
-			ClientAuth: tls.VerifyClientCertIfGiven,
+		spiffeTLSConfig := tlsconfig.MTLSServerConfig(svidSrc, bundleSrc, nil)
+		// provided client certificates will be validated using the custom VerifyPeerCertificate hook
+		spiffeTLSConfig.ClientAuth = tls.RequestClientCert
+		spiffeTLSConfig.MinVersion = tls.VersionTLS12
+		spiffeTLSConfig.NextProtos = []string{http2.NextProtoTLS}
+		spiffeTLSConfig.VerifyPeerCertificate = e.serverSpiffeVerificationFunc(bundleSrc)
 
-			Certificates: certs,
-			ClientCAs:    roots,
-
-			MinVersion: tls.VersionTLS12,
-
-			NextProtos: []string{http2.NextProtoTLS},
-		}, nil
+		return spiffeTLSConfig, nil
 	}
-}
-
-// getCerts queries the datastore and returns a TLS serving certificate(s) plus
-// the current CA root bundle.
-func (e *Endpoints) getCerts(ctx context.Context) ([]tls.Certificate, *x509.CertPool, error) {
-	bundle, err := e.DataStore.FetchBundle(dscache.WithCache(ctx), e.TrustDomain.IDString())
-	if err != nil {
-		return nil, nil, fmt.Errorf("get bundle from datastore: %w", err)
-	}
-	if bundle == nil {
-		return nil, nil, errors.New("bundle not found")
-	}
-
-	var caCerts []*x509.Certificate
-	for _, rootCA := range bundle.RootCas {
-		rootCACerts, err := x509.ParseCertificates(rootCA.DerBytes)
-		if err != nil {
-			return nil, nil, fmt.Errorf("parse bundle: %w", err)
-		}
-		caCerts = append(caCerts, rootCACerts...)
-	}
-
-	caPool := x509.NewCertPool()
-	for _, c := range caCerts {
-		caPool.AddCert(c)
-	}
-
-	svidState := e.SVIDObserver.State()
-
-	certChain := [][]byte{}
-	for _, cert := range svidState.SVID {
-		certChain = append(certChain, cert.Raw)
-	}
-
-	tlsCert := tls.Certificate{
-		Certificate: certChain,
-		PrivateKey:  svidState.Key,
-	}
-
-	return []tls.Certificate{tlsCert}, caPool, nil
 }
 
 func (e *Endpoints) makeInterceptors() (grpc.UnaryServerInterceptor, grpc.StreamServerInterceptor) {

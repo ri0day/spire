@@ -11,13 +11,13 @@ import (
 	"testing"
 	"time"
 
+	"cloud.google.com/go/security/privateca/apiv1/privatecapb"
 	"github.com/spiffe/spire/pkg/common/pemutil"
 	commonutil "github.com/spiffe/spire/pkg/common/util"
 	"github.com/spiffe/spire/pkg/server/plugin/upstreamauthority"
 	"github.com/spiffe/spire/test/plugintest"
 	"github.com/spiffe/spire/test/testkey"
 	"github.com/stretchr/testify/require"
-	privatecapb "google.golang.org/genproto/googleapis/cloud/security/privateca/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -220,7 +220,7 @@ type fakeClient struct { // implements CAClient interface
 	privKeyOfEarliestCA *crypto.PrivateKey
 }
 
-func (client *fakeClient) CreateCertificate(ctx context.Context, req *privatecapb.CreateCertificateRequest) (*privatecapb.Certificate, error) {
+func (client *fakeClient) CreateCertificate(_ context.Context, req *privatecapb.CreateCertificateRequest) (*privatecapb.Certificate, error) {
 	// Confirm that we were called with a request to sign using
 	// the very first CA from the CA List ( i.e. issuance order )
 	require.Equal(client.t, req.IssuingCertificateAuthorityId, client.mockX509CAs[0][0].Subject.CommonName)
@@ -243,7 +243,7 @@ func (client *fakeClient) CreateCertificate(ctx context.Context, req *privatecap
 	return ca, nil
 }
 
-func (client *fakeClient) LoadCertificateAuthorities(ctx context.Context, spec CertificateAuthoritySpec) ([]*privatecapb.CertificateAuthority, error) {
+func (client *fakeClient) LoadCertificateAuthorities(context.Context, CertificateAuthoritySpec) ([]*privatecapb.CertificateAuthority, error) {
 	var allCerts []*privatecapb.CertificateAuthority
 	for _, x509CA := range client.mockX509CAs {
 		ca := new(privatecapb.CertificateAuthority)

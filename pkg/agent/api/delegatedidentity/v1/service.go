@@ -12,7 +12,7 @@ import (
 	delegatedidentityv1 "github.com/spiffe/spire-api-sdk/proto/spire/api/agent/delegatedidentity/v1"
 	"github.com/spiffe/spire-api-sdk/proto/spire/api/types"
 	"github.com/spiffe/spire/pkg/agent/api/rpccontext"
-	workload_attestor "github.com/spiffe/spire/pkg/agent/attestor/workload"
+	workloadattestor "github.com/spiffe/spire/pkg/agent/attestor/workload"
 	"github.com/spiffe/spire/pkg/agent/client"
 	"github.com/spiffe/spire/pkg/agent/endpoints"
 	"github.com/spiffe/spire/pkg/agent/manager"
@@ -20,6 +20,7 @@ import (
 	"github.com/spiffe/spire/pkg/common/bundleutil"
 	"github.com/spiffe/spire/pkg/common/idutil"
 	"github.com/spiffe/spire/pkg/common/telemetry"
+	"github.com/spiffe/spire/pkg/common/telemetry/agent/adminapi"
 	"github.com/spiffe/spire/pkg/common/x509util"
 	"github.com/spiffe/spire/pkg/server/api"
 	"github.com/spiffe/spire/proto/spire/common"
@@ -39,8 +40,9 @@ type attestor interface {
 
 type Config struct {
 	Log                 logrus.FieldLogger
+	Metrics             telemetry.Metrics
 	Manager             manager.Manager
-	Attestor            workload_attestor.Attestor
+	Attestor            workloadattestor.Attestor
 	AuthorizedDelegates []string
 }
 
@@ -54,6 +56,7 @@ func New(config Config) *Service {
 	return &Service{
 		manager:             config.Manager,
 		attestor:            endpoints.PeerTrackerAttestor{Attestor: config.Attestor},
+		metrics:             config.Metrics,
 		authorizedDelegates: AuthorizedDelegates,
 	}
 }
@@ -64,6 +67,7 @@ type Service struct {
 
 	manager  manager.Manager
 	attestor attestor
+	metrics  telemetry.Metrics
 
 	// SPIFFE IDs of delegates that are authorized to use this API
 	authorizedDelegates map[string]bool
@@ -82,32 +86,36 @@ func (s *Service) isCallerAuthorized(ctx context.Context, log logrus.FieldLogger
 		}
 	}
 
-	identities := s.manager.MatchingIdentities(callerSelectors)
-	numRegisteredIDs := len(identities)
+	log = log.WithField("delegate_selectors", callerSelectors)
+	entries := s.manager.MatchingRegistrationEntries(callerSelectors)
+	numRegisteredEntries := len(entries)
 
-	if numRegisteredIDs == 0 {
+	if numRegisteredEntries == 0 {
 		log.Error("no identity issued")
 		return nil, status.Error(codes.PermissionDenied, "no identity issued")
 	}
 
-	for _, identity := range identities {
-		if _, ok := s.authorizedDelegates[identity.Entry.SpiffeId]; ok {
+	for _, entry := range entries {
+		if _, ok := s.authorizedDelegates[entry.SpiffeId]; ok {
+			log.WithField("delegate_id", entry.SpiffeId).Debug("Caller authorized as delegate")
 			return callerSelectors, nil
 		}
 	}
 
-	// caller has identity associeted with but none is authorized
+	// caller has identity associated with but none is authorized
 	log.WithFields(logrus.Fields{
-		"num_registered_ids": numRegisteredIDs,
-		"default_id":         identities[0].Entry.SpiffeId,
+		"num_registered_entries": numRegisteredEntries,
+		"default_id":             entries[0].SpiffeId,
 	}).Error("Permission denied; caller not configured as an authorized delegate.")
 
 	return nil, status.Error(codes.PermissionDenied, "caller not configured as an authorized delegate")
 }
 
 func (s *Service) SubscribeToX509SVIDs(req *delegatedidentityv1.SubscribeToX509SVIDsRequest, stream delegatedidentityv1.DelegatedIdentity_SubscribeToX509SVIDsServer) error {
+	latency := adminapi.StartFirstX509SVIDUpdateLatency(s.metrics)
 	ctx := stream.Context()
 	log := rpccontext.Logger(ctx)
+	var receivedFirstUpdate bool
 
 	cachedSelectors, err := s.isCallerAuthorized(ctx, log, nil)
 	if err != nil {
@@ -120,12 +128,27 @@ func (s *Service) SubscribeToX509SVIDs(req *delegatedidentityv1.SubscribeToX509S
 		return status.Error(codes.InvalidArgument, "could not parse provided selectors")
 	}
 
-	subscriber := s.manager.SubscribeToCacheChanges(selectors)
+	log.WithFields(logrus.Fields{
+		"delegate_selectors": cachedSelectors,
+		"request_selectors":  selectors,
+	}).Info("Subscribing to cache changes")
+
+	subscriber, err := s.manager.SubscribeToCacheChanges(ctx, selectors)
+	if err != nil {
+		log.WithError(err).Error("Subscribe to cache changes failed")
+		return err
+	}
 	defer subscriber.Finish()
 
 	for {
 		select {
 		case update := <-subscriber.Updates():
+			if !receivedFirstUpdate {
+				// emit latency metric for first update.
+				latency.Measure()
+				receivedFirstUpdate = true
+			}
+
 			if _, err := s.isCallerAuthorized(ctx, log, cachedSelectors); err != nil {
 				return err
 			}
@@ -149,6 +172,19 @@ func sendX509SVIDResponse(update *cache.WorkloadUpdate, stream delegatedidentity
 	if err := stream.Send(resp); err != nil {
 		log.WithError(err).Error("Failed to send X.509 SVID response")
 		return err
+	}
+
+	log = log.WithField(telemetry.Count, len(resp.X509Svids))
+
+	// log details on each SVID
+	// a response has already been sent so nothing is
+	// blocked on this logic
+	for i, svid := range resp.X509Svids {
+		ttl := time.Until(update.Identities[i].SVID[0].NotAfter)
+		log.WithFields(logrus.Fields{
+			telemetry.SPIFFEID: svid.X509Svid.Id.String(),
+			telemetry.TTL:      ttl.Seconds(),
+		}).Debug("Fetched X.509 SVID for delegated identity")
 	}
 
 	return nil
@@ -192,6 +228,7 @@ func composeX509SVIDBySelectors(update *cache.WorkloadUpdate) (*delegatedidentit
 				Id:        id,
 				CertChain: x509util.RawCertsFromCertificates(identity.SVID),
 				ExpiresAt: identity.SVID[0].NotAfter.Unix(),
+				Hint:      identity.Entry.Hint,
 			},
 			X509SvidKey: keyData,
 		}
@@ -200,7 +237,7 @@ func composeX509SVIDBySelectors(update *cache.WorkloadUpdate) (*delegatedidentit
 	return resp, nil
 }
 
-func (s *Service) SubscribeToX509Bundles(req *delegatedidentityv1.SubscribeToX509BundlesRequest, stream delegatedidentityv1.DelegatedIdentity_SubscribeToX509BundlesServer) error {
+func (s *Service) SubscribeToX509Bundles(_ *delegatedidentityv1.SubscribeToX509BundlesRequest, stream delegatedidentityv1.DelegatedIdentity_SubscribeToX509BundlesServer) error {
 	ctx := stream.Context()
 	log := rpccontext.Logger(ctx)
 
@@ -214,7 +251,7 @@ func (s *Service) SubscribeToX509Bundles(req *delegatedidentityv1.SubscribeToX50
 	// send initial update....
 	caCerts := make(map[string][]byte)
 	for td, bundle := range subscriber.Value() {
-		caCerts[td.IDString()] = marshalBundle(bundle.RootCAs())
+		caCerts[td.IDString()] = marshalBundle(bundle.X509Authorities())
 	}
 
 	resp := &delegatedidentityv1.SubscribeToX509BundlesResponse{
@@ -233,7 +270,7 @@ func (s *Service) SubscribeToX509Bundles(req *delegatedidentityv1.SubscribeToX50
 			}
 
 			for td, bundle := range subscriber.Next() {
-				caCerts[td.IDString()] = marshalBundle(bundle.RootCAs())
+				caCerts[td.IDString()] = marshalBundle(bundle.X509Authorities())
 			}
 
 			resp := &delegatedidentityv1.SubscribeToX509BundlesResponse{
@@ -266,30 +303,21 @@ func (s *Service) FetchJWTSVIDs(ctx context.Context, req *delegatedidentityv1.Fe
 		log.WithError(err).Error("Invalid argument; could not parse provided selectors")
 		return nil, status.Error(codes.InvalidArgument, "could not parse provided selectors")
 	}
-	var spiffeIDs []spiffeid.ID
 
-	identities := s.manager.MatchingIdentities(selectors)
-	for _, identity := range identities {
-		spiffeID, err := spiffeid.FromString(identity.Entry.SpiffeId)
+	resp = new(delegatedidentityv1.FetchJWTSVIDsResponse)
+
+	entries := s.manager.MatchingRegistrationEntries(selectors)
+	for _, entry := range entries {
+		spiffeID, err := spiffeid.FromString(entry.SpiffeId)
 		if err != nil {
-			log.WithField(telemetry.SPIFFEID, identity.Entry.SpiffeId).WithError(err).Error("Invalid requested SPIFFE ID")
+			log.WithField(telemetry.SPIFFEID, entry.SpiffeId).WithError(err).Error("Invalid requested SPIFFE ID")
 			return nil, status.Errorf(codes.InvalidArgument, "invalid requested SPIFFE ID: %v", err)
 		}
 
-		spiffeIDs = append(spiffeIDs, spiffeID)
-	}
-
-	if len(spiffeIDs) == 0 {
-		log.Error("No identity issued")
-		return nil, status.Error(codes.PermissionDenied, "no identity issued")
-	}
-
-	resp = new(delegatedidentityv1.FetchJWTSVIDsResponse)
-	for _, id := range spiffeIDs {
-		loopLog := log.WithField(telemetry.SPIFFEID, id.String())
+		loopLog := log.WithField(telemetry.SPIFFEID, spiffeID.String())
 
 		var svid *client.JWTSVID
-		svid, err = s.manager.FetchJWTSVID(ctx, id, req.Audience)
+		svid, err = s.manager.FetchJWTSVID(ctx, entry, req.Audience)
 		if err != nil {
 			loopLog.WithError(err).Error("Could not fetch JWT-SVID")
 			return nil, status.Errorf(codes.Unavailable, "could not fetch JWT-SVID: %v", err)
@@ -297,21 +325,27 @@ func (s *Service) FetchJWTSVIDs(ctx context.Context, req *delegatedidentityv1.Fe
 		resp.Svids = append(resp.Svids, &types.JWTSVID{
 			Token: svid.Token,
 			Id: &types.SPIFFEID{
-				TrustDomain: id.TrustDomain().String(),
-				Path:        id.Path(),
+				TrustDomain: spiffeID.TrustDomain().Name(),
+				Path:        spiffeID.Path(),
 			},
 			ExpiresAt: svid.ExpiresAt.Unix(),
 			IssuedAt:  svid.IssuedAt.Unix(),
+			Hint:      entry.Hint,
 		})
 
 		ttl := time.Until(svid.ExpiresAt)
 		loopLog.WithField(telemetry.TTL, ttl.Seconds()).Debug("Fetched JWT SVID")
 	}
 
+	if len(resp.Svids) == 0 {
+		log.Error("No identity issued")
+		return nil, status.Error(codes.PermissionDenied, "no identity issued")
+	}
+
 	return resp, nil
 }
 
-func (s *Service) SubscribeToJWTBundles(req *delegatedidentityv1.SubscribeToJWTBundlesRequest, stream delegatedidentityv1.DelegatedIdentity_SubscribeToJWTBundlesServer) error {
+func (s *Service) SubscribeToJWTBundles(_ *delegatedidentityv1.SubscribeToJWTBundlesRequest, stream delegatedidentityv1.DelegatedIdentity_SubscribeToJWTBundlesServer) error {
 	ctx := stream.Context()
 	log := rpccontext.Logger(ctx)
 

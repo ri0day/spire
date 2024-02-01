@@ -18,6 +18,8 @@ import (
 	"testing"
 	"time"
 
+	jose "github.com/go-jose/go-jose/v3"
+	"github.com/go-jose/go-jose/v3/jwt"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	agentstorev1 "github.com/spiffe/spire-plugin-sdk/proto/spire/hostservice/server/agentstore/v1"
 	"github.com/spiffe/spire/pkg/common/catalog"
@@ -29,8 +31,6 @@ import (
 	"github.com/spiffe/spire/test/plugintest"
 	"github.com/spiffe/spire/test/spiretest"
 	"google.golang.org/grpc/codes"
-	jose "gopkg.in/square/go-jose.v2"
-	"gopkg.in/square/go-jose.v2/jwt"
 	authv1 "k8s.io/api/authentication/v1"
 )
 
@@ -524,7 +524,7 @@ func createTokenStatus(namespace, serviceAccountName string, authenticated bool)
 	}
 }
 
-func expectNoChallenge(ctx context.Context, challenge []byte) ([]byte, error) {
+func expectNoChallenge(context.Context, []byte) ([]byte, error) {
 	return nil, errors.New("challenge is not expected")
 }
 
@@ -542,7 +542,7 @@ func (c *fakeAPIServerClient) SetTokenStatus(token string, status *authv1.TokenR
 	c.status[token] = status
 }
 
-func (c *fakeAPIServerClient) ValidateToken(ctx context.Context, token string, audiences []string) (*authv1.TokenReviewStatus, error) {
+func (c *fakeAPIServerClient) ValidateToken(_ context.Context, token string, audiences []string) (*authv1.TokenReviewStatus, error) {
 	if len(audiences) > 0 {
 		return nil, fmt.Errorf("unexpected audiences %q", audiences)
 	}

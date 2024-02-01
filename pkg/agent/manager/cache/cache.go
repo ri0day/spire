@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"context"
 	"crypto"
 	"crypto/x509"
 	"sort"
@@ -8,14 +9,14 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
+	"github.com/spiffe/go-spiffe/v2/bundle/spiffebundle"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
-	"github.com/spiffe/spire/pkg/common/bundleutil"
 	"github.com/spiffe/spire/pkg/common/telemetry"
 	"github.com/spiffe/spire/proto/spire/common"
 )
 
 type Selectors []*common.Selector
-type Bundle = bundleutil.Bundle
+type Bundle = spiffebundle.Bundle
 
 // Identity holds the data for a single workload identity
 type Identity struct {
@@ -27,8 +28,8 @@ type Identity struct {
 // WorkloadUpdate is used to convey workload information to cache subscribers
 type WorkloadUpdate struct {
 	Identities       []Identity
-	Bundle           *bundleutil.Bundle
-	FederatedBundles map[spiffeid.TrustDomain]*bundleutil.Bundle
+	Bundle           *spiffebundle.Bundle
+	FederatedBundles map[spiffeid.TrustDomain]*spiffebundle.Bundle
 }
 
 func (u *WorkloadUpdate) HasIdentity() bool {
@@ -38,7 +39,7 @@ func (u *WorkloadUpdate) HasIdentity() bool {
 // Update holds information for an entries update to the cache.
 type UpdateEntries struct {
 	// Bundles is a set of ALL trust bundles available to the agent, keyed by trust domain
-	Bundles map[spiffeid.TrustDomain]*bundleutil.Bundle
+	Bundles map[spiffeid.TrustDomain]*spiffebundle.Bundle
 
 	// RegistrationEntries is a set of ALL registration entries available to the
 	// agent, keyed by registration entry id.
@@ -63,9 +64,10 @@ type X509SVID struct {
 // selector sets and notifies subscribers when:
 //
 // 1) a registration entry related to the selectors:
-//   * is modified
-//   * has a new X509-SVID signed for it
-//   * federates with a federated bundle that is updated
+//   - is modified
+//   - has a new X509-SVID signed for it
+//   - federates with a federated bundle that is updated
+//
 // 2) the trust bundle for the agent trust domain is updated
 //
 // When notified, the subscriber is given a WorkloadUpdate containing
@@ -117,7 +119,7 @@ type Cache struct {
 	staleEntries map[string]bool
 
 	// bundles holds the trust bundles, keyed by trust domain id (i.e. "spiffe://domain.test")
-	bundles map[spiffeid.TrustDomain]*bundleutil.Bundle
+	bundles map[spiffeid.TrustDomain]*spiffebundle.Bundle
 }
 
 // StaleEntry holds stale entries with SVIDs expiration time
@@ -125,7 +127,7 @@ type StaleEntry struct {
 	// Entry stale registration entry
 	Entry *common.RegistrationEntry
 	// SVIDs expiration time
-	ExpiresAt time.Time
+	SVIDExpiresAt time.Time
 }
 
 func New(log logrus.FieldLogger, trustDomain spiffeid.TrustDomain, bundle *Bundle, metrics telemetry.Metrics) *Cache {
@@ -139,7 +141,7 @@ func New(log logrus.FieldLogger, trustDomain spiffeid.TrustDomain, bundle *Bundl
 		records:      make(map[string]*cacheRecord),
 		selectors:    make(map[selector]*selectorIndex),
 		staleEntries: make(map[string]bool),
-		bundles: map[spiffeid.TrustDomain]*bundleutil.Bundle{
+		bundles: map[spiffeid.TrustDomain]*spiffebundle.Bundle{
 			trustDomain: bundle,
 		},
 	}
@@ -199,16 +201,8 @@ func (c *Cache) FetchWorkloadUpdate(selectors []*common.Selector) *WorkloadUpdat
 	return c.buildWorkloadUpdate(set)
 }
 
-func (c *Cache) SubscribeToWorkloadUpdates(selectors []*common.Selector) Subscriber {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	sub := newSubscriber(c, selectors)
-	for s := range sub.set {
-		c.addSelectorIndexSub(s, sub)
-	}
-	c.notify(sub)
-	return sub
+func (c *Cache) SubscribeToWorkloadUpdates(_ context.Context, selectors Selectors) (Subscriber, error) {
+	return c.subscribeToWorkloadUpdates(selectors), nil
 }
 
 // UpdateEntries updates the cache with the provided registration entries and bundles and
@@ -240,7 +234,7 @@ func (c *Cache) UpdateEntries(update *UpdateEntries, checkSVID func(*common.Regi
 	bundleChanged := make(map[spiffeid.TrustDomain]bool)
 	for id, bundle := range update.Bundles {
 		existing, ok := c.bundles[id]
-		if !(ok && existing.EqualTo(bundle)) {
+		if !(ok && existing.Equal(bundle)) {
 			if !ok {
 				c.log.WithField(telemetry.TrustDomainID, id).Debug("Bundle added")
 			} else {
@@ -277,10 +271,10 @@ func (c *Cache) UpdateEntries(update *UpdateEntries, checkSVID func(*common.Regi
 			// built a set of selectors for the record being removed, drop the
 			// record for each selector index, and add the entry selectors to
 			// the notify set.
-			clearSelectorSet(selRem)
-			selRem.Merge(record.entry.Selectors...)
-			c.delSelectorIndicesRecord(selRem, record)
-			notifySets = append(notifySets, selRem)
+			notifySet, notifySetDone := allocSelectorSet(record.entry.Selectors...)
+			defer notifySetDone()
+			c.delSelectorIndicesRecord(notifySet, record)
+			notifySets = append(notifySets, notifySet)
 			delete(c.records, id)
 			// Remove stale entry since, registration entry is no longer on cache.
 			delete(c.staleEntries, id)
@@ -326,21 +320,19 @@ func (c *Cache) UpdateEntries(update *UpdateEntries, checkSVID func(*common.Regi
 		}
 
 		// If any selectors or federated bundles were changed, then make
-		// sure subscribers for the new and extisting entry selector sets
+		// sure subscribers for the new and existing entry selector sets
 		// are notified.
 		if selectorsChanged {
 			if existingEntry != nil {
-				notifySet, selSetDone := allocSelectorSet()
-				defer selSetDone()
-				notifySet.Merge(existingEntry.Selectors...)
+				notifySet, notifySetDone := allocSelectorSet(existingEntry.Selectors...)
+				defer notifySetDone()
 				notifySets = append(notifySets, notifySet)
 			}
 		}
 
 		if federatedBundlesChanged || selectorsChanged {
-			notifySet, selSetDone := allocSelectorSet()
-			defer selSetDone()
-			notifySet.Merge(newEntry.Selectors...)
+			notifySet, notifySetDone := allocSelectorSet(newEntry.Selectors...)
+			defer notifySetDone()
 			notifySets = append(notifySets, notifySet)
 		}
 
@@ -391,8 +383,8 @@ func (c *Cache) UpdateSVIDs(update *UpdateSVIDs) {
 	defer c.mu.Unlock()
 
 	// Allocate a set of selectors that
-	notifySet, selSetDone := allocSelectorSet()
-	defer selSetDone()
+	notifySet, notifySetDone := allocSelectorSet()
+	defer notifySetDone()
 
 	// Add/update records for registration entries in the update
 	for entryID, svid := range update.X509SVIDs {
@@ -437,12 +429,61 @@ func (c *Cache) GetStaleEntries() []*StaleEntry {
 		}
 
 		staleEntries = append(staleEntries, &StaleEntry{
-			Entry:     cachedEntry.entry,
-			ExpiresAt: expiresAt,
+			Entry:         cachedEntry.entry,
+			SVIDExpiresAt: expiresAt,
 		})
 	}
 
 	return staleEntries
+}
+
+func (c *Cache) MatchingRegistrationEntries(selectors []*common.Selector) []*common.RegistrationEntry {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	set, setDone := allocSelectorSet(selectors...)
+	defer setDone()
+
+	records, recordsDone := c.getRecordsForSelectors(set)
+	defer recordsDone()
+
+	// Return identities in ascending "entry id" order to maintain a consistent
+	// ordering.
+	// TODO: figure out how to determine the "default" identity
+	out := make([]*common.RegistrationEntry, 0, len(records))
+	for record := range records {
+		out = append(out, record.entry)
+	}
+	sortEntriesByID(out)
+	return out
+}
+
+func (c *Cache) Entries() []*common.RegistrationEntry {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	out := make([]*common.RegistrationEntry, 0, len(c.records))
+	for _, record := range c.records {
+		out = append(out, record.entry)
+	}
+	sortEntriesByID(out)
+	return out
+}
+
+func (c *Cache) SyncSVIDsWithSubscribers() {
+	c.log.Error("SyncSVIDsWithSubscribers method is not implemented")
+}
+
+func (c *Cache) subscribeToWorkloadUpdates(selectors []*common.Selector) Subscriber {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	sub := newSubscriber(c, selectors)
+	for s := range sub.set {
+		c.addSelectorIndexSub(s, sub)
+	}
+	c.notify(sub)
+	return sub
 }
 
 func (c *Cache) updateOrCreateRecord(newEntry *common.RegistrationEntry) (*cacheRecord, *common.RegistrationEntry) {
@@ -625,7 +666,7 @@ func (c *Cache) matchingIdentities(set selectorSet) []Identity {
 func (c *Cache) buildWorkloadUpdate(set selectorSet) *WorkloadUpdate {
 	w := &WorkloadUpdate{
 		Bundle:           c.bundles[c.trustDomain],
-		FederatedBundles: make(map[spiffeid.TrustDomain]*bundleutil.Bundle),
+		FederatedBundles: make(map[spiffeid.TrustDomain]*spiffebundle.Bundle),
 		Identities:       c.matchingIdentities(set),
 	}
 

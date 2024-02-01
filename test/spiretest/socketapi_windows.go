@@ -1,25 +1,24 @@
 //go:build windows
-// +build windows
 
 package spiretest
 
 import (
+	"crypto/rand"
+	"encoding/binary"
 	"fmt"
-	"math/rand"
 	"net"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/Microsoft/go-winio"
 	"github.com/spiffe/go-spiffe/v2/proto/spiffe/workload"
-	"github.com/spiffe/spire/pkg/common/util"
+	"github.com/spiffe/spire/pkg/common/namedpipe"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 )
 
 func StartWorkloadAPI(t *testing.T, server workload.SpiffeWorkloadAPIServer) net.Addr {
-	return StartWorkloadAPIOnNamedPipe(t, util.GetPipeName(GetRandNamedPipeAddr().String()), server)
+	return StartWorkloadAPIOnNamedPipe(t, namedpipe.GetPipeName(GetRandNamedPipeAddr().String()), server)
 }
 
 func StartWorkloadAPIOnNamedPipe(t *testing.T, pipeName string, server workload.SpiffeWorkloadAPIServer) net.Addr {
@@ -43,7 +42,7 @@ func ServeGRPCServerOnNamedPipe(t *testing.T, server *grpc.Server, pipeName stri
 	listener, err := winio.ListenPipe(fmt.Sprintf(`\\.\`+filepath.Join("pipe", pipeName)), nil)
 	require.NoError(t, err)
 	ServeGRPCServerOnListener(t, server, listener)
-	return util.GetNamedPipeAddr(util.GetPipeName(listener.Addr().String()))
+	return namedpipe.AddrFromName(namedpipe.GetPipeName(listener.Addr().String()))
 }
 
 func ServeGRPCServerOnRandPipeName(t *testing.T, server *grpc.Server) net.Addr {
@@ -51,9 +50,13 @@ func ServeGRPCServerOnRandPipeName(t *testing.T, server *grpc.Server) net.Addr {
 }
 
 func GetRandNamedPipeAddr() net.Addr {
-	return util.GetNamedPipeAddr(fmt.Sprintf("spire-test-%x", rand.Uint64())) // nolint: gosec // used for testing only
+	return namedpipe.AddrFromName(fmt.Sprintf("spire-test-%x", randUint64()))
 }
 
-func init() {
-	rand.Seed(time.Now().UnixNano())
+func randUint64() uint64 {
+	var value uint64
+	if err := binary.Read(rand.Reader, binary.LittleEndian, &value); err != nil {
+		panic(fmt.Sprintf("failed to generate random value for pipe name: %v", err))
+	}
+	return value
 }

@@ -43,7 +43,7 @@ type Config struct {
 	HealthChecks health.Config
 
 	// Configurations for agent plugins
-	PluginConfigs catalog.HCLPluginConfigMap
+	PluginConfigs catalog.PluginConfigs
 
 	Log logrus.FieldLogger
 
@@ -58,6 +58,16 @@ type Config struct {
 
 	// SyncInterval controls how often the agent sync synchronizer waits
 	SyncInterval time.Duration
+
+	// UseSyncAuthorizedEntries controls if the new SyncAuthorizedEntries RPC
+	// is used to sync entries from the server.
+	UseSyncAuthorizedEntries bool
+
+	// X509SVIDCacheMaxSize is a soft limit of max number of SVIDs that would be stored in cache
+	X509SVIDCacheMaxSize int
+
+	// DisableLRUCache disables the SPIRE Agent LRU cache used for storing SVIDs and fallback to original cache
+	DisableLRUCache bool
 
 	// Trust domain and associated CA bundle
 	TrustDomain spiffeid.TrustDomain
@@ -87,6 +97,9 @@ type Config struct {
 	AllowedForeignJWTClaims []string
 
 	AuthorizedDelegates []string
+
+	// AvailabilityTarget controls how frequently rotate SVIDs
+	AvailabilityTarget time.Duration
 }
 
 func New(c *Config) *Agent {

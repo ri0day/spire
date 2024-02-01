@@ -3,12 +3,14 @@ package debug_test
 import (
 	"context"
 	"crypto/ecdsa"
+	"crypto/x509"
 	"crypto/x509/pkix"
 	"testing"
 	"time"
 
 	"github.com/sirupsen/logrus"
 	"github.com/sirupsen/logrus/hooks/test"
+	"github.com/spiffe/go-spiffe/v2/bundle/spiffebundle"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	debugv1 "github.com/spiffe/spire-api-sdk/proto/spire/api/agent/debug/v1"
 	"github.com/spiffe/spire-api-sdk/proto/spire/api/types"
@@ -16,8 +18,8 @@ import (
 	"github.com/spiffe/spire/pkg/agent/manager"
 	"github.com/spiffe/spire/pkg/agent/manager/cache"
 	"github.com/spiffe/spire/pkg/agent/svid"
-	"github.com/spiffe/spire/pkg/common/bundleutil"
 	"github.com/spiffe/spire/test/clock"
+	"github.com/spiffe/spire/test/grpctest"
 	"github.com/spiffe/spire/test/spiretest"
 	"github.com/spiffe/spire/test/testca"
 	"github.com/stretchr/testify/require"
@@ -36,7 +38,7 @@ func TestGetInfo(t *testing.T) {
 	ca := testca.New(t, td)
 	cachedBundleCert := ca.Bundle().X509Authorities()[0]
 	trustDomain := spiffeid.RequireTrustDomainFromString("example.org")
-	cachedBundle := bundleutil.BundleFromRootCA(trustDomain, cachedBundleCert)
+	cachedBundle := spiffebundle.FromX509Authorities(trustDomain, []*x509.Certificate{cachedBundleCert})
 
 	x509SVID := ca.CreateX509SVID(spiffeid.RequireFromPath(td, "/spire/agent/foo"))
 
@@ -68,7 +70,7 @@ func TestGetInfo(t *testing.T) {
 		SVID: svidWithIntermediate.Certificates,
 		Key:  svidWithIntermediate.PrivateKey.(*ecdsa.PrivateKey),
 	}
-	// Manually create SVID chain with intemediate
+	// Manually create SVID chain with intermediate
 	svidWithIntermediateChain := []*debugv1.GetInfoResponse_Cert{
 		{
 			Id:        &types.SPIFFEID{TrustDomain: "example.org", Path: "/spire/agent/bar"},
@@ -249,15 +251,12 @@ func setupServiceTest(t *testing.T) *serviceTest {
 		uptime:  fakeUptime,
 	}
 
-	registerFn := func(s *grpc.Server) {
+	registerFn := func(s grpc.ServiceRegistrar) {
 		debug.RegisterService(s, service)
 	}
-	contextFn := func(ctx context.Context) context.Context {
-		return ctx
-	}
-	conn, done := spiretest.NewAPIServer(t, registerFn, contextFn)
-	test.done = done
-	test.client = debugv1.NewDebugClient(conn)
+	server := grpctest.StartServer(t, registerFn)
+	test.done = server.Stop
+	test.client = debugv1.NewDebugClient(server.Dial(t))
 
 	return test
 }

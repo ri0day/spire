@@ -1,3 +1,4 @@
+
 syntax = "proto3";
 package spire.common;
 option go_package = "github.com/spiffe/spire/proto/spire/common";
@@ -68,8 +69,8 @@ message RegistrationEntry {
     caller. It is defined as a URI comprising a “trust domain” and an
     associated path. */
     string spiffe_id = 3;
-    /** Time to live. */
-    int32 ttl = 4;
+    /** Time to live for X509-SVIDs generated from this entry. Was previously called 'ttl'. */
+    int32 x509_svid_ttl = 4;
     /** A list of federated trust domain SPIFFE IDs. */
     repeated string federates_with = 5;
     /** Entry ID */
@@ -88,6 +89,13 @@ message RegistrationEntry {
     int64 revision_number = 11;
     /** Determines if the issued SVID must be stored through an SVIDStore plugin */
     bool store_svid = 12;
+    /** Time to live for JWT-SVIDs generated from this entry, if set will override ttl field. */
+    int32 jwt_svid_ttl = 13;
+    /** An operator-specified string used to provide guidance on how this
+    identity should be used by a workload when more than one SVID is returned. */
+    string hint = 14;
+    /** Time of creation, in seconds from epoch */
+    int64 created_at = 15;
 }
 
 /** The RegistrationEntryMask is used to update only selected fields of the RegistrationEntry */
@@ -95,7 +103,7 @@ message RegistrationEntryMask {
     bool selectors = 1;
     bool parent_id = 2;
     bool spiffe_id = 3;
-    bool ttl = 4;
+    bool x509_svid_ttl = 4;
     bool federates_with = 5;
     bool entry_id = 6;
     bool admin = 7;
@@ -103,6 +111,8 @@ message RegistrationEntryMask {
     bool entryExpiry = 9;
     bool dns_names = 10;
     bool store_svid = 11;
+    bool jwt_svid_ttl = 12;
+    bool hint = 13;
 }
 
 
@@ -127,6 +137,9 @@ message PublicKey {
 
     /** not after (seconds since unix epoch, 0 means "never expires") */
     int64 not_after = 3;
+
+    /** Whether or not the key is tainted */
+    bool tainted_key = 4;
 }
 
 message Bundle {
@@ -142,12 +155,26 @@ message Bundle {
     /** refresh hint is a hint, in seconds, on how often a bundle consumer
      * should poll for bundle updates */
     int64 refresh_hint = 4;
+
+    /** sequence number is a monotonically increasing number that is
+     * incremented every time the bundle is updated */
+    uint64 sequence_number = 5;
+
+    /** list of X.509 tainted keys */
+    repeated X509TaintedKey x509_tainted_keys = 6;
+}
+
+message X509TaintedKey {
+        /** tainted public key*/
+	bytes public_key = 1;
 }
 
 message BundleMask {
     bool root_cas = 1;
     bool jwt_signing_keys = 2;
     bool refresh_hint = 3;
+    bool sequence_number = 4;
+    bool x509_tainted_keys = 5;
 }
 
 message AttestedNodeMask{

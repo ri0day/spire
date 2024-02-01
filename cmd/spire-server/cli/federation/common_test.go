@@ -103,6 +103,8 @@ const (
 }`
 )
 
+var availableFormats = []string{"pretty", "json"}
+
 type cmdTest struct {
 	stdin  *bytes.Buffer
 	stdout *bytes.Buffer
@@ -146,7 +148,7 @@ type fakeServer struct {
 	updateResp  *trustdomainv1.BatchUpdateFederationRelationshipResponse
 }
 
-func (f *fakeServer) BatchCreateFederationRelationship(ctx context.Context, req *trustdomainv1.BatchCreateFederationRelationshipRequest) (*trustdomainv1.BatchCreateFederationRelationshipResponse, error) {
+func (f *fakeServer) BatchCreateFederationRelationship(_ context.Context, req *trustdomainv1.BatchCreateFederationRelationshipRequest) (*trustdomainv1.BatchCreateFederationRelationshipResponse, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -155,7 +157,7 @@ func (f *fakeServer) BatchCreateFederationRelationship(ctx context.Context, req 
 	return f.createResp, nil
 }
 
-func (f *fakeServer) BatchDeleteFederationRelationship(ctx context.Context, req *trustdomainv1.BatchDeleteFederationRelationshipRequest) (*trustdomainv1.BatchDeleteFederationRelationshipResponse, error) {
+func (f *fakeServer) BatchDeleteFederationRelationship(_ context.Context, req *trustdomainv1.BatchDeleteFederationRelationshipRequest) (*trustdomainv1.BatchDeleteFederationRelationshipResponse, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -164,7 +166,7 @@ func (f *fakeServer) BatchDeleteFederationRelationship(ctx context.Context, req 
 	return f.deleteResp, nil
 }
 
-func (f *fakeServer) ListFederationRelationships(ctx context.Context, req *trustdomainv1.ListFederationRelationshipsRequest) (*trustdomainv1.ListFederationRelationshipsResponse, error) {
+func (f *fakeServer) ListFederationRelationships(_ context.Context, req *trustdomainv1.ListFederationRelationshipsRequest) (*trustdomainv1.ListFederationRelationshipsResponse, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -173,7 +175,7 @@ func (f *fakeServer) ListFederationRelationships(ctx context.Context, req *trust
 	return f.listResp, nil
 }
 
-func (f *fakeServer) GetFederationRelationship(ctx context.Context, req *trustdomainv1.GetFederationRelationshipRequest) (*types.FederationRelationship, error) {
+func (f *fakeServer) GetFederationRelationship(_ context.Context, req *trustdomainv1.GetFederationRelationshipRequest) (*types.FederationRelationship, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -185,7 +187,7 @@ func (f *fakeServer) GetFederationRelationship(ctx context.Context, req *trustdo
 	return &types.FederationRelationship{}, status.Error(codes.NotFound, "federation relationship does not exist")
 }
 
-func (f *fakeServer) RefreshBundle(ctx context.Context, req *trustdomainv1.RefreshBundleRequest) (*emptypb.Empty, error) {
+func (f *fakeServer) RefreshBundle(_ context.Context, req *trustdomainv1.RefreshBundleRequest) (*emptypb.Empty, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -194,7 +196,7 @@ func (f *fakeServer) RefreshBundle(ctx context.Context, req *trustdomainv1.Refre
 	return f.refreshResp, nil
 }
 
-func (f *fakeServer) BatchUpdateFederationRelationship(ctx context.Context, req *trustdomainv1.BatchUpdateFederationRelationshipRequest) (*trustdomainv1.BatchUpdateFederationRelationshipResponse, error) {
+func (f *fakeServer) BatchUpdateFederationRelationship(_ context.Context, req *trustdomainv1.BatchUpdateFederationRelationshipRequest) (*trustdomainv1.BatchUpdateFederationRelationshipResponse, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -239,12 +241,12 @@ func createBundle(t *testing.T, trustDomain string) (*types.Bundle, string) {
 	td := spiffeid.RequireTrustDomainFromString(trustDomain)
 	bundlePath := path.Join(t.TempDir(), "bundle.pem")
 	ca := fakeserverca.New(t, td, &fakeserverca.Options{})
-	require.NoError(t, pemutil.SaveCertificates(bundlePath, ca.Bundle(), 0600))
+	require.NoError(t, os.WriteFile(bundlePath, pemutil.EncodeCertificates(ca.Bundle()), 0600))
 
 	return &types.Bundle{
-		TrustDomain: td.String(),
+		TrustDomain: td.Name(),
 		X509Authorities: []*types.X509Certificate{
-			{Asn1: ca.X509CA().Certificate.Raw},
+			{Asn1: ca.Bundle()[0].Raw},
 		},
 	}, bundlePath
 }
@@ -259,4 +261,17 @@ func createJSONDataFile(t *testing.T, data string) string {
 	jsonDataFilePath := path.Join(t.TempDir(), "bundle.pem")
 	require.NoError(t, os.WriteFile(jsonDataFilePath, []byte(data), 0600))
 	return jsonDataFilePath
+}
+
+func requireOutputBasedOnFormat(t *testing.T, format, stdoutString string, expectedStdoutPretty, expectedStdoutJSON string) {
+	switch format {
+	case "pretty":
+		require.Contains(t, stdoutString, expectedStdoutPretty)
+	case "json":
+		if expectedStdoutJSON != "" {
+			require.JSONEq(t, expectedStdoutJSON, stdoutString)
+		} else {
+			require.Empty(t, stdoutString)
+		}
+	}
 }

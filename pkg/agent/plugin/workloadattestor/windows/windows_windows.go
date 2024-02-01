@@ -1,5 +1,4 @@
 //go:build windows
-// +build windows
 
 package windows
 
@@ -7,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"sync"
-	"syscall"
 
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/hcl"
@@ -62,7 +60,7 @@ func (p *Plugin) SetLogger(log hclog.Logger) {
 	p.log = log
 }
 
-func (p *Plugin) Attest(ctx context.Context, req *workloadattestorv1.AttestRequest) (*workloadattestorv1.AttestResponse, error) {
+func (p *Plugin) Attest(_ context.Context, req *workloadattestorv1.AttestRequest) (*workloadattestorv1.AttestResponse, error) {
 	config, err := p.getConfig()
 	if err != nil {
 		return nil, err
@@ -176,7 +174,7 @@ func (p *Plugin) newProcessInfo(pid int32, queryPath bool) (*processInfo, error)
 	return processInfo, nil
 }
 
-func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) (*configv1.ConfigureResponse, error) {
+func (p *Plugin) Configure(_ context.Context, req *configv1.ConfigureRequest) (*configv1.ConfigureResponse, error) {
 	config := new(Configuration)
 	if err := hcl.Decode(config, req.HclConfiguration); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "failed to decode configuration: %v", err)
@@ -235,15 +233,14 @@ type processQueryer interface {
 	GetProcessExe(windows.Handle) (string, error)
 }
 
-type processQuery struct {
-}
+type processQuery struct{}
 
 func (q *processQuery) OpenProcess(pid int32) (handle windows.Handle, err error) {
 	return windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
 }
 
 func (q *processQuery) OpenProcessToken(h windows.Handle, token *windows.Token) (err error) {
-	return windows.OpenProcessToken(h, syscall.TOKEN_QUERY, token)
+	return windows.OpenProcessToken(h, windows.TOKEN_QUERY, token)
 }
 
 func (q *processQuery) LookupAccount(sid *windows.SID) (account, domain string, err error) {
@@ -272,8 +269,8 @@ func (q *processQuery) CloseProcessToken(t windows.Token) error {
 }
 
 func (q *processQuery) GetProcessExe(h windows.Handle) (string, error) {
-	buf := make([]uint16, syscall.MAX_LONG_PATH)
-	size := uint32(syscall.MAX_LONG_PATH)
+	buf := make([]uint16, windows.MAX_LONG_PATH)
+	size := uint32(windows.MAX_LONG_PATH)
 
 	if err := windows.QueryFullProcessImageName(h, 0, &buf[0], &size); err != nil {
 		return "", err

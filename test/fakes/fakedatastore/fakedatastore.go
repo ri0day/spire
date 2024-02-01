@@ -2,6 +2,7 @@ package fakedatastore
 
 import (
 	"context"
+	"crypto"
 	"fmt"
 	"sort"
 	"sync/atomic"
@@ -36,6 +37,7 @@ func New(tb testing.TB) *DataStore {
 	log, _ := test.NewNullLogger()
 
 	ds := sql.New(log)
+	ds.SetUseServerTimestamps(true)
 
 	err := ds.Configure(ctx, fmt.Sprintf(`
 		database_type = "sqlite3"
@@ -161,6 +163,55 @@ func (s *DataStore) DeleteAttestedNode(ctx context.Context, spiffeID string) (*c
 	return s.ds.DeleteAttestedNode(ctx, spiffeID)
 }
 
+func (s *DataStore) ListAttestedNodesEvents(ctx context.Context, req *datastore.ListAttestedNodesEventsRequest) (*datastore.ListAttestedNodesEventsResponse, error) {
+	if err := s.getNextError(); err != nil {
+		return nil, err
+	}
+	return s.ds.ListAttestedNodesEvents(ctx, req)
+}
+
+func (s *DataStore) PruneAttestedNodesEvents(ctx context.Context, olderThan time.Duration) error {
+	if err := s.getNextError(); err != nil {
+		return err
+	}
+	return s.ds.PruneAttestedNodesEvents(ctx, olderThan)
+}
+
+func (s *DataStore) GetLatestAttestedNodeEventID(ctx context.Context) (uint, error) {
+	if err := s.getNextError(); err != nil {
+		return 0, err
+	}
+	return s.ds.GetLatestAttestedNodeEventID(ctx)
+}
+
+func (s *DataStore) TaintX509CA(ctx context.Context, trustDomainID string, publicKeyToTaint crypto.PublicKey) error {
+	if err := s.getNextError(); err != nil {
+		return err
+	}
+	return s.ds.TaintX509CA(ctx, trustDomainID, publicKeyToTaint)
+}
+
+func (s *DataStore) RevokeX509CA(ctx context.Context, trustDomainID string, publicKeyToRevoke crypto.PublicKey) error {
+	if err := s.getNextError(); err != nil {
+		return err
+	}
+	return s.ds.RevokeX509CA(ctx, trustDomainID, publicKeyToRevoke)
+}
+
+func (s *DataStore) TaintJWTKey(ctx context.Context, trustDomainID string, authorityID string) (*common.PublicKey, error) {
+	if err := s.getNextError(); err != nil {
+		return nil, err
+	}
+	return s.ds.TaintJWTKey(ctx, trustDomainID, authorityID)
+}
+
+func (s *DataStore) RevokeJWTKey(ctx context.Context, trustDomainID string, authorityID string) (*common.PublicKey, error) {
+	if err := s.getNextError(); err != nil {
+		return nil, err
+	}
+	return s.ds.RevokeJWTKey(ctx, trustDomainID, authorityID)
+}
+
 func (s *DataStore) SetNodeSelectors(ctx context.Context, spiffeID string, selectors []*common.Selector) error {
 	if err := s.getNextError(); err != nil {
 		return err
@@ -248,6 +299,27 @@ func (s *DataStore) PruneRegistrationEntries(ctx context.Context, expiresBefore 
 	return s.ds.PruneRegistrationEntries(ctx, expiresBefore)
 }
 
+func (s *DataStore) ListRegistrationEntriesEvents(ctx context.Context, req *datastore.ListRegistrationEntriesEventsRequest) (*datastore.ListRegistrationEntriesEventsResponse, error) {
+	if err := s.getNextError(); err != nil {
+		return nil, err
+	}
+	return s.ds.ListRegistrationEntriesEvents(ctx, req)
+}
+
+func (s *DataStore) PruneRegistrationEntriesEvents(ctx context.Context, olderThan time.Duration) error {
+	if err := s.getNextError(); err != nil {
+		return err
+	}
+	return s.ds.PruneRegistrationEntriesEvents(ctx, olderThan)
+}
+
+func (s *DataStore) GetLatestRegistrationEntryEventID(ctx context.Context) (uint, error) {
+	if err := s.getNextError(); err != nil {
+		return 0, err
+	}
+	return s.ds.GetLatestRegistrationEntryEventID(ctx)
+}
+
 func (s *DataStore) CreateJoinToken(ctx context.Context, token *datastore.JoinToken) error {
 	if err := s.getNextError(); err != nil {
 		return err
@@ -309,6 +381,34 @@ func (s *DataStore) UpdateFederationRelationship(ctx context.Context, fr *datast
 		return nil, err
 	}
 	return s.ds.UpdateFederationRelationship(ctx, fr, mask)
+}
+
+func (s *DataStore) FetchCAJournal(ctx context.Context, activeX509AuthorityID string) (*datastore.CAJournal, error) {
+	if err := s.getNextError(); err != nil {
+		return nil, err
+	}
+	return s.ds.FetchCAJournal(ctx, activeX509AuthorityID)
+}
+
+func (s *DataStore) ListCAJournalsForTesting(ctx context.Context) ([]*datastore.CAJournal, error) {
+	if err := s.getNextError(); err != nil {
+		return nil, err
+	}
+	return s.ds.ListCAJournalsForTesting(ctx)
+}
+
+func (s *DataStore) SetCAJournal(ctx context.Context, caJournal *datastore.CAJournal) (*datastore.CAJournal, error) {
+	if err := s.getNextError(); err != nil {
+		return nil, err
+	}
+	return s.ds.SetCAJournal(ctx, caJournal)
+}
+
+func (s *DataStore) PruneCAJournals(ctx context.Context, allCAsExpireBefore int64) error {
+	if err := s.getNextError(); err != nil {
+		return err
+	}
+	return s.ds.PruneCAJournals(ctx, allCAsExpireBefore)
 }
 
 func (s *DataStore) SetNextError(err error) {

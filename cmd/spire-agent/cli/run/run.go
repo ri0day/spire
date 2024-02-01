@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -20,11 +21,15 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/hashicorp/hcl"
+	"github.com/hashicorp/hcl/hcl/ast"
+	"github.com/hashicorp/hcl/hcl/token"
 	"github.com/imdario/mergo"
 	"github.com/mitchellh/cli"
 	"github.com/sirupsen/logrus"
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/spire/pkg/agent"
 	"github.com/spiffe/spire/pkg/agent/workloadkey"
+	"github.com/spiffe/spire/pkg/common/bundleutil"
 	"github.com/spiffe/spire/pkg/common/catalog"
 	common_cli "github.com/spiffe/spire/pkg/common/cli"
 	"github.com/spiffe/spire/pkg/common/fflag"
@@ -47,15 +52,20 @@ const (
 	defaultDefaultBundleName           = "ROOTCA"
 	defaultDefaultAllBundlesName       = "ALL"
 	defaultDisableSPIFFECertValidation = false
+
+	bundleFormatPEM    = "pem"
+	bundleFormatSPIFFE = "spiffe"
+
+	minimumAvailabilityTarget = 24 * time.Hour
 )
 
 // Config contains all available configurables, arranged by section
 type Config struct {
-	Agent        *agentConfig                `hcl:"agent"`
-	Plugins      *catalog.HCLPluginConfigMap `hcl:"plugins"`
-	Telemetry    telemetry.FileConfig        `hcl:"telemetry"`
-	HealthChecks health.Config               `hcl:"health_checks"`
-	UnusedKeys   []string                    `hcl:",unusedKeys"`
+	Agent              *agentConfig           `hcl:"agent"`
+	Plugins            ast.Node               `hcl:"plugins"`
+	Telemetry          telemetry.FileConfig   `hcl:"telemetry"`
+	HealthChecks       health.Config          `hcl:"health_checks"`
+	UnusedKeyPositions map[string][]token.Pos `hcl:",unusedKeyPositions"`
 }
 
 type agentConfig struct {
@@ -66,16 +76,19 @@ type agentConfig struct {
 	LogFile                       string    `hcl:"log_file"`
 	LogFormat                     string    `hcl:"log_format"`
 	LogLevel                      string    `hcl:"log_level"`
+	LogSourceLocation             bool      `hcl:"log_source_location"`
 	SDS                           sdsConfig `hcl:"sds"`
 	ServerAddress                 string    `hcl:"server_address"`
 	ServerPort                    int       `hcl:"server_port"`
 	SocketPath                    string    `hcl:"socket_path"`
 	WorkloadX509SVIDKeyType       string    `hcl:"workload_x509_svid_key_type"`
+	TrustBundleFormat             string    `hcl:"trust_bundle_format"`
 	TrustBundlePath               string    `hcl:"trust_bundle_path"`
 	TrustBundleURL                string    `hcl:"trust_bundle_url"`
 	TrustDomain                   string    `hcl:"trust_domain"`
 	AllowUnauthenticatedVerifiers bool      `hcl:"allow_unauthenticated_verifiers"`
 	AllowedForeignJWTClaims       []string  `hcl:"allowed_foreign_jwt_claims"`
+	AvailabilityTarget            string    `hcl:"availability_target"`
 
 	AuthorizedDelegates []string `hcl:"authorized_delegates"`
 
@@ -89,7 +102,7 @@ type agentConfig struct {
 	ProfilingNames   []string           `hcl:"profiling_names"`
 	Experimental     experimentalConfig `hcl:"experimental"`
 
-	UnusedKeys []string `hcl:",unusedKeys"`
+	UnusedKeyPositions map[string][]token.Pos `hcl:",unusedKeyPositions"`
 }
 
 type sdsConfig struct {
@@ -100,27 +113,32 @@ type sdsConfig struct {
 }
 
 type experimentalConfig struct {
-	SyncInterval       string `hcl:"sync_interval"`
-	NamedPipeName      string `hcl:"named_pipe_name"`
-	AdminNamedPipeName string `hcl:"admin_named_pipe_name"`
+	SyncInterval             string `hcl:"sync_interval"`
+	NamedPipeName            string `hcl:"named_pipe_name"`
+	AdminNamedPipeName       string `hcl:"admin_named_pipe_name"`
+	UseSyncAuthorizedEntries bool   `hcl:"use_sync_authorized_entries"`
 
 	Flags fflag.RawConfig `hcl:"feature_flags"`
 
-	UnusedKeys []string `hcl:",unusedKeys"`
+	UnusedKeyPositions   map[string][]token.Pos `hcl:",unusedKeyPositions"`
+	X509SVIDCacheMaxSize int                    `hcl:"x509_svid_cache_max_size"`
+	DisableLRUCache      bool                   `hcl:"disable_lru_cache"`
 }
 
 type Command struct {
+	ctx                context.Context
 	logOptions         []log.Option
 	env                *common_cli.Env
 	allowUnknownConfig bool
 }
 
-func NewRunCommand(logOptions []log.Option, allowUnknownConfig bool) cli.Command {
-	return newRunCommand(common_cli.DefaultEnv, logOptions, allowUnknownConfig)
+func NewRunCommand(ctx context.Context, logOptions []log.Option, allowUnknownConfig bool) cli.Command {
+	return newRunCommand(ctx, common_cli.DefaultEnv, logOptions, allowUnknownConfig)
 }
 
-func newRunCommand(env *common_cli.Env, logOptions []log.Option, allowUnknownConfig bool) *Command {
+func newRunCommand(ctx context.Context, env *common_cli.Env, logOptions []log.Option, allowUnknownConfig bool) *Command {
 	return &Command{
+		ctx:                ctx,
 		env:                env,
 		logOptions:         logOptions,
 		allowUnknownConfig: allowUnknownConfig,
@@ -182,7 +200,11 @@ func (cmd *Command) Run(args []string) int {
 
 	a := agent.New(c)
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	ctx := cmd.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	err = a.Run(ctx)
@@ -216,16 +238,30 @@ func (c *agentConfig) validate() error {
 		return errors.New("trust_domain must be configured")
 	}
 
+	// If insecure_bootstrap is set, trust_bundle_path or trust_bundle_url cannot be set
 	// If trust_bundle_url is set, download the trust bundle using HTTP and parse it from memory
 	// If trust_bundle_path is set, parse the trust bundle file on disk
 	// Both cannot be set
 	// The trust bundle URL must start with HTTPS
-	if c.TrustBundlePath == "" && c.TrustBundleURL == "" && !c.InsecureBootstrap {
+	if c.InsecureBootstrap {
+		switch {
+		case c.TrustBundleURL != "" && c.TrustBundlePath != "":
+			return errors.New("only one of insecure_bootstrap, trust_bundle_url, or trust_bundle_path can be specified, not the three options")
+		case c.TrustBundleURL != "":
+			return errors.New("only one of insecure_bootstrap or trust_bundle_url can be specified, not both")
+		case c.TrustBundlePath != "":
+			return errors.New("only one of insecure_bootstrap or trust_bundle_path can be specified, not both")
+		}
+	} else if c.TrustBundlePath == "" && c.TrustBundleURL == "" {
 		return errors.New("trust_bundle_path or trust_bundle_url must be configured unless insecure_bootstrap is set")
 	}
 
 	if c.TrustBundleURL != "" && c.TrustBundlePath != "" {
 		return errors.New("only one of trust_bundle_url or trust_bundle_path can be specified, not both")
+	}
+
+	if c.TrustBundleFormat != bundleFormatPEM && c.TrustBundleFormat != bundleFormatSPIFFE {
+		return fmt.Errorf("invalid value for trust_bundle_format, expected %q or %q", bundleFormatPEM, bundleFormatSPIFFE)
 	}
 
 	if c.TrustBundleURL != "" {
@@ -288,11 +324,13 @@ func parseFlags(name string, args []string, output io.Writer) (*agentConfig, err
 	flags.StringVar(&c.LogFile, "logFile", "", "File to write logs to")
 	flags.StringVar(&c.LogFormat, "logFormat", "", "'text' or 'json'")
 	flags.StringVar(&c.LogLevel, "logLevel", "", "'debug', 'info', 'warn', or 'error'")
+	flags.BoolVar(&c.LogSourceLocation, "logSourceLocation", false, "Include source file, line number and function name in log lines")
 	flags.StringVar(&c.ServerAddress, "serverAddress", "", "IP address or DNS name of the SPIRE server")
 	flags.IntVar(&c.ServerPort, "serverPort", 0, "Port number of the SPIRE server")
 	flags.StringVar(&c.TrustDomain, "trustDomain", "", "The trust domain that this agent belongs to")
 	flags.StringVar(&c.TrustBundlePath, "trustBundle", "", "Path to the SPIRE server CA bundle")
 	flags.StringVar(&c.TrustBundleURL, "trustBundleUrl", "", "URL to download the SPIRE server CA bundle")
+	flags.StringVar(&c.TrustBundleFormat, "trustBundleFormat", "", fmt.Sprintf("Format of the bootstrap trust bundle, %q or %q", bundleFormatPEM, bundleFormatSPIFFE))
 	flags.BoolVar(&c.AllowUnauthenticatedVerifiers, "allowUnauthenticatedVerifiers", false, "If true, the agent permits the retrieval of X509 certificate bundles by unregistered clients")
 	flags.BoolVar(&c.InsecureBootstrap, "insecureBootstrap", false, "If true, the agent bootstraps without verifying the server's identity")
 	flags.BoolVar(&c.ExpandEnv, "expandEnv", false, "Expand environment variables in SPIRE config file")
@@ -329,7 +367,26 @@ func mergeInput(fileInput *Config, cliInput *agentConfig) (*Config, error) {
 	return c, nil
 }
 
-func downloadTrustBundle(trustBundleURL string) ([]*x509.Certificate, error) {
+func parseTrustBundle(bundleBytes []byte, trustBundleContentType string) ([]*x509.Certificate, error) {
+	switch trustBundleContentType {
+	case bundleFormatPEM:
+		bundle, err := pemutil.ParseCertificates(bundleBytes)
+		if err != nil {
+			return nil, err
+		}
+		return bundle, nil
+	case bundleFormatSPIFFE:
+		bundle, err := bundleutil.Unmarshal(spiffeid.TrustDomain{}, bundleBytes)
+		if err != nil {
+			return nil, fmt.Errorf("unable to parse SPIFFE trust bundle: %w", err)
+		}
+		return bundle.X509Authorities(), nil
+	}
+
+	return nil, fmt.Errorf("unknown trust bundle format: %s", trustBundleContentType)
+}
+
+func downloadTrustBundle(trustBundleURL string) ([]byte, error) {
 	// Download the trust bundle URL from the user specified URL
 	// We use gosec -- the annotation below will disable a security check that URLs are not tainted
 	/* #nosec G107 */
@@ -348,33 +405,45 @@ func downloadTrustBundle(trustBundleURL string) ([]*x509.Certificate, error) {
 		return nil, fmt.Errorf("unable to read from trust bundle URL %s: %w", trustBundleURL, err)
 	}
 
-	bundle, err := pemutil.ParseCertificates(pemBytes)
-	if err != nil {
-		return nil, err
-	}
-
-	return bundle, nil
+	return pemBytes, nil
 }
 
 func setupTrustBundle(ac *agent.Config, c *Config) error {
-	// Either download the turst bundle if TrustBundleURL is set, or read it
+	// Either download the trust bundle if TrustBundleURL is set, or read it
 	// from disk if TrustBundlePath is set
 	ac.InsecureBootstrap = c.Agent.InsecureBootstrap
 
+	var bundleBytes []byte
+	var err error
+
 	switch {
 	case c.Agent.TrustBundleURL != "":
-		bundle, err := downloadTrustBundle(c.Agent.TrustBundleURL)
+		bundleBytes, err = downloadTrustBundle(c.Agent.TrustBundleURL)
 		if err != nil {
 			return err
 		}
-		ac.TrustBundle = bundle
 	case c.Agent.TrustBundlePath != "":
-		bundle, err := parseTrustBundle(c.Agent.TrustBundlePath)
+		bundleBytes, err = loadTrustBundle(c.Agent.TrustBundlePath)
 		if err != nil {
 			return fmt.Errorf("could not parse trust bundle: %w", err)
 		}
-		ac.TrustBundle = bundle
+	default:
+		// If InsecureBootstrap is configured, the bundle is not required
+		if ac.InsecureBootstrap {
+			return nil
+		}
 	}
+
+	bundle, err := parseTrustBundle(bundleBytes, c.Agent.TrustBundleFormat)
+	if err != nil {
+		return err
+	}
+
+	if len(bundle) == 0 {
+		return errors.New("no certificates found in trust bundle")
+	}
+
+	ac.TrustBundle = bundle
 
 	return nil
 }
@@ -394,6 +463,17 @@ func NewAgentConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool)
 		}
 	}
 
+	if c.Agent.Experimental.X509SVIDCacheMaxSize < 0 {
+		return nil, errors.New("x509_svid_cache_max_size should not be negative")
+	}
+	ac.UseSyncAuthorizedEntries = c.Agent.Experimental.UseSyncAuthorizedEntries
+	ac.X509SVIDCacheMaxSize = c.Agent.Experimental.X509SVIDCacheMaxSize
+
+	if c.Agent.Experimental.DisableLRUCache && ac.X509SVIDCacheMaxSize != 0 {
+		return nil, errors.New("x509_svid_cache_max_size should not be set when disable_lru_cache is set")
+	}
+	ac.DisableLRUCache = c.Agent.Experimental.DisableLRUCache
+
 	serverHostPort := net.JoinHostPort(c.Agent.ServerAddress, strconv.Itoa(c.Agent.ServerPort))
 	ac.ServerAddress = fmt.Sprintf("dns:///%s", serverHostPort)
 
@@ -401,6 +481,9 @@ func NewAgentConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool)
 		log.WithLevel(c.Agent.LogLevel),
 		log.WithFormat(c.Agent.LogFormat),
 	)
+	if c.Agent.LogSourceLocation {
+		logOptions = append(logOptions, log.WithSourceLocation())
+	}
 	var reopenableFile *log.ReopenableFile
 	if c.Agent.LogFile != "" {
 		reopenableFile, err := log.NewReopenableFile(c.Agent.LogFile)
@@ -468,7 +551,11 @@ func NewAgentConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool)
 
 	ac.AllowedForeignJWTClaims = c.Agent.AllowedForeignJWTClaims
 
-	ac.PluginConfigs = *c.Plugins
+	ac.PluginConfigs, err = catalog.PluginConfigsFromHCLNode(c.Plugins)
+	if err != nil {
+		return nil, err
+	}
+
 	ac.Telemetry = c.Telemetry
 	ac.HealthChecks = c.HealthChecks
 
@@ -488,6 +575,17 @@ func NewAgentConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool)
 
 	ac.AuthorizedDelegates = c.Agent.AuthorizedDelegates
 
+	if c.Agent.AvailabilityTarget != "" {
+		t, err := time.ParseDuration(c.Agent.AvailabilityTarget)
+		if err != nil {
+			return nil, fmt.Errorf("unable to parse availability_target: %w", err)
+		}
+		if t < minimumAvailabilityTarget {
+			return nil, fmt.Errorf("availability_target must be at least %s", minimumAvailabilityTarget.String())
+		}
+		ac.AvailabilityTarget = t
+	}
+
 	if cmp.Diff(experimentalConfig{}, c.Agent.Experimental) != "" {
 		logger.Warn("Experimental features have been enabled. Please see doc/upgrading.md for upgrade and compatibility considerations for experimental features.")
 	}
@@ -504,15 +602,17 @@ func validateConfig(c *Config) error {
 		return errors.New("plugins section must be configured")
 	}
 
-	if err := c.Agent.validate(); err != nil {
-		return err
-	}
-
-	return nil
+	return c.Agent.validate()
 }
 
 func checkForUnknownConfig(c *Config, l logrus.FieldLogger) (err error) {
-	detectedUnknown := func(section string, keys []string) {
+	detectedUnknown := func(section string, keyPositions map[string][]token.Pos) {
+		var keys []string
+		for k := range keyPositions {
+			keys = append(keys, k)
+		}
+
+		sort.Strings(keys)
 		l.WithFields(logrus.Fields{
 			"section": section,
 			"keys":    strings.Join(keys, ","),
@@ -520,49 +620,49 @@ func checkForUnknownConfig(c *Config, l logrus.FieldLogger) (err error) {
 		err = errors.New("unknown configuration detected")
 	}
 
-	if len(c.UnusedKeys) != 0 {
-		detectedUnknown("top-level", c.UnusedKeys)
+	if len(c.UnusedKeyPositions) != 0 {
+		detectedUnknown("top-level", c.UnusedKeyPositions)
 	}
 
-	if a := c.Agent; a != nil && len(a.UnusedKeys) != 0 {
-		detectedUnknown("agent", a.UnusedKeys)
+	if a := c.Agent; a != nil && len(a.UnusedKeyPositions) != 0 {
+		detectedUnknown("agent", a.UnusedKeyPositions)
 	}
 
 	// TODO: Re-enable unused key detection for telemetry. See
 	// https://github.com/spiffe/spire/issues/1101 for more information
 	//
-	// if len(c.Telemetry.UnusedKeys) != 0 {
-	//	detectedUnknown("telemetry", c.Telemetry.UnusedKeys)
+	// if len(c.Telemetry.UnusedKeyPositions) != 0 {
+	//	detectedUnknown("telemetry", c.Telemetry.UnusedKeyPositions)
 	// }
 
-	if p := c.Telemetry.Prometheus; p != nil && len(p.UnusedKeys) != 0 {
-		detectedUnknown("Prometheus", p.UnusedKeys)
+	if p := c.Telemetry.Prometheus; p != nil && len(p.UnusedKeyPositions) != 0 {
+		detectedUnknown("Prometheus", p.UnusedKeyPositions)
 	}
 
 	for _, v := range c.Telemetry.DogStatsd {
-		if len(v.UnusedKeys) != 0 {
-			detectedUnknown("DogStatsd", v.UnusedKeys)
+		if len(v.UnusedKeyPositions) != 0 {
+			detectedUnknown("DogStatsd", v.UnusedKeyPositions)
 		}
 	}
 
 	for _, v := range c.Telemetry.Statsd {
-		if len(v.UnusedKeys) != 0 {
-			detectedUnknown("Statsd", v.UnusedKeys)
+		if len(v.UnusedKeyPositions) != 0 {
+			detectedUnknown("Statsd", v.UnusedKeyPositions)
 		}
 	}
 
 	for _, v := range c.Telemetry.M3 {
-		if len(v.UnusedKeys) != 0 {
-			detectedUnknown("M3", v.UnusedKeys)
+		if len(v.UnusedKeyPositions) != 0 {
+			detectedUnknown("M3", v.UnusedKeyPositions)
 		}
 	}
 
-	if p := c.Telemetry.InMem; p != nil && len(p.UnusedKeys) != 0 {
-		detectedUnknown("InMem", p.UnusedKeys)
+	if p := c.Telemetry.InMem; p != nil && len(p.UnusedKeyPositions) != 0 {
+		detectedUnknown("InMem", p.UnusedKeyPositions)
 	}
 
-	if len(c.HealthChecks.UnusedKeys) != 0 {
-		detectedUnknown("health check", c.HealthChecks.UnusedKeys)
+	if len(c.HealthChecks.UnusedKeyPositions) != 0 {
+		detectedUnknown("health check", c.HealthChecks.UnusedKeyPositions)
 	}
 
 	return err
@@ -571,9 +671,10 @@ func checkForUnknownConfig(c *Config, l logrus.FieldLogger) (err error) {
 func defaultConfig() *Config {
 	c := &Config{
 		Agent: &agentConfig{
-			DataDir:   defaultDataDir,
-			LogLevel:  defaultLogLevel,
-			LogFormat: log.DefaultFormat,
+			DataDir:           defaultDataDir,
+			LogLevel:          defaultLogLevel,
+			LogFormat:         log.DefaultFormat,
+			TrustBundleFormat: bundleFormatPEM,
 			SDS: sdsConfig{
 				DefaultBundleName:           defaultDefaultBundleName,
 				DefaultSVIDName:             defaultDefaultSVIDName,
@@ -587,15 +688,11 @@ func defaultConfig() *Config {
 	return c
 }
 
-func parseTrustBundle(path string) ([]*x509.Certificate, error) {
-	bundle, err := pemutil.LoadCertificates(path)
+func loadTrustBundle(path string) ([]byte, error) {
+	bundleBytes, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
 
-	if len(bundle) == 0 {
-		return nil, errors.New("no certificates found in trust bundle")
-	}
-
-	return bundle, nil
+	return bundleBytes, nil
 }

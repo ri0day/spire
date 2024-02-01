@@ -2,6 +2,7 @@ package datastore
 
 import (
 	"context"
+	"crypto"
 	"errors"
 	"reflect"
 	"strings"
@@ -118,12 +119,24 @@ func TestWithMetrics(t *testing.T) {
 			methodName: "FetchFederationRelationship",
 		},
 		{
+			key:        "datastore.node_event.fetch",
+			methodName: "GetLatestAttestedNodeEventID",
+		},
+		{
+			key:        "datastore.registration_entry_event.fetch",
+			methodName: "GetLatestRegistrationEntryEventID",
+		},
+		{
 			key:        "datastore.node.selectors.fetch",
 			methodName: "GetNodeSelectors",
 		},
 		{
 			key:        "datastore.node.list",
 			methodName: "ListAttestedNodes",
+		},
+		{
+			key:        "datastore.node_event.list",
+			methodName: "ListAttestedNodesEvents",
 		},
 		{
 			key:        "datastore.bundle.list",
@@ -138,8 +151,16 @@ func TestWithMetrics(t *testing.T) {
 			methodName: "ListRegistrationEntries",
 		},
 		{
+			key:        "datastore.registration_entry_event.list",
+			methodName: "ListRegistrationEntriesEvents",
+		},
+		{
 			key:        "datastore.federation_relationship.list",
 			methodName: "ListFederationRelationships",
+		},
+		{
+			key:        "datastore.node_event.prune",
+			methodName: "PruneAttestedNodesEvents",
 		},
 		{
 			key:        "datastore.bundle.prune",
@@ -154,8 +175,28 @@ func TestWithMetrics(t *testing.T) {
 			methodName: "PruneRegistrationEntries",
 		},
 		{
+			key:        "datastore.registration_entry_event.prune",
+			methodName: "PruneRegistrationEntriesEvents",
+		},
+		{
 			key:        "datastore.bundle.set",
 			methodName: "SetBundle",
+		},
+		{
+			key:        "datastore.bundle.x509.taint",
+			methodName: "TaintX509CA",
+		},
+		{
+			key:        "datastore.bundle.jwt.revoke",
+			methodName: "RevokeJWTKey",
+		},
+		{
+			key:        "datastore.bundle.x509.revoke",
+			methodName: "RevokeX509CA",
+		},
+		{
+			key:        "datastore.bundle.jwt.taint",
+			methodName: "TaintJWTKey",
 		},
 		{
 			key:        "datastore.node.selectors.set",
@@ -177,6 +218,22 @@ func TestWithMetrics(t *testing.T) {
 			key:        "datastore.registration_entry.update",
 			methodName: "UpdateRegistrationEntry",
 		},
+		{
+			key:        "datastore.ca_journal.set",
+			methodName: "SetCAJournal",
+		},
+		{
+			key:        "datastore.ca_journal.fetch",
+			methodName: "FetchCAJournal",
+		},
+		{
+			key:        "datastore.ca_journal.prune",
+			methodName: "PruneCAJournals",
+		},
+		{
+			key:        "datastore.ca_journal.list",
+			methodName: "ListCAJournalsForTesting",
+		},
 	} {
 		tt := tt
 		methodType, ok := wt.MethodByName(tt.methodName)
@@ -187,7 +244,7 @@ func TestWithMetrics(t *testing.T) {
 		// will fail the test below.
 		delete(methodNames, methodType.Name)
 
-		doCall := func(err error) interface{} {
+		doCall := func(err error) any {
 			m.Reset()
 			ds.SetError(err)
 			numIn := methodValue.Type().NumIn()
@@ -341,12 +398,24 @@ func (ds *fakeDataStore) FetchRegistrationEntry(context.Context, string) (*commo
 	return &common.RegistrationEntry{}, ds.err
 }
 
+func (ds *fakeDataStore) GetLatestAttestedNodeEventID(context.Context) (uint, error) {
+	return 0, ds.err
+}
+
+func (ds *fakeDataStore) GetLatestRegistrationEntryEventID(context.Context) (uint, error) {
+	return 0, ds.err
+}
+
 func (ds *fakeDataStore) GetNodeSelectors(context.Context, string, datastore.DataConsistency) ([]*common.Selector, error) {
 	return []*common.Selector{}, ds.err
 }
 
 func (ds *fakeDataStore) ListAttestedNodes(context.Context, *datastore.ListAttestedNodesRequest) (*datastore.ListAttestedNodesResponse, error) {
 	return &datastore.ListAttestedNodesResponse{}, ds.err
+}
+
+func (ds *fakeDataStore) ListAttestedNodesEvents(context.Context, *datastore.ListAttestedNodesEventsRequest) (*datastore.ListAttestedNodesEventsResponse, error) {
+	return &datastore.ListAttestedNodesEventsResponse{}, ds.err
 }
 
 func (ds *fakeDataStore) ListBundles(context.Context, *datastore.ListBundlesRequest) (*datastore.ListBundlesResponse, error) {
@@ -361,6 +430,14 @@ func (ds *fakeDataStore) ListRegistrationEntries(context.Context, *datastore.Lis
 	return &datastore.ListRegistrationEntriesResponse{}, ds.err
 }
 
+func (ds *fakeDataStore) ListRegistrationEntriesEvents(context.Context, *datastore.ListRegistrationEntriesEventsRequest) (*datastore.ListRegistrationEntriesEventsResponse, error) {
+	return &datastore.ListRegistrationEntriesEventsResponse{}, ds.err
+}
+
+func (ds *fakeDataStore) PruneAttestedNodesEvents(context.Context, time.Duration) error {
+	return ds.err
+}
+
 func (ds *fakeDataStore) PruneBundle(context.Context, string, time.Time) (bool, error) {
 	return false, ds.err
 }
@@ -373,8 +450,28 @@ func (ds *fakeDataStore) PruneRegistrationEntries(context.Context, time.Time) er
 	return ds.err
 }
 
+func (ds *fakeDataStore) PruneRegistrationEntriesEvents(context.Context, time.Duration) error {
+	return ds.err
+}
+
 func (ds *fakeDataStore) SetBundle(context.Context, *common.Bundle) (*common.Bundle, error) {
 	return &common.Bundle{}, ds.err
+}
+
+func (ds *fakeDataStore) TaintX509CA(context.Context, string, crypto.PublicKey) error {
+	return ds.err
+}
+
+func (ds *fakeDataStore) RevokeX509CA(context.Context, string, crypto.PublicKey) error {
+	return ds.err
+}
+
+func (ds *fakeDataStore) TaintJWTKey(context.Context, string, string) (*common.PublicKey, error) {
+	return &common.PublicKey{}, ds.err
+}
+
+func (ds *fakeDataStore) RevokeJWTKey(context.Context, string, string) (*common.PublicKey, error) {
+	return &common.PublicKey{}, ds.err
 }
 
 func (ds *fakeDataStore) SetNodeSelectors(context.Context, string, []*common.Selector) error {
@@ -395,4 +492,20 @@ func (ds *fakeDataStore) UpdateRegistrationEntry(context.Context, *common.Regist
 
 func (ds *fakeDataStore) UpdateFederationRelationship(context.Context, *datastore.FederationRelationship, *types.FederationRelationshipMask) (*datastore.FederationRelationship, error) {
 	return &datastore.FederationRelationship{}, ds.err
+}
+
+func (ds *fakeDataStore) SetCAJournal(context.Context, *datastore.CAJournal) (*datastore.CAJournal, error) {
+	return &datastore.CAJournal{}, ds.err
+}
+
+func (ds *fakeDataStore) FetchCAJournal(context.Context, string) (*datastore.CAJournal, error) {
+	return &datastore.CAJournal{}, ds.err
+}
+
+func (ds *fakeDataStore) ListCAJournalsForTesting(context.Context) ([]*datastore.CAJournal, error) {
+	return []*datastore.CAJournal{}, ds.err
+}
+
+func (ds *fakeDataStore) PruneCAJournals(context.Context, int64) error {
+	return ds.err
 }

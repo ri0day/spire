@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -22,7 +23,7 @@ import (
 	trustdomainv1 "github.com/spiffe/spire-api-sdk/proto/spire/api/server/trustdomain/v1"
 	"github.com/spiffe/spire/pkg/common/util"
 	"github.com/spiffe/spire/pkg/server/authpolicy"
-	"github.com/spiffe/spire/pkg/server/ca"
+	"github.com/spiffe/spire/pkg/server/ca/manager"
 	"github.com/spiffe/spire/pkg/server/cache/entrycache"
 	"github.com/spiffe/spire/pkg/server/datastore"
 	"github.com/spiffe/spire/pkg/server/endpoints/bundle"
@@ -30,11 +31,9 @@ import (
 	"github.com/spiffe/spire/proto/spire/common"
 	"github.com/spiffe/spire/test/clock"
 	"github.com/spiffe/spire/test/fakes/fakedatastore"
-	"github.com/spiffe/spire/test/fakes/fakehealthchecker"
 	"github.com/spiffe/spire/test/fakes/fakemetrics"
 	"github.com/spiffe/spire/test/fakes/fakeserverca"
 	"github.com/spiffe/spire/test/fakes/fakeservercatalog"
-	"github.com/spiffe/spire/test/spiretest"
 	"github.com/spiffe/spire/test/testca"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -46,10 +45,17 @@ import (
 )
 
 var (
-	testTD       = spiffeid.RequireTrustDomainFromString("domain.test")
-	serverID     = spiffeid.RequireFromPath(testTD, "/spire/server")
-	agentID      = spiffeid.RequireFromPath(testTD, "/spire/agent/foo")
-	adminID      = spiffeid.RequireFromPath(testTD, "/admin")
+	testTD                        = spiffeid.RequireTrustDomainFromString("domain.test")
+	foreignFederatedTD            = spiffeid.RequireTrustDomainFromString("foreign-domain.test")
+	foreignUnfederatedTD          = spiffeid.RequireTrustDomainFromString("foreign-domain-not-federated.test")
+	serverID                      = spiffeid.RequireFromPath(testTD, "/spire/server")
+	agentID                       = spiffeid.RequireFromPath(testTD, "/spire/agent/foo")
+	adminID                       = spiffeid.RequireFromPath(testTD, "/admin")
+	foreignAdminID                = spiffeid.RequireFromPath(foreignFederatedTD, "/admin/foreign")
+	unauthorizedForeignAdminID    = spiffeid.RequireFromPath(foreignFederatedTD, "/admin/foreign-not-authorized")
+	unfederatedForeignAdminID     = spiffeid.RequireFromPath(foreignUnfederatedTD, "/admin/foreign-not-federated")
+	unauthenticatedForeignAdminID = spiffeid.RequireFromPath(foreignFederatedTD, "/admin/foreign-not-authenticated")
+
 	downstreamID = spiffeid.RequireFromPath(testTD, "/downstream")
 	rateLimit    = RateLimitConfig{
 		Attestation: true,
@@ -76,17 +82,6 @@ func TestNew(t *testing.T) {
 	require.NoError(t, err)
 
 	serverCA := fakeserverca.New(t, testTD, nil)
-	healthChecker := fakehealthchecker.New()
-	manager := ca.NewManager(ca.ManagerConfig{
-		CA:            serverCA,
-		Catalog:       cat,
-		TrustDomain:   testTD,
-		Dir:           spiretest.TempDir(t),
-		Log:           log,
-		Metrics:       metrics,
-		Clock:         clk,
-		HealthChecker: healthChecker,
-	})
 
 	endpoints, err := New(ctx, Config{
 		TCPAddr:          tcpAddr,
@@ -96,7 +91,7 @@ func TestNew(t *testing.T) {
 		Catalog:          cat,
 		ServerCA:         serverCA,
 		BundleEndpoint:   bundle.EndpointConfig{Address: tcpAddr},
-		Manager:          manager,
+		JWTKeyPublisher:  &fakeJWTKeyPublisher{},
 		Log:              log,
 		Metrics:          metrics,
 		RateLimit:        rateLimit,
@@ -115,6 +110,7 @@ func TestNew(t *testing.T) {
 	assert.NotNil(t, endpoints.APIServers.HealthServer)
 	assert.NotNil(t, endpoints.APIServers.SVIDServer)
 	assert.NotNil(t, endpoints.BundleEndpointServer)
+	assert.NotNil(t, endpoints.EntryFetcherPruneEventsTask)
 	assert.Equal(t, cat.GetDataStore(), endpoints.DataStore)
 	assert.Equal(t, log, endpoints.Log)
 	assert.Equal(t, metrics, endpoints.Metrics)
@@ -141,17 +137,6 @@ func TestNewErrorCreatingAuthorizedEntryFetcher(t *testing.T) {
 	require.NoError(t, err)
 
 	serverCA := fakeserverca.New(t, testTD, nil)
-	healthChecker := fakehealthchecker.New()
-	manager := ca.NewManager(ca.ManagerConfig{
-		CA:            serverCA,
-		Catalog:       cat,
-		TrustDomain:   testTD,
-		Dir:           spiretest.TempDir(t),
-		Log:           log,
-		Metrics:       metrics,
-		Clock:         clk,
-		HealthChecker: healthChecker,
-	})
 
 	endpoints, err := New(ctx, Config{
 		TCPAddr:          tcpAddr,
@@ -161,7 +146,7 @@ func TestNewErrorCreatingAuthorizedEntryFetcher(t *testing.T) {
 		Catalog:          cat,
 		ServerCA:         serverCA,
 		BundleEndpoint:   bundle.EndpointConfig{Address: tcpAddr},
-		Manager:          manager,
+		JWTKeyPublisher:  &fakeJWTKeyPublisher{},
 		Log:              log,
 		Metrics:          metrics,
 		RateLimit:        rateLimit,
@@ -176,9 +161,15 @@ func TestNewErrorCreatingAuthorizedEntryFetcher(t *testing.T) {
 func TestListenAndServe(t *testing.T) {
 	ctx := context.Background()
 	ca := testca.New(t, testTD)
+	federatedCA := testca.New(t, foreignFederatedTD)
+	unfederatedCA := testca.New(t, foreignUnfederatedTD)
 	serverSVID := ca.CreateX509SVID(serverID)
 	agentSVID := ca.CreateX509SVID(agentID)
 	adminSVID := ca.CreateX509SVID(adminID)
+	foreignAdminSVID := federatedCA.CreateX509SVID(foreignAdminID)
+	unauthorizedForeignAdminSVID := federatedCA.CreateX509SVID(unauthorizedForeignAdminID)
+	unauthenticatedForeignAdminSVID := unfederatedCA.CreateX509SVID(unauthenticatedForeignAdminID)
+	unfederatedForeignAdminSVID := federatedCA.CreateX509SVID(unfederatedForeignAdminID)
 	downstreamSVID := ca.CreateX509SVID(downstreamID)
 
 	listener, err := net.Listen("tcp", "localhost:0")
@@ -196,7 +187,7 @@ func TestListenAndServe(t *testing.T) {
 		return entrycache.BuildFromDataStore(ctx, ds)
 	}
 
-	ef, err := NewAuthorizedEntryFetcherWithFullCache(context.Background(), buildCacheFn, log, clk, defaultCacheReloadInterval)
+	ef, err := NewAuthorizedEntryFetcherWithFullCache(context.Background(), buildCacheFn, log, clk, ds, defaultCacheReloadInterval, defaultPruneEventsOlderThan)
 	require.NoError(t, err)
 
 	pe, err := authpolicy.DefaultAuthPolicy(ctx)
@@ -208,6 +199,7 @@ func TestListenAndServe(t *testing.T) {
 		SVIDObserver: newSVIDObserver(serverSVID),
 		TrustDomain:  testTD,
 		DataStore:    ds,
+		BundleCache:  bundle.NewCache(ds, clk),
 		APIServers: APIServers{
 			AgentServer:       &agentv1.UnimplementedAgentServer{},
 			BundleServer:      &bundlev1.UnimplementedBundleServer{},
@@ -222,7 +214,9 @@ func TestListenAndServe(t *testing.T) {
 		Metrics:                      metrics,
 		RateLimit:                    rateLimit,
 		EntryFetcherCacheRebuildTask: ef.RunRebuildCacheTask,
+		EntryFetcherPruneEventsTask:  ef.PruneEventsTask,
 		AuthPolicyEngine:             pe,
+		AdminIDs:                     []spiffeid.ID{foreignAdminSVID.ID},
 	}
 
 	// Prime the datastore with the:
@@ -230,7 +224,7 @@ func TestListenAndServe(t *testing.T) {
 	// - agent attested node information
 	// - admin registration entry
 	// - downstream registration entry
-	prepareDataStore(t, ds, ca, agentSVID)
+	prepareDataStore(t, ds, []*testca.CA{ca, federatedCA}, agentSVID)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
@@ -253,10 +247,6 @@ func TestListenAndServe(t *testing.T) {
 	target, err := util.GetTargetName(endpoints.LocalAddr)
 	require.NoError(t, err)
 
-	t.Run("Access denied to remote caller", func(t *testing.T) {
-		testRemoteCaller(ctx, t, target)
-	})
-
 	localConn, err := util.GRPCDialContext(ctx, target, grpc.WithBlock())
 	require.NoError(t, err)
 	defer localConn.Close()
@@ -271,6 +261,9 @@ func TestListenAndServe(t *testing.T) {
 	defer adminConn.Close()
 
 	downstreamConn := dialTCP(tlsconfig.MTLSClientConfig(downstreamSVID, ca.X509Bundle(), tlsconfig.AuthorizeID(serverID)))
+	defer downstreamConn.Close()
+
+	federatedAdminConn := dialTCP(tlsconfig.MTLSClientConfig(foreignAdminSVID, ca.X509Bundle(), tlsconfig.AuthorizeID(serverID)))
 	defer downstreamConn.Close()
 
 	t.Run("Bad Client SVID", func(t *testing.T) {
@@ -289,25 +282,57 @@ func TestListenAndServe(t *testing.T) {
 	})
 
 	t.Run("Agent", func(t *testing.T) {
-		testAgentAPI(ctx, t, localConn, noauthConn, agentConn, adminConn, downstreamConn)
+		testAgentAPI(ctx, t, localConn, noauthConn, agentConn, adminConn, federatedAdminConn, downstreamConn)
 	})
 	t.Run("Debug", func(t *testing.T) {
-		testDebugAPI(ctx, t, localConn, noauthConn, agentConn, adminConn, downstreamConn)
+		testDebugAPI(ctx, t, localConn, noauthConn, agentConn, adminConn, federatedAdminConn, downstreamConn)
 	})
 	t.Run("Health", func(t *testing.T) {
-		testHealthAPI(ctx, t, localConn, noauthConn, agentConn, adminConn, downstreamConn)
+		testHealthAPI(ctx, t, localConn, noauthConn, agentConn, adminConn, federatedAdminConn, downstreamConn)
 	})
 	t.Run("Bundle", func(t *testing.T) {
-		testBundleAPI(ctx, t, localConn, noauthConn, agentConn, adminConn, downstreamConn)
+		testBundleAPI(ctx, t, localConn, noauthConn, agentConn, adminConn, federatedAdminConn, downstreamConn)
 	})
 	t.Run("Entry", func(t *testing.T) {
-		testEntryAPI(ctx, t, localConn, noauthConn, agentConn, adminConn, downstreamConn)
+		testEntryAPI(ctx, t, localConn, noauthConn, agentConn, adminConn, federatedAdminConn, downstreamConn)
 	})
 	t.Run("SVID", func(t *testing.T) {
-		testSVIDAPI(ctx, t, localConn, noauthConn, agentConn, adminConn, downstreamConn)
+		testSVIDAPI(ctx, t, localConn, noauthConn, agentConn, adminConn, federatedAdminConn, downstreamConn)
 	})
 	t.Run("TrustDomain", func(t *testing.T) {
-		testTrustDomainAPI(ctx, t, localConn, noauthConn, agentConn, adminConn, downstreamConn)
+		testTrustDomainAPI(ctx, t, localConn, noauthConn, agentConn, adminConn, federatedAdminConn, downstreamConn)
+	})
+
+	t.Run("Access denied to remote caller", func(t *testing.T) {
+		testRemoteCaller(ctx, t, target)
+	})
+
+	t.Run("Invalidate connection with misconfigured foreign admin caller", func(t *testing.T) {
+		unauthenticatedConfig := tlsconfig.MTLSClientConfig(unauthenticatedForeignAdminSVID, ca.X509Bundle(), tlsconfig.AuthorizeID(serverID))
+		unauthorizedConfig := tlsconfig.MTLSClientConfig(unauthorizedForeignAdminSVID, ca.X509Bundle(), tlsconfig.AuthorizeID(serverID))
+		unfederatedConfig := tlsconfig.MTLSClientConfig(unfederatedForeignAdminSVID, ca.X509Bundle(), tlsconfig.AuthorizeID(serverID))
+
+		for _, config := range []*tls.Config{unauthenticatedConfig, unauthorizedConfig, unfederatedConfig} {
+			conn, err := grpc.DialContext(ctx, endpoints.TCPAddr.String(),
+				grpc.WithTransportCredentials(credentials.NewTLS(config)),
+			)
+			require.NoError(t, err)
+
+			_, err = entryv1.NewEntryClient(conn).ListEntries(ctx, nil)
+			require.Error(t, err)
+
+			switch {
+			// This message can be returned on macOS
+			case strings.Contains(err.Error(), "write: broken pipe"):
+			// This message can be returned on Windows
+			case strings.Contains(err.Error(), "connection was forcibly closed by the remote host"):
+			case strings.Contains(err.Error(), "connection reset by peer"):
+			case strings.Contains(err.Error(), "tls: bad certificate"):
+				return
+			default:
+				t.Errorf("expected invalid connection for misconfigured foreign admin caller: %s", err.Error())
+			}
+		}
 	})
 
 	// Assert that the bundle endpoint server was called to listen and serve
@@ -324,13 +349,15 @@ func TestListenAndServe(t *testing.T) {
 	}
 }
 
-func prepareDataStore(t *testing.T, ds datastore.DataStore, ca *testca.CA, agentSVID *x509svid.SVID) {
+func prepareDataStore(t *testing.T, ds datastore.DataStore, rootCAs []*testca.CA, agentSVID *x509svid.SVID) {
 	// Prepare the bundle
-	_, err := ds.CreateBundle(context.Background(), makeBundle(ca))
-	require.NoError(t, err)
+	for _, rootCA := range rootCAs {
+		_, err := ds.CreateBundle(context.Background(), makeBundle(rootCA))
+		require.NoError(t, err)
+	}
 
 	// Create the attested node
-	_, err = ds.CreateAttestedNode(context.Background(), &common.AttestedNode{
+	_, err := ds.CreateAttestedNode(context.Background(), &common.AttestedNode{
 		SpiffeId:         agentID.String(),
 		CertSerialNumber: agentSVID.Certificates[0].SerialNumber.String(),
 	})
@@ -355,7 +382,7 @@ func prepareDataStore(t *testing.T, ds datastore.DataStore, ca *testca.CA, agent
 	require.NoError(t, err)
 }
 
-func testAgentAPI(ctx context.Context, t *testing.T, udsConn, noauthConn, agentConn, adminConn, downstreamConn *grpc.ClientConn) {
+func testAgentAPI(ctx context.Context, t *testing.T, udsConn, noauthConn, agentConn, adminConn, federatedAdminConn, downstreamConn *grpc.ClientConn) {
 	t.Run("UDS", func(t *testing.T) {
 		testAuthorization(ctx, t, agentv1.NewAgentClient(udsConn), map[string]bool{
 			"CountAgents":     true,
@@ -366,6 +393,7 @@ func testAgentAPI(ctx context.Context, t *testing.T, udsConn, noauthConn, agentC
 			"AttestAgent":     true,
 			"RenewAgent":      false,
 			"CreateJoinToken": true,
+			"PostStatus":      false,
 		})
 	})
 
@@ -379,6 +407,7 @@ func testAgentAPI(ctx context.Context, t *testing.T, udsConn, noauthConn, agentC
 			"AttestAgent":     true,
 			"RenewAgent":      false,
 			"CreateJoinToken": false,
+			"PostStatus":      false,
 		})
 	})
 
@@ -392,6 +421,8 @@ func testAgentAPI(ctx context.Context, t *testing.T, udsConn, noauthConn, agentC
 			"AttestAgent":     true,
 			"RenewAgent":      true,
 			"CreateJoinToken": false,
+			// TODO: Must be true for agent (#3908)
+			"PostStatus": false,
 		})
 	})
 
@@ -405,6 +436,21 @@ func testAgentAPI(ctx context.Context, t *testing.T, udsConn, noauthConn, agentC
 			"AttestAgent":     true,
 			"RenewAgent":      false,
 			"CreateJoinToken": true,
+			"PostStatus":      false,
+		})
+	})
+
+	t.Run("Federated Admin", func(t *testing.T) {
+		testAuthorization(ctx, t, agentv1.NewAgentClient(federatedAdminConn), map[string]bool{
+			"CountAgents":     true,
+			"ListAgents":      true,
+			"GetAgent":        true,
+			"DeleteAgent":     true,
+			"BanAgent":        true,
+			"AttestAgent":     true,
+			"RenewAgent":      false,
+			"CreateJoinToken": true,
+			"PostStatus":      false,
 		})
 	})
 
@@ -418,11 +464,12 @@ func testAgentAPI(ctx context.Context, t *testing.T, udsConn, noauthConn, agentC
 			"AttestAgent":     true,
 			"RenewAgent":      false,
 			"CreateJoinToken": false,
+			"PostStatus":      false,
 		})
 	})
 }
 
-func testHealthAPI(ctx context.Context, t *testing.T, udsConn, noauthConn, agentConn, adminConn, downstreamConn *grpc.ClientConn) {
+func testHealthAPI(ctx context.Context, t *testing.T, udsConn, noauthConn, agentConn, adminConn, federatedAdminConn, downstreamConn *grpc.ClientConn) {
 	t.Run("UDS", func(t *testing.T) {
 		testAuthorization(ctx, t, grpc_health_v1.NewHealthClient(udsConn), map[string]bool{
 			"Check": true,
@@ -451,6 +498,13 @@ func testHealthAPI(ctx context.Context, t *testing.T, udsConn, noauthConn, agent
 		})
 	})
 
+	t.Run("Federated Admin", func(t *testing.T) {
+		testAuthorization(ctx, t, grpc_health_v1.NewHealthClient(federatedAdminConn), map[string]bool{
+			"Check": true,
+			"Watch": true,
+		})
+	})
+
 	t.Run("Downstream", func(t *testing.T) {
 		testAuthorization(ctx, t, grpc_health_v1.NewHealthClient(downstreamConn), map[string]bool{
 			"Check": true,
@@ -459,7 +513,7 @@ func testHealthAPI(ctx context.Context, t *testing.T, udsConn, noauthConn, agent
 	})
 }
 
-func testDebugAPI(ctx context.Context, t *testing.T, udsConn, noauthConn, agentConn, adminConn, downstreamConn *grpc.ClientConn) {
+func testDebugAPI(ctx context.Context, t *testing.T, udsConn, noauthConn, agentConn, adminConn, federatedAdminConn, downstreamConn *grpc.ClientConn) {
 	t.Run("UDS", func(t *testing.T) {
 		testAuthorization(ctx, t, debugv1.NewDebugClient(udsConn), map[string]bool{
 			"GetInfo": true,
@@ -484,6 +538,12 @@ func testDebugAPI(ctx context.Context, t *testing.T, udsConn, noauthConn, agentC
 		})
 	})
 
+	t.Run("Federated Admin", func(t *testing.T) {
+		testAuthorization(ctx, t, debugv1.NewDebugClient(federatedAdminConn), map[string]bool{
+			"GetInfo": true,
+		})
+	})
+
 	t.Run("Downstream", func(t *testing.T) {
 		testAuthorization(ctx, t, debugv1.NewDebugClient(downstreamConn), map[string]bool{
 			"GetInfo": true,
@@ -491,7 +551,7 @@ func testDebugAPI(ctx context.Context, t *testing.T, udsConn, noauthConn, agentC
 	})
 }
 
-func testBundleAPI(ctx context.Context, t *testing.T, udsConn, noauthConn, agentConn, adminConn, downstreamConn *grpc.ClientConn) {
+func testBundleAPI(ctx context.Context, t *testing.T, udsConn, noauthConn, agentConn, adminConn, federatedAdminConn, downstreamConn *grpc.ClientConn) {
 	t.Run("UDS", func(t *testing.T) {
 		testAuthorization(ctx, t, bundlev1.NewBundleClient(udsConn), map[string]bool{
 			"GetBundle":                  true,
@@ -552,6 +612,21 @@ func testBundleAPI(ctx context.Context, t *testing.T, udsConn, noauthConn, agent
 		})
 	})
 
+	t.Run("Federated Admin", func(t *testing.T) {
+		testAuthorization(ctx, t, bundlev1.NewBundleClient(federatedAdminConn), map[string]bool{
+			"GetBundle":                  true,
+			"AppendBundle":               true,
+			"PublishJWTAuthority":        false,
+			"CountBundles":               true,
+			"ListFederatedBundles":       true,
+			"GetFederatedBundle":         true,
+			"BatchCreateFederatedBundle": true,
+			"BatchUpdateFederatedBundle": true,
+			"BatchSetFederatedBundle":    true,
+			"BatchDeleteFederatedBundle": true,
+		})
+	})
+
 	t.Run("Downstream", func(t *testing.T) {
 		testAuthorization(ctx, t, bundlev1.NewBundleClient(downstreamConn), map[string]bool{
 			"GetBundle":                  true,
@@ -568,69 +643,87 @@ func testBundleAPI(ctx context.Context, t *testing.T, udsConn, noauthConn, agent
 	})
 }
 
-func testEntryAPI(ctx context.Context, t *testing.T, udsConn, noauthConn, agentConn, adminConn, downstreamConn *grpc.ClientConn) {
+func testEntryAPI(ctx context.Context, t *testing.T, udsConn, noauthConn, agentConn, adminConn, federatedAdminConn, downstreamConn *grpc.ClientConn) {
 	t.Run("UDS", func(t *testing.T) {
 		testAuthorization(ctx, t, entryv1.NewEntryClient(udsConn), map[string]bool{
-			"CountEntries":         true,
-			"ListEntries":          true,
-			"GetEntry":             true,
-			"BatchCreateEntry":     true,
-			"BatchUpdateEntry":     true,
-			"BatchDeleteEntry":     true,
-			"GetAuthorizedEntries": false,
+			"CountEntries":          true,
+			"ListEntries":           true,
+			"GetEntry":              true,
+			"BatchCreateEntry":      true,
+			"BatchUpdateEntry":      true,
+			"BatchDeleteEntry":      true,
+			"GetAuthorizedEntries":  false,
+			"SyncAuthorizedEntries": false,
 		})
 	})
 
 	t.Run("NoAuth", func(t *testing.T) {
 		testAuthorization(ctx, t, entryv1.NewEntryClient(noauthConn), map[string]bool{
-			"CountEntries":         false,
-			"ListEntries":          false,
-			"GetEntry":             false,
-			"BatchCreateEntry":     false,
-			"BatchUpdateEntry":     false,
-			"BatchDeleteEntry":     false,
-			"GetAuthorizedEntries": false,
+			"CountEntries":          false,
+			"ListEntries":           false,
+			"GetEntry":              false,
+			"BatchCreateEntry":      false,
+			"BatchUpdateEntry":      false,
+			"BatchDeleteEntry":      false,
+			"GetAuthorizedEntries":  false,
+			"SyncAuthorizedEntries": false,
 		})
 	})
 
 	t.Run("Agent", func(t *testing.T) {
 		testAuthorization(ctx, t, entryv1.NewEntryClient(agentConn), map[string]bool{
-			"CountEntries":         false,
-			"ListEntries":          false,
-			"GetEntry":             false,
-			"BatchCreateEntry":     false,
-			"BatchUpdateEntry":     false,
-			"BatchDeleteEntry":     false,
-			"GetAuthorizedEntries": true,
+			"CountEntries":          false,
+			"ListEntries":           false,
+			"GetEntry":              false,
+			"BatchCreateEntry":      false,
+			"BatchUpdateEntry":      false,
+			"BatchDeleteEntry":      false,
+			"GetAuthorizedEntries":  true,
+			"SyncAuthorizedEntries": true,
 		})
 	})
 
 	t.Run("Admin", func(t *testing.T) {
 		testAuthorization(ctx, t, entryv1.NewEntryClient(adminConn), map[string]bool{
-			"CountEntries":         true,
-			"ListEntries":          true,
-			"GetEntry":             true,
-			"BatchCreateEntry":     true,
-			"BatchUpdateEntry":     true,
-			"BatchDeleteEntry":     true,
-			"GetAuthorizedEntries": false,
+			"CountEntries":          true,
+			"ListEntries":           true,
+			"GetEntry":              true,
+			"BatchCreateEntry":      true,
+			"BatchUpdateEntry":      true,
+			"BatchDeleteEntry":      true,
+			"GetAuthorizedEntries":  false,
+			"SyncAuthorizedEntries": false,
+		})
+	})
+
+	t.Run("Federated Admin", func(t *testing.T) {
+		testAuthorization(ctx, t, entryv1.NewEntryClient(federatedAdminConn), map[string]bool{
+			"CountEntries":          true,
+			"ListEntries":           true,
+			"GetEntry":              true,
+			"BatchCreateEntry":      true,
+			"BatchUpdateEntry":      true,
+			"BatchDeleteEntry":      true,
+			"GetAuthorizedEntries":  false,
+			"SyncAuthorizedEntries": false,
 		})
 	})
 
 	t.Run("Downstream", func(t *testing.T) {
 		testAuthorization(ctx, t, entryv1.NewEntryClient(downstreamConn), map[string]bool{
-			"CountEntries":         false,
-			"ListEntries":          false,
-			"GetEntry":             false,
-			"BatchCreateEntry":     false,
-			"BatchUpdateEntry":     false,
-			"BatchDeleteEntry":     false,
-			"GetAuthorizedEntries": false,
+			"CountEntries":          false,
+			"ListEntries":           false,
+			"GetEntry":              false,
+			"BatchCreateEntry":      false,
+			"BatchUpdateEntry":      false,
+			"BatchDeleteEntry":      false,
+			"GetAuthorizedEntries":  false,
+			"SyncAuthorizedEntries": false,
 		})
 	})
 }
 
-func testSVIDAPI(ctx context.Context, t *testing.T, udsConn, noauthConn, agentConn, adminConn, downstreamConn *grpc.ClientConn) {
+func testSVIDAPI(ctx context.Context, t *testing.T, udsConn, noauthConn, agentConn, adminConn, federatedAdminConn, downstreamConn *grpc.ClientConn) {
 	t.Run("UDS", func(t *testing.T) {
 		testAuthorization(ctx, t, svidv1.NewSVIDClient(udsConn), map[string]bool{
 			"MintX509SVID":        true,
@@ -671,6 +764,16 @@ func testSVIDAPI(ctx context.Context, t *testing.T, udsConn, noauthConn, agentCo
 		})
 	})
 
+	t.Run("Federated Admin", func(t *testing.T) {
+		testAuthorization(ctx, t, svidv1.NewSVIDClient(federatedAdminConn), map[string]bool{
+			"MintX509SVID":        true,
+			"MintJWTSVID":         true,
+			"BatchNewX509SVID":    false,
+			"NewJWTSVID":          false,
+			"NewDownstreamX509CA": false,
+		})
+	})
+
 	t.Run("Downstream", func(t *testing.T) {
 		testAuthorization(ctx, t, svidv1.NewSVIDClient(downstreamConn), map[string]bool{
 			"MintX509SVID":        false,
@@ -682,7 +785,7 @@ func testSVIDAPI(ctx context.Context, t *testing.T, udsConn, noauthConn, agentCo
 	})
 }
 
-func testTrustDomainAPI(ctx context.Context, t *testing.T, udsConn, noauthConn, agentConn, adminConn, downstreamConn *grpc.ClientConn) {
+func testTrustDomainAPI(ctx context.Context, t *testing.T, udsConn, noauthConn, agentConn, adminConn, federatedAdminConn, downstreamConn *grpc.ClientConn) {
 	t.Run("UDS", func(t *testing.T) {
 		testAuthorization(ctx, t, trustdomainv1.NewTrustDomainClient(udsConn), map[string]bool{
 			"ListFederationRelationships":       true,
@@ -727,6 +830,17 @@ func testTrustDomainAPI(ctx context.Context, t *testing.T, udsConn, noauthConn, 
 		})
 	})
 
+	t.Run("Federated Admin", func(t *testing.T) {
+		testAuthorization(ctx, t, trustdomainv1.NewTrustDomainClient(federatedAdminConn), map[string]bool{
+			"ListFederationRelationships":       true,
+			"GetFederationRelationship":         true,
+			"BatchCreateFederationRelationship": true,
+			"BatchUpdateFederationRelationship": true,
+			"BatchDeleteFederationRelationship": true,
+			"RefreshBundle":                     true,
+		})
+	})
+
 	t.Run("Downstream", func(t *testing.T) {
 		testAuthorization(ctx, t, trustdomainv1.NewTrustDomainClient(downstreamConn), map[string]bool{
 			"ListFederationRelationships":       false,
@@ -743,7 +857,7 @@ func testTrustDomainAPI(ctx context.Context, t *testing.T, udsConn, noauthConn, 
 // asserts that the RPC was authorized or not. If a method is not represented
 // in the expectedAuthResults, or a method in expectedAuthResults does not
 // belong to the client interface, the test will fail.
-func testAuthorization(ctx context.Context, t *testing.T, client interface{}, expectedAuthResults map[string]bool) {
+func testAuthorization(ctx context.Context, t *testing.T, client any, expectedAuthResults map[string]bool) {
 	cv := reflect.ValueOf(client)
 	ct := cv.Type()
 
@@ -821,7 +935,7 @@ func newBundleEndpointServer() *bundleEndpointServer {
 	return &bundleEndpointServer{}
 }
 
-func (s *bundleEndpointServer) ListenAndServe(ctx context.Context) error {
+func (s *bundleEndpointServer) ListenAndServe(context.Context) error {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 	s.used = true
@@ -836,7 +950,7 @@ func (s *bundleEndpointServer) Used() bool {
 
 func makeBundle(ca *testca.CA) *common.Bundle {
 	bundle := &common.Bundle{
-		TrustDomainId: testTD.IDString(),
+		TrustDomainId: ca.Bundle().TrustDomain().IDString(),
 	}
 
 	for _, x509Authority := range ca.X509Authorities() {
@@ -860,4 +974,8 @@ func (o *svidObserver) State() svid.State {
 		SVID: o.svid.Certificates,
 		Key:  o.svid.PrivateKey,
 	}
+}
+
+type fakeJWTKeyPublisher struct {
+	manager.JwtKeyPublisher
 }

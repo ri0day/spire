@@ -7,14 +7,14 @@ import (
 	"net/http"
 	"testing"
 
+	jose "github.com/go-jose/go-jose/v3"
+	"github.com/go-jose/go-jose/v3/jwt"
 	"github.com/spiffe/spire/pkg/agent/plugin/nodeattestor"
 	nodeattestortest "github.com/spiffe/spire/pkg/agent/plugin/nodeattestor/test"
 	"github.com/spiffe/spire/pkg/common/plugin/azure"
 	"github.com/spiffe/spire/test/plugintest"
 	"github.com/spiffe/spire/test/spiretest"
 	"google.golang.org/grpc/codes"
-	jose "gopkg.in/square/go-jose.v2"
-	"gopkg.in/square/go-jose.v2/jwt"
 )
 
 var (
@@ -81,7 +81,7 @@ func (s *MSIAttestorSuite) TestConfigure() {
 
 func (s *MSIAttestorSuite) loadAttestor(options ...plugintest.Option) nodeattestor.NodeAttestor {
 	p := New()
-	p.hooks.fetchMSIToken = func(ctx context.Context, httpClient azure.HTTPClient, resource string) (string, error) {
+	p.hooks.fetchMSIToken = func(httpClient azure.HTTPClient, resource string) (string, error) {
 		if httpClient != http.DefaultClient {
 			return "", errors.New("unexpected http client")
 		}

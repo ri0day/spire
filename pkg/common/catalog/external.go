@@ -143,11 +143,11 @@ type hcClientPlugin struct {
 
 var _ goplugin.GRPCPlugin = (*hcClientPlugin)(nil)
 
-func (p *hcClientPlugin) GRPCServer(b *goplugin.GRPCBroker, s *grpc.Server) error {
+func (p *hcClientPlugin) GRPCServer(*goplugin.GRPCBroker, *grpc.Server) error {
 	return errors.New("not implemented host side")
 }
 
-func (p *hcClientPlugin) GRPCClient(ctx context.Context, b *goplugin.GRPCBroker, c *grpc.ClientConn) (interface{}, error) {
+func (p *hcClientPlugin) GRPCClient(ctx context.Context, b *goplugin.GRPCBroker, c *grpc.ClientConn) (any, error) {
 	// Manually start up the server via b.Accept since b.AcceptAndServe does
 	// some logging we don't care for. Although b.AcceptAndServe is currently
 	// the only way to feed the TLS config to the brokered connection, AutoMTLS

@@ -82,7 +82,7 @@ func New() *Plugin {
 	}
 }
 
-func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) (*configv1.ConfigureResponse, error) {
+func (p *Plugin) Configure(_ context.Context, req *configv1.ConfigureRequest) (*configv1.ConfigureResponse, error) {
 	// Parse HCL config payload into config struct
 	config := new(Configuration)
 
@@ -328,7 +328,7 @@ func (p *Plugin) unsubscribeToPolling() {
 	defer p.pollMtx.Unlock()
 	p.currentPollSubscribers--
 	if p.currentPollSubscribers == 0 {
-		// TODO: may we relase server here?
+		// TODO: may we release server here?
 		p.stopPolling()
 	}
 }

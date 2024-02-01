@@ -1,8 +1,6 @@
 run:
-  go:  '1.18'
-
   # timeout for analysis, e.g. 30s, 5m, default is 1m
-  deadline: 10m
+  timeout: 12m
 
   skip-dirs:
     - testdata$
@@ -10,12 +8,10 @@ run:
 
   skip-files:
     - ".*\\.pb\\.go"
-    - support/k8s/k8s-workload-registrar/mode-crd/api/spiffeid/v1beta1/spiffeid_types.go
 
 linters:
   enable:
     - bodyclose
-    - depguard
     - durationcheck
     - errorlint
     - goimports
@@ -27,9 +23,8 @@ linters:
     - unparam
     - whitespace
     - gocritic
-    # nolintlint can be re-enabled after the rest of the linters have gained
-    # support for go1.18.
-    # - nolintlint
+    - nolintlint
+
 linters-settings:
   revive:
     # minimal confidence for issues, default is 0.8

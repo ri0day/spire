@@ -47,10 +47,10 @@ order to trigger test suite failure.
 
 The following environment variables are available to the step scripts:
 
-| Environment Variable  | Description |
-| --------- | ----------------|
-| `REPODIR` | Path to the root of the git repository.          |
-| `ROOTDIR` | Path to the root of the integration test directory (i.e. `${REPODIR}/test/integration` ) |
+| Environment Variable | Description                                                                              |
+|----------------------|------------------------------------------------------------------------------------------|
+| `REPODIR`            | Path to the root of the git repository.                                                  |
+| `ROOTDIR`            | Path to the root of the integration test directory (i.e. `${REPODIR}/test/integration` ) |
 
 ### Teardown Script
 
@@ -63,29 +63,29 @@ for the test suite.
 
 The following environment variables are available to the teardown script:
 
-| Environment Variable  | Description |
-| --------- | ----------------|
-| `REPODIR` | Path to the root of the git repository.          |
-| `ROOTDIR` | Path to the root of the integration test directory (i.e. `${REPODIR}/test/integration` ) |
-| `SUCCESS` | If set, indicates the test suite was successful. |
+| Environment Variable | Description                                                                              |
+|----------------------|------------------------------------------------------------------------------------------|
+| `REPODIR`            | Path to the root of the git repository.                                                  |
+| `ROOTDIR`            | Path to the root of the integration test directory (i.e. `${REPODIR}/test/integration` ) |
+| `SUCCESS`            | If set, indicates the test suite was successful.                                         |
 
 ## Test Suites
 
 * [Admin Endpoints](suites/admin-endpoints/README.md)
 * [Upstream Authority cert-manager](suites/upstream-authority-cert-manager/README.md)
+* [Upstream Authority vault](suites/upstream-authority-vault/README.md)
 * [Datastore (MySQL)](suites/datastore-mysql/README.md)
 * [Datastore (Postgres)](suites/datastore-postgres/README.md)
 * [Debug Endpoints](suites/debug-endpoints/README.md)
 * [Downstream Endpoint](suites/downstream-endpoints/README.md)
-* [Envoy SDS (v2)](suites/envoy-sds-v2/README.md)
 * [Envoy SDS (v3)](suites/envoy-sds-v3/README.md)
 * [Ghostunnel + Federation](suites/ghostunnel-federation/README.md)
 * [Join Token](suites/join-token/README.md)
-* [Kubernetes (K8S Workload Registrar "crd" mode)](suites/k8s-crd-mode/README.md)
-* [Kubernetes (K8S Workload Registrar "reconcile" mode)](suites/k8s-reconcile/README.md)
+* [Kubernetes](suites/k8s)
 * [Nested Rotation](suites/nested-rotation/README.md)
 * [Node Attestation](suites/node-attestation/README.md)
 * [Rotation](suites/rotation/README.md)
 * [Self Test](suites/self-test/README.md)
 * [SPIRE Server CLI](suites/spire-server-cli/README.md)
 * [Upgrade](suites/upgrade/README.md)
+* [Windows Service](suites-windows/windows-service/README.md)

@@ -11,7 +11,8 @@ import (
 	"sync"
 	"time"
 
-	pcaapi "cloud.google.com/go/security/privateca/apiv1"
+	privateca "cloud.google.com/go/security/privateca/apiv1"
+	"cloud.google.com/go/security/privateca/apiv1/privatecapb"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/hcl"
 	"github.com/spiffe/spire-plugin-sdk/pluginsdk"
@@ -22,7 +23,6 @@ import (
 	"github.com/spiffe/spire/pkg/common/pemutil"
 	"github.com/spiffe/spire/pkg/common/x509util"
 	"google.golang.org/api/iterator"
-	privatecapb "google.golang.org/genproto/googleapis/cloud/security/privateca/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/durationpb"
@@ -133,7 +133,7 @@ func (p *Plugin) PublishJWTKeyAndSubscribe(*upstreamauthorityv1.PublishJWTKeyReq
 	return status.Error(codes.Unimplemented, "publishing upstream is unsupported")
 }
 
-func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) (*configv1.ConfigureResponse, error) {
+func (p *Plugin) Configure(_ context.Context, req *configv1.ConfigureRequest) (*configv1.ConfigureResponse, error) {
 	// Parse HCL config payload into config struct
 	config := new(Configuration)
 	if err := hcl.Decode(config, req.HclConfiguration); err != nil {
@@ -373,7 +373,7 @@ func (p *Plugin) mintX509CA(ctx context.Context, csr []byte, preferredTTL int32)
 func getClient(ctx context.Context) (CAClient, error) {
 	// https://cloud.google.com/docs/authentication/production#go
 	// The client creation implicitly uses Application Default Credentials (ADC) for authentication
-	pcaClient, err := pcaapi.NewCertificateAuthorityClient(ctx)
+	pcaClient, err := privateca.NewCertificateAuthorityClient(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -382,7 +382,7 @@ func getClient(ctx context.Context) (CAClient, error) {
 }
 
 type gcpCAClient struct {
-	pcaClient *pcaapi.CertificateAuthorityClient
+	pcaClient *privateca.CertificateAuthorityClient
 }
 
 func (client *gcpCAClient) CreateCertificate(ctx context.Context, req *privatecapb.CreateCertificateRequest) (*privatecapb.Certificate, error) {

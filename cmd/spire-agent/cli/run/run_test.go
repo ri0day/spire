@@ -9,12 +9,13 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/hashicorp/hcl/hcl/ast"
 	"github.com/sirupsen/logrus"
 	"github.com/sirupsen/logrus/hooks/test"
 	"github.com/spiffe/spire/pkg/agent"
 	"github.com/spiffe/spire/pkg/agent/workloadkey"
-	"github.com/spiffe/spire/pkg/common/catalog"
 	"github.com/spiffe/spire/pkg/common/log"
 	"github.com/spiffe/spire/test/spiretest"
 	"github.com/spiffe/spire/test/util"
@@ -30,50 +31,94 @@ type mergeInputCase struct {
 }
 
 type newAgentConfigCase struct {
-	msg         string
-	expectError bool
-	input       func(*Config)
-	logOptions  func(t *testing.T) []log.Option
-	test        func(*testing.T, *agent.Config)
+	msg                string
+	expectError        bool
+	requireErrorPrefix string
+	input              func(*Config)
+	logOptions         func(t *testing.T) []log.Option
+	test               func(*testing.T, *agent.Config)
 }
 
 func TestDownloadTrustBundle(t *testing.T) {
 	testTB, _ := os.ReadFile(path.Join(util.ProjectRoot(), "conf/agent/dummy_root_ca.crt"))
+	testTBSPIFFE := `{
+    "keys": [
+        {
+            "use": "x509-svid",
+            "kty": "EC",
+            "crv": "P-384",
+            "x": "WjB-nSGSxIYiznb84xu5WGDZj80nL7W1c3zf48Why0ma7Y7mCBKzfQkrgDguI4j0",
+            "y": "Z-0_tDH_r8gtOtLLrIpuMwWHoe4vbVBFte1vj6Xt6WeE8lXwcCvLs_mcmvPqVK9j",
+            "x5c": [
+                "MIIBzDCCAVOgAwIBAgIJAJM4DhRH0vmuMAoGCCqGSM49BAMEMB4xCzAJBgNVBAYTAlVTMQ8wDQYDVQQKDAZTUElGRkUwHhcNMTgwNTEzMTkzMzQ3WhcNMjMwNTEyMTkzMzQ3WjAeMQswCQYDVQQGEwJVUzEPMA0GA1UECgwGU1BJRkZFMHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEWjB+nSGSxIYiznb84xu5WGDZj80nL7W1c3zf48Why0ma7Y7mCBKzfQkrgDguI4j0Z+0/tDH/r8gtOtLLrIpuMwWHoe4vbVBFte1vj6Xt6WeE8lXwcCvLs/mcmvPqVK9jo10wWzAdBgNVHQ4EFgQUh6XzV6LwNazA+GTEVOdu07o5yOgwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAQYwGQYDVR0RBBIwEIYOc3BpZmZlOi8vbG9jYWwwCgYIKoZIzj0EAwQDZwAwZAIwE4Me13qMC9i6Fkx0h26y09QZIbuRqA9puLg9AeeAAyo5tBzRl1YL0KNEp02VKSYJAjBdeJvqjJ9wW55OGj1JQwDFD7kWeEB6oMlwPbI/5hEY3azJi16I0uN1JSYTSWGSqWc="
+            ]
+        }
+    ]
+}`
+
 	cases := []struct {
-		msg          string
-		status       int
-		fileContents string
-		expectError  bool
+		msg                 string
+		status              int
+		fileContents        string
+		format              string
+		expectDownloadError bool
+		expectParseError    bool
 	}{
 		{
-			msg:          "if URL is not found, should be an error",
-			status:       http.StatusNotFound,
-			fileContents: "",
-			expectError:  true,
+			msg:                 "if URL is not found, should be an error",
+			status:              http.StatusNotFound,
+			fileContents:        "",
+			format:              bundleFormatPEM,
+			expectDownloadError: true,
+			expectParseError:    false,
 		},
 		{
-			msg:          "if URL returns error 500, should be an error",
-			status:       http.StatusInternalServerError,
-			fileContents: "",
-			expectError:  true,
+			msg:                 "if URL returns error 500, should be an error",
+			status:              http.StatusInternalServerError,
+			fileContents:        "",
+			format:              bundleFormatPEM,
+			expectDownloadError: true,
+			expectParseError:    false,
 		},
 		{
-			msg:          "if file is not parseable, should be an error",
-			status:       http.StatusOK,
-			fileContents: "NON PEM PARSEABLE TEXT HERE",
-			expectError:  true,
+			msg:                 "if file is not parseable, should be an error",
+			status:              http.StatusOK,
+			fileContents:        "NON PEM PARSEABLE TEXT HERE",
+			format:              bundleFormatPEM,
+			expectDownloadError: false,
+			expectParseError:    true,
 		},
 		{
-			msg:          "if file is empty, should be error",
-			status:       http.StatusOK,
-			fileContents: "",
-			expectError:  true,
+			msg:                 "if file is empty, should be an error",
+			status:              http.StatusOK,
+			fileContents:        "",
+			format:              bundleFormatPEM,
+			expectDownloadError: false,
+			expectParseError:    true,
 		},
 		{
-			msg:          "if file is valid, should be error",
-			status:       http.StatusOK,
-			fileContents: string(testTB),
-			expectError:  false,
+			msg:                 "if file is valid, should not be an error",
+			status:              http.StatusOK,
+			fileContents:        string(testTB),
+			format:              bundleFormatPEM,
+			expectDownloadError: false,
+			expectParseError:    false,
+		},
+		{
+			msg:                 "if file is not parseable, format is SPIFFE, should not be an error",
+			status:              http.StatusOK,
+			fileContents:        "[}",
+			format:              bundleFormatSPIFFE,
+			expectDownloadError: false,
+			expectParseError:    true,
+		},
+		{
+			msg:                 "if file is valid, format is SPIFFE, should not be an error",
+			status:              http.StatusOK,
+			fileContents:        testTBSPIFFE,
+			format:              bundleFormatSPIFFE,
+			expectDownloadError: false,
+			expectParseError:    false,
 		},
 	}
 
@@ -90,11 +135,18 @@ func TestDownloadTrustBundle(t *testing.T) {
 					// }
 				}))
 			defer testServer.Close()
-			_, err := downloadTrustBundle(testServer.URL)
-			if testCase.expectError {
+			bundleBytes, err := downloadTrustBundle(testServer.URL)
+			if testCase.expectDownloadError {
 				require.Error(t, err)
 			} else {
 				require.NoError(t, err)
+
+				_, err := parseTrustBundle(bundleBytes, testCase.format)
+				if testCase.expectParseError {
+					require.Error(t, err)
+				} else {
+					require.NoError(t, err)
+				}
 			}
 		})
 	}
@@ -369,6 +421,46 @@ func TestMergeInput(t *testing.T) {
 			},
 		},
 		{
+			msg:       "log_source_location should default to false if not set",
+			fileInput: func(c *Config) {},
+			cliInput:  func(c *agentConfig) {},
+			test: func(t *testing.T, c *Config) {
+				require.False(t, c.Agent.LogSourceLocation)
+			},
+		},
+		{
+			msg: "log_source_location should be configurable by file",
+			fileInput: func(c *Config) {
+				c.Agent.LogSourceLocation = true
+			},
+			cliInput: func(c *agentConfig) {},
+			test: func(t *testing.T, c *Config) {
+				require.True(t, c.Agent.LogSourceLocation)
+			},
+		},
+		{
+			msg:       "log_source_location should be configurable by CLI flag",
+			fileInput: func(c *Config) {},
+			cliInput: func(c *agentConfig) {
+				c.LogSourceLocation = true
+			},
+			test: func(t *testing.T, c *Config) {
+				require.True(t, c.Agent.LogSourceLocation)
+			},
+		},
+		{
+			msg: "log_source_location specified by CLI flag should take precedence over file",
+			fileInput: func(c *Config) {
+				c.Agent.LogSourceLocation = false
+			},
+			cliInput: func(c *agentConfig) {
+				c.LogSourceLocation = true
+			},
+			test: func(t *testing.T, c *Config) {
+				require.True(t, c.Agent.LogSourceLocation)
+			},
+		},
+		{
 			msg:       "server_address should not have a default value",
 			fileInput: func(c *Config) {},
 			cliInput:  func(c *agentConfig) {},
@@ -587,6 +679,9 @@ func TestNewAgentConfig(t *testing.T) {
 		{
 			msg: "insecure_bootstrap should be correctly set to true",
 			input: func(c *Config) {
+				// in this case, remove trust_bundle_path provided by defaultValidConfig()
+				// because trust_bundle_path and insecure_bootstrap cannot be set at the same time
+				c.Agent.TrustBundlePath = ""
 				c.Agent.InsecureBootstrap = true
 			},
 			test: func(t *testing.T, c *agent.Config) {
@@ -640,8 +735,9 @@ func TestNewAgentConfig(t *testing.T) {
 			},
 		},
 		{
-			msg:         "trust_bundle_path and trust_bundle_url cannot both be set",
-			expectError: true,
+			msg:                "trust_bundle_path and trust_bundle_url cannot both be set",
+			expectError:        true,
+			requireErrorPrefix: "only one of trust_bundle_url or trust_bundle_path can be specified, not both",
 			input: func(c *Config) {
 				c.Agent.TrustBundlePath = "foo"
 				c.Agent.TrustBundleURL = "foo2"
@@ -651,10 +747,66 @@ func TestNewAgentConfig(t *testing.T) {
 			},
 		},
 		{
-			msg:         "insecure_bootstrap and trust_bundle_url cannot both be set",
-			expectError: true,
+			msg:                "insecure_bootstrap and trust_bundle_path cannot both be set",
+			expectError:        true,
+			requireErrorPrefix: "only one of insecure_bootstrap or trust_bundle_path can be specified, not both",
 			input: func(c *Config) {
+				c.Agent.TrustBundlePath = "foo"
+				c.Agent.InsecureBootstrap = true
+			},
+			test: func(t *testing.T, c *agent.Config) {
+				require.Nil(t, c)
+			},
+		},
+		{
+			msg:                "insecure_bootstrap and trust_bundle_url cannot both be set",
+			expectError:        true,
+			requireErrorPrefix: "only one of insecure_bootstrap or trust_bundle_url can be specified, not both",
+			input: func(c *Config) {
+				// in this case, remove trust_bundle_path provided by defaultValidConfig()
+				c.Agent.TrustBundlePath = ""
 				c.Agent.TrustBundleURL = "foo"
+				c.Agent.InsecureBootstrap = true
+			},
+			test: func(t *testing.T, c *agent.Config) {
+				require.Nil(t, c)
+			},
+		},
+		{
+			msg:                "insecure_bootstrap, trust_bundle_url, trust_bundle_path cannot be set at the same time",
+			expectError:        true,
+			requireErrorPrefix: "only one of insecure_bootstrap, trust_bundle_url, or trust_bundle_path can be specified, not the three options",
+			input: func(c *Config) {
+				c.Agent.TrustBundlePath = "bar"
+				c.Agent.TrustBundleURL = "foo"
+				c.Agent.InsecureBootstrap = true
+			},
+			test: func(t *testing.T, c *agent.Config) {
+				require.Nil(t, c)
+			},
+		},
+		{
+			msg:                "trust_bundle_path or trust_bundle_url must be configured unless insecure_bootstrap is set",
+			expectError:        true,
+			requireErrorPrefix: "trust_bundle_path or trust_bundle_url must be configured unless insecure_bootstrap is set",
+			input: func(c *Config) {
+				// in this case, remove trust_bundle_path provided by defaultValidConfig()
+				c.Agent.TrustBundlePath = ""
+				c.Agent.TrustBundleURL = ""
+				c.Agent.InsecureBootstrap = false
+			},
+			test: func(t *testing.T, c *agent.Config) {
+				require.Nil(t, c)
+			},
+		},
+		{
+			msg:                "trust_bundle_url must start with https://",
+			expectError:        true,
+			requireErrorPrefix: "trust bundle URL must start with https://",
+			input: func(c *Config) {
+				// remove trust_bundle_path provided by defaultValidConfig()
+				c.Agent.TrustBundlePath = ""
+				c.Agent.TrustBundleURL = "foo.bar"
 				c.Agent.InsecureBootstrap = false
 			},
 			test: func(t *testing.T, c *agent.Config) {
@@ -728,6 +880,70 @@ func TestNewAgentConfig(t *testing.T) {
 			},
 		},
 		{
+			msg: "x509_svid_cache_max_size is set",
+			input: func(c *Config) {
+				c.Agent.Experimental.X509SVIDCacheMaxSize = 100
+			},
+			test: func(t *testing.T, c *agent.Config) {
+				require.EqualValues(t, 100, c.X509SVIDCacheMaxSize)
+			},
+		},
+		{
+			msg: "x509_svid_cache_max_size is not set",
+			input: func(c *Config) {
+			},
+			test: func(t *testing.T, c *agent.Config) {
+				require.EqualValues(t, 0, c.X509SVIDCacheMaxSize)
+			},
+		},
+		{
+			msg: "x509_svid_cache_max_size is zero",
+			input: func(c *Config) {
+				c.Agent.Experimental.X509SVIDCacheMaxSize = 0
+			},
+			test: func(t *testing.T, c *agent.Config) {
+				require.EqualValues(t, 0, c.X509SVIDCacheMaxSize)
+			},
+		},
+		{
+			msg:         "x509_svid_cache_max_size is negative",
+			expectError: true,
+			input: func(c *Config) {
+				c.Agent.Experimental.X509SVIDCacheMaxSize = -10
+			},
+			test: func(t *testing.T, c *agent.Config) {
+				require.Nil(t, c)
+			},
+		},
+		{
+			msg: "disable_lru_cache is set",
+			input: func(c *Config) {
+				c.Agent.Experimental.DisableLRUCache = true
+			},
+			test: func(t *testing.T, c *agent.Config) {
+				require.True(t, c.DisableLRUCache)
+			},
+		},
+		{
+			msg:         "both disable_lru_cache and x509_svid_cache_max_size are set",
+			expectError: true,
+			input: func(c *Config) {
+				c.Agent.Experimental.DisableLRUCache = true
+				c.Agent.Experimental.X509SVIDCacheMaxSize = 100
+			},
+			test: func(t *testing.T, c *agent.Config) {
+				require.Nil(t, c)
+			},
+		},
+		{
+			msg: "disable_lru_cache is not set",
+			input: func(c *Config) {
+			},
+			test: func(t *testing.T, c *agent.Config) {
+				require.False(t, c.DisableLRUCache)
+			},
+		},
+		{
 			msg: "allowed_foreign_jwt_claims provided",
 			input: func(c *Config) {
 				c.Agent.AllowedForeignJWTClaims = []string{"c1", "c2"}
@@ -772,7 +988,7 @@ func TestNewAgentConfig(t *testing.T) {
 						t.Cleanup(func() {
 							spiretest.AssertLogsContainEntries(t, hook.AllEntries(), []spiretest.LogEntry{
 								{
-									Data:  map[string]interface{}{"trust_domain": strings.Repeat("a", 256)},
+									Data:  map[string]any{"trust_domain": strings.Repeat("a", 256)},
 									Level: logrus.WarnLevel,
 									Message: "Configured trust domain name should be less than 255 characters to be " +
 										"SPIFFE compliant; a longer trust domain name may impact interoperability",
@@ -785,6 +1001,25 @@ func TestNewAgentConfig(t *testing.T) {
 			},
 			test: func(t *testing.T, c *agent.Config) {
 				assert.NotNil(t, c)
+			},
+		},
+		{
+			msg: "availability_target parses a duration",
+			input: func(c *Config) {
+				c.Agent.AvailabilityTarget = "24h"
+			},
+			test: func(t *testing.T, c *agent.Config) {
+				require.EqualValues(t, 24*time.Hour, c.AvailabilityTarget)
+			},
+		},
+		{
+			msg:         "availability_target is too short",
+			expectError: true,
+			input: func(c *Config) {
+				c.Agent.AvailabilityTarget = "1h"
+			},
+			test: func(t *testing.T, c *agent.Config) {
+				require.Nil(t, c)
 			},
 		},
 	}
@@ -805,6 +1040,9 @@ func TestNewAgentConfig(t *testing.T) {
 			ac, err := NewAgentConfig(input, logOpts, false)
 			if testCase.expectError {
 				require.Error(t, err)
+				if testCase.requireErrorPrefix != "" {
+					spiretest.RequireErrorPrefix(t, err, testCase.requireErrorPrefix)
+				}
 			} else {
 				require.NoError(t, err)
 			}
@@ -825,7 +1063,7 @@ func defaultValidConfig() *Config {
 	c.Agent.TrustBundlePath = path.Join(util.ProjectRoot(), "conf/agent/dummy_root_ca.crt")
 	c.Agent.TrustDomain = "example.org"
 
-	c.Plugins = &catalog.HCLPluginConfigMap{}
+	c.Plugins = &ast.ObjectList{}
 
 	return c
 }

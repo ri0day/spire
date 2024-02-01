@@ -9,13 +9,13 @@ import (
 	"github.com/andres-erbsen/clock"
 	"github.com/sirupsen/logrus"
 	"github.com/sirupsen/logrus/hooks/test"
+	"github.com/spiffe/go-spiffe/v2/bundle/spiffebundle"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/spire/pkg/agent/catalog"
 	"github.com/spiffe/spire/pkg/agent/manager/cache"
 	"github.com/spiffe/spire/pkg/agent/manager/storecache"
 	"github.com/spiffe/spire/pkg/agent/plugin/svidstore"
 	"github.com/spiffe/spire/pkg/agent/svid/store"
-	"github.com/spiffe/spire/pkg/common/bundleutil"
 	"github.com/spiffe/spire/pkg/common/telemetry"
 	"github.com/spiffe/spire/proto/spire/common"
 	"github.com/spiffe/spire/test/spiretest"
@@ -34,8 +34,8 @@ func TestRun(t *testing.T) {
 	bundleCerts, err := util.LoadBundleFixture()
 	require.NoError(t, err)
 
-	bundle := bundleutil.New(td)
-	bundle.AppendRootCA(bundleCerts[0])
+	bundle := spiffebundle.New(td)
+	bundle.AddX509Authority(bundleCerts[0])
 
 	cert, key, err := util.LoadSVIDFixture()
 	require.NoError(t, err)
@@ -88,7 +88,7 @@ func TestRun(t *testing.T) {
 						Chain:      []*x509.Certificate{cert},
 						PrivateKey: key,
 					},
-					Bundles: map[spiffeid.TrustDomain]*bundleutil.Bundle{
+					Bundles: map[spiffeid.TrustDomain]*spiffebundle.Bundle{
 						td: bundle,
 					},
 					ExpiresAt: now,
@@ -148,8 +148,8 @@ func TestRunDeleteSecrets(t *testing.T) {
 	bundleCerts, err := util.LoadBundleFixture()
 	require.NoError(t, err)
 
-	bundle := bundleutil.New(td)
-	bundle.AppendRootCA(bundleCerts[0])
+	bundle := spiffebundle.New(td)
+	bundle.AddX509Authority(bundleCerts[0])
 
 	cert, key, err := util.LoadSVIDFixture()
 	require.NoError(t, err)
@@ -161,7 +161,7 @@ func TestRunDeleteSecrets(t *testing.T) {
 		// readyRecords list of records that are ready to be stored
 		readyRecords []*storecache.Record
 		// stores is a list of configured SVIDStores,
-		// it contains the list of expecerd configurations to be send
+		// it contains the list of expected configurations to be send
 		stores map[string]*fakeSVIDStore
 		// logs is the list of expected logs
 		logs []spiretest.LogEntry
@@ -185,7 +185,7 @@ func TestRunDeleteSecrets(t *testing.T) {
 							{Type: "store1", Value: "b:2"},
 						},
 					},
-					Bundles: map[spiffeid.TrustDomain]*bundleutil.Bundle{
+					Bundles: map[spiffeid.TrustDomain]*spiffebundle.Bundle{
 						td: bundle,
 					},
 					ExpiresAt: now,
@@ -224,7 +224,7 @@ func TestRunDeleteSecrets(t *testing.T) {
 							{Type: "store1", Value: "i:1"},
 						},
 					},
-					Bundles: map[spiffeid.TrustDomain]*bundleutil.Bundle{
+					Bundles: map[spiffeid.TrustDomain]*spiffebundle.Bundle{
 						td: bundle,
 					},
 					ExpiresAt: now,
@@ -264,7 +264,7 @@ func TestRunDeleteSecrets(t *testing.T) {
 							{Type: "store1", Value: "i:1"},
 						},
 					},
-					Bundles: map[spiffeid.TrustDomain]*bundleutil.Bundle{
+					Bundles: map[spiffeid.TrustDomain]*spiffebundle.Bundle{
 						td: bundle,
 					},
 					ExpiresAt: now,
@@ -326,7 +326,7 @@ func TestRunDeleteSecrets(t *testing.T) {
 							{Type: "store1", Value: "b:2"},
 						},
 					},
-					Bundles: map[spiffeid.TrustDomain]*bundleutil.Bundle{
+					Bundles: map[spiffeid.TrustDomain]*spiffebundle.Bundle{
 						td: bundle,
 					},
 					ExpiresAt: now,
@@ -478,7 +478,7 @@ func (s *fakeSVIDStore) Name() string {
 	return s.name
 }
 
-func (s *fakeSVIDStore) PutX509SVID(ctx context.Context, req *svidstore.X509SVID) error {
+func (s *fakeSVIDStore) PutX509SVID(_ context.Context, req *svidstore.X509SVID) error {
 	if s.err != nil {
 		return s.err
 	}
@@ -487,7 +487,7 @@ func (s *fakeSVIDStore) PutX509SVID(ctx context.Context, req *svidstore.X509SVID
 	return nil
 }
 
-func (s *fakeSVIDStore) DeleteX509SVID(ctx context.Context, req []string) error {
+func (s *fakeSVIDStore) DeleteX509SVID(_ context.Context, req []string) error {
 	if s.err != nil {
 		return s.err
 	}

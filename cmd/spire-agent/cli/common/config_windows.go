@@ -1,5 +1,4 @@
 //go:build windows
-// +build windows
 
 package common
 
@@ -7,7 +6,7 @@ import (
 	"flag"
 	"net"
 
-	"github.com/spiffe/spire/pkg/common/util"
+	"github.com/spiffe/spire/pkg/common/namedpipe"
 )
 
 type ConfigOS struct {
@@ -19,5 +18,5 @@ func (c *ConfigOS) AddOSFlags(flags *flag.FlagSet) {
 }
 
 func (c *ConfigOS) GetAddr() (net.Addr, error) {
-	return util.GetNamedPipeAddr(c.namedPipeName), nil
+	return namedpipe.AddrFromName(c.namedPipeName), nil
 }

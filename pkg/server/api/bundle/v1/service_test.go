@@ -26,6 +26,7 @@ import (
 	"github.com/spiffe/spire/pkg/server/datastore"
 	"github.com/spiffe/spire/proto/spire/common"
 	"github.com/spiffe/spire/test/fakes/fakedatastore"
+	"github.com/spiffe/spire/test/grpctest"
 	"github.com/spiffe/spire/test/spiretest"
 	"github.com/spiffe/spire/test/testca"
 	"github.com/stretchr/testify/require"
@@ -140,7 +141,7 @@ func TestGetFederatedBundle(t *testing.T) {
 					Level:   logrus.ErrorLevel,
 					Message: "Invalid argument: getting a federated bundle for the server's own trust domain is not allowed",
 					Data: logrus.Fields{
-						telemetry.TrustDomainID: serverTrustDomain.String(),
+						telemetry.TrustDomainID: serverTrustDomain.Name(),
 					},
 				},
 				{
@@ -166,7 +167,7 @@ func TestGetFederatedBundle(t *testing.T) {
 					Level:   logrus.ErrorLevel,
 					Message: "Bundle not found",
 					Data: logrus.Fields{
-						telemetry.TrustDomainID: federatedTrustDomain.String(),
+						telemetry.TrustDomainID: federatedTrustDomain.Name(),
 					},
 				},
 				{
@@ -398,9 +399,10 @@ func TestAppendBundle(t *testing.T) {
 	pkixBytesHashed := api.HashByte(pkixBytes)
 
 	sb := &common.Bundle{
-		TrustDomainId: serverTrustDomain.IDString(),
-		RefreshHint:   60,
-		RootCas:       []*common.Certificate{{DerBytes: []byte("cert-bytes")}},
+		TrustDomainId:  serverTrustDomain.IDString(),
+		RefreshHint:    60,
+		SequenceNumber: 42,
+		RootCas:        []*common.Certificate{{DerBytes: []byte("cert-bytes")}},
 		JwtSigningKeys: []*common.PublicKey{
 			{
 				Kid:       "key-id-1",
@@ -451,7 +453,7 @@ func TestAppendBundle(t *testing.T) {
 			expectBundle: &types.Bundle{
 				TrustDomain:     defaultBundle.TrustDomain,
 				RefreshHint:     defaultBundle.RefreshHint,
-				SequenceNumber:  defaultBundle.SequenceNumber,
+				SequenceNumber:  defaultBundle.SequenceNumber + 1, // sequence number is incremented when appending authorities
 				X509Authorities: append(defaultBundle.X509Authorities, x509Cert),
 				JwtAuthorities:  append(defaultBundle.JwtAuthorities, jwtKey2),
 			},
@@ -502,7 +504,7 @@ func TestAppendBundle(t *testing.T) {
 			expectBundle: &types.Bundle{
 				TrustDomain:     defaultBundle.TrustDomain,
 				RefreshHint:     defaultBundle.RefreshHint,
-				SequenceNumber:  defaultBundle.SequenceNumber,
+				SequenceNumber:  defaultBundle.SequenceNumber + 1, // sequence number is incremented when appending authorities
 				JwtAuthorities:  defaultBundle.JwtAuthorities,
 				X509Authorities: append(defaultBundle.X509Authorities, x509Cert),
 			},
@@ -524,7 +526,7 @@ func TestAppendBundle(t *testing.T) {
 			expectBundle: &types.Bundle{
 				TrustDomain:     defaultBundle.TrustDomain,
 				RefreshHint:     defaultBundle.RefreshHint,
-				SequenceNumber:  defaultBundle.SequenceNumber,
+				SequenceNumber:  defaultBundle.SequenceNumber + 1, // sequence number is incremented when appending authorities
 				JwtAuthorities:  append(defaultBundle.JwtAuthorities, jwtKey2),
 				X509Authorities: defaultBundle.X509Authorities,
 			},
@@ -546,7 +548,7 @@ func TestAppendBundle(t *testing.T) {
 			name:            "output mask all false",
 			x509Authorities: []*types.X509Certificate{x509Cert},
 			jwtAuthorities:  []*types.JWTKey{jwtKey2},
-			expectBundle:    &types.Bundle{TrustDomain: serverTrustDomain.String()},
+			expectBundle:    &types.Bundle{TrustDomain: serverTrustDomain.Name()},
 			outputMask: &types.BundleMask{
 				X509Authorities: false,
 				JwtAuthorities:  false,
@@ -603,7 +605,7 @@ func TestAppendBundle(t *testing.T) {
 					Level:   logrus.ErrorLevel,
 					Message: "Invalid argument: failed to convert X.509 authority",
 					Data: logrus.Fields{
-						telemetry.TrustDomainID: serverTrustDomain.String(),
+						telemetry.TrustDomainID: serverTrustDomain.Name(),
 						logrus.ErrorKey:         expectedX509Err.Error(),
 					},
 				},
@@ -636,7 +638,7 @@ func TestAppendBundle(t *testing.T) {
 					Level:   logrus.ErrorLevel,
 					Message: "Invalid argument: failed to convert JWT authority",
 					Data: logrus.Fields{
-						telemetry.TrustDomainID: serverTrustDomain.String(),
+						telemetry.TrustDomainID: serverTrustDomain.Name(),
 						logrus.ErrorKey:         expectedJWTErr.Error(),
 					},
 				},
@@ -670,7 +672,7 @@ func TestAppendBundle(t *testing.T) {
 					Level:   logrus.ErrorLevel,
 					Message: "Invalid argument: failed to convert JWT authority",
 					Data: logrus.Fields{
-						telemetry.TrustDomainID: serverTrustDomain.String(),
+						telemetry.TrustDomainID: serverTrustDomain.Name(),
 						logrus.ErrorKey:         "missing key ID",
 					},
 				},
@@ -700,7 +702,7 @@ func TestAppendBundle(t *testing.T) {
 					Level:   logrus.ErrorLevel,
 					Message: "Failed to append bundle",
 					Data: logrus.Fields{
-						telemetry.TrustDomainID: serverTrustDomain.String(),
+						telemetry.TrustDomainID: serverTrustDomain.Name(),
 						logrus.ErrorKey:         "some error",
 					},
 				},
@@ -736,7 +738,7 @@ func TestAppendBundle(t *testing.T) {
 				},
 			},
 			expectBundle: &types.Bundle{
-				TrustDomain:     serverTrustDomain.String(),
+				TrustDomain:     serverTrustDomain.Name(),
 				X509Authorities: []*types.X509Certificate{x509Cert},
 				JwtAuthorities:  []*types.JWTKey{jwtKey2},
 			},
@@ -791,10 +793,11 @@ func TestBatchDeleteFederatedBundle(t *testing.T) {
 		td3.IDString(),
 	}
 	newEntry := &common.RegistrationEntry{
-		EntryId:  "entry1",
-		ParentId: "spiffe://example.org/foo",
-		SpiffeId: "spiffe://example.org/bar",
-		Ttl:      60,
+		EntryId:     "entry1",
+		ParentId:    "spiffe://example.org/foo",
+		SpiffeId:    "spiffe://example.org/bar",
+		X509SvidTtl: 70,
+		JwtSvidTtl:  80,
 		Selectors: []*common.Selector{
 			{Type: "a", Value: "1"},
 		},
@@ -819,11 +822,11 @@ func TestBatchDeleteFederatedBundle(t *testing.T) {
 		{
 			name: "remove multiple bundles",
 			expectResults: []*bundlev1.BatchDeleteFederatedBundleResponse_Result{
-				{Status: &types.Status{Code: int32(codes.OK), Message: "OK"}, TrustDomain: td1.String()},
-				{Status: &types.Status{Code: int32(codes.OK), Message: "OK"}, TrustDomain: td2.String()},
+				{Status: &types.Status{Code: int32(codes.OK), Message: "OK"}, TrustDomain: td1.Name()},
+				{Status: &types.Status{Code: int32(codes.OK), Message: "OK"}, TrustDomain: td2.Name()},
 			},
 			expectDSBundles: []string{serverTrustDomain.IDString(), td3.IDString()},
-			trustDomains:    []string{td1.String(), td2.String()},
+			trustDomains:    []string{td1.Name(), td2.Name()},
 			expectLogs: []spiretest.LogEntry{
 				{
 					Level:   logrus.InfoLevel,
@@ -888,7 +891,7 @@ func TestBatchDeleteFederatedBundle(t *testing.T) {
 				},
 			},
 			mode:            bundlev1.BatchDeleteFederatedBundleRequest_RESTRICT,
-			trustDomains:    []string{td1.String()},
+			trustDomains:    []string{td1.Name()},
 			expectDSBundles: dsBundles,
 		},
 		{
@@ -904,7 +907,7 @@ func TestBatchDeleteFederatedBundle(t *testing.T) {
 				},
 			},
 			mode:         bundlev1.BatchDeleteFederatedBundleRequest_DISSOCIATE,
-			trustDomains: []string{td1.String()},
+			trustDomains: []string{td1.Name()},
 			expectDSBundles: []string{
 				serverTrustDomain.IDString(),
 				td2.IDString(),
@@ -936,7 +939,7 @@ func TestBatchDeleteFederatedBundle(t *testing.T) {
 				},
 			},
 			mode:         bundlev1.BatchDeleteFederatedBundleRequest_DELETE,
-			trustDomains: []string{td1.String()},
+			trustDomains: []string{td1.Name()},
 			expectDSBundles: []string{
 				serverTrustDomain.IDString(),
 				td2.IDString(),
@@ -999,7 +1002,7 @@ func TestBatchDeleteFederatedBundle(t *testing.T) {
 					Level:   logrus.ErrorLevel,
 					Message: "Invalid argument: removing the bundle for the server trust domain is not allowed",
 					Data: logrus.Fields{
-						telemetry.TrustDomainID:             serverTrustDomain.String(),
+						telemetry.TrustDomainID:             serverTrustDomain.Name(),
 						telemetry.DeleteFederatedBundleMode: "RESTRICT",
 					},
 				},
@@ -1022,11 +1025,11 @@ func TestBatchDeleteFederatedBundle(t *testing.T) {
 						Code:    int32(codes.InvalidArgument),
 						Message: "removing the bundle for the server trust domain is not allowed",
 					},
-					TrustDomain: serverTrustDomain.String(),
+					TrustDomain: serverTrustDomain.Name(),
 				},
 			},
 			expectDSBundles: dsBundles,
-			trustDomains:    []string{serverTrustDomain.String()},
+			trustDomains:    []string{serverTrustDomain.Name()},
 		},
 		{
 			name: "bundle not found",
@@ -1073,7 +1076,7 @@ func TestBatchDeleteFederatedBundle(t *testing.T) {
 					Data: logrus.Fields{
 						logrus.ErrorKey:                     "rpc error: code = Internal desc = datasource fails",
 						telemetry.DeleteFederatedBundleMode: "RESTRICT",
-						telemetry.TrustDomainID:             td1.String(),
+						telemetry.TrustDomainID:             td1.Name(),
 					},
 				},
 				{
@@ -1095,11 +1098,11 @@ func TestBatchDeleteFederatedBundle(t *testing.T) {
 						Code:    int32(codes.Internal),
 						Message: "failed to delete federated bundle: datasource fails",
 					},
-					TrustDomain: td1.String(),
+					TrustDomain: td1.Name(),
 				},
 			},
 			expectDSBundles: dsBundles,
-			trustDomains:    []string{td1.String()},
+			trustDomains:    []string{td1.Name()},
 			dsError:         status.New(codes.Internal, "datasource fails").Err(),
 		},
 	} {
@@ -1495,7 +1498,7 @@ func TestListFederatedBundles(t *testing.T) {
 		{
 			name: "page bundles",
 			// Returns only one element because server bundle is the first element
-			// returned by datastore, and we filter resutls on service
+			// returned by datastore, and we filter results on service
 			expectBundlePages: [][]*common.Bundle{
 				{b1},
 				{b2, b3},
@@ -1567,7 +1570,6 @@ func TestListFederatedBundles(t *testing.T) {
 				actualBundlePages = append(actualBundlePages, resp.Bundles)
 				if len(actualBundlePages) > pagesLimit {
 					t.Fatalf("exceeded page count limit (%d); paging is likely broken", pagesLimit)
-					break
 				}
 				pageToken = resp.NextPageToken
 				if pageToken == "" {
@@ -1720,9 +1722,10 @@ func TestCountBundles(t *testing.T) {
 
 func createBundle(t *testing.T, test *serviceTest, td string) *common.Bundle {
 	b := &common.Bundle{
-		TrustDomainId: td,
-		RefreshHint:   60,
-		RootCas:       []*common.Certificate{{DerBytes: []byte(fmt.Sprintf("cert-bytes-%s", td))}},
+		TrustDomainId:  td,
+		RefreshHint:    60,
+		SequenceNumber: 42,
+		RootCas:        []*common.Certificate{{DerBytes: []byte(fmt.Sprintf("cert-bytes-%s", td))}},
 		JwtSigningKeys: []*common.PublicKey{
 			{
 				Kid:       fmt.Sprintf("key-id-%s", td),
@@ -1758,14 +1761,16 @@ func TestBatchCreateFederatedBundle(t *testing.T) {
 			name:            "Create succeeds",
 			bundlesToCreate: []*types.Bundle{makeValidBundle(t, federatedTrustDomain)},
 			outputMask: &types.BundleMask{
-				RefreshHint: true,
+				RefreshHint:    true,
+				SequenceNumber: true,
 			},
 			expectedResults: []*bundlev1.BatchCreateFederatedBundleResponse_Result{
 				{
 					Status: api.OK(),
 					Bundle: &types.Bundle{
-						TrustDomain: "another-example.org",
-						RefreshHint: 60,
+						TrustDomain:    "another-example.org",
+						RefreshHint:    60,
+						SequenceNumber: 42,
 					},
 				},
 			},
@@ -1784,7 +1789,7 @@ func TestBatchCreateFederatedBundle(t *testing.T) {
 						telemetry.Status:                 "success",
 						telemetry.Type:                   "audit",
 						telemetry.RefreshHint:            "60",
-						telemetry.SequenceNumber:         "0",
+						telemetry.SequenceNumber:         "42",
 						telemetry.TrustDomainID:          "another-example.org",
 						"x509_authorities_asn1_sha256.0": x509BundleHash,
 					},
@@ -1798,7 +1803,7 @@ func TestBatchCreateFederatedBundle(t *testing.T) {
 			expectedResults: []*bundlev1.BatchCreateFederatedBundleResponse_Result{
 				{
 					Status: api.OK(),
-					Bundle: &types.Bundle{TrustDomain: federatedTrustDomain.String()},
+					Bundle: &types.Bundle{TrustDomain: federatedTrustDomain.Name()},
 				},
 			},
 			expectedLogMsgs: []spiretest.LogEntry{
@@ -1816,7 +1821,7 @@ func TestBatchCreateFederatedBundle(t *testing.T) {
 						telemetry.Status:                 "success",
 						telemetry.Type:                   "audit",
 						telemetry.RefreshHint:            "60",
-						telemetry.SequenceNumber:         "0",
+						telemetry.SequenceNumber:         "42",
 						telemetry.TrustDomainID:          "another-example.org",
 						"x509_authorities_asn1_sha256.0": x509BundleHash,
 					},
@@ -1847,7 +1852,7 @@ func TestBatchCreateFederatedBundle(t *testing.T) {
 						telemetry.Status:                 "success",
 						telemetry.Type:                   "audit",
 						telemetry.RefreshHint:            "60",
-						telemetry.SequenceNumber:         "0",
+						telemetry.SequenceNumber:         "42",
 						telemetry.TrustDomainID:          "another-example.org",
 						"x509_authorities_asn1_sha256.0": x509BundleHash,
 					},
@@ -1888,7 +1893,7 @@ func TestBatchCreateFederatedBundle(t *testing.T) {
 						telemetry.StatusMessage:          `trust domain argument is not valid: trust domain characters are limited to lowercase letters, numbers, dots, dashes, and underscores`,
 						telemetry.Type:                   "audit",
 						telemetry.RefreshHint:            "60",
-						telemetry.SequenceNumber:         "0",
+						telemetry.SequenceNumber:         "42",
 						telemetry.TrustDomainID:          "malformed id",
 						"x509_authorities_asn1_sha256.0": x509BundleHash,
 					},
@@ -1924,7 +1929,7 @@ func TestBatchCreateFederatedBundle(t *testing.T) {
 						telemetry.StatusMessage:          "creating a federated bundle for the server's own trust domain is not allowed",
 						telemetry.Type:                   "audit",
 						telemetry.RefreshHint:            "60",
-						telemetry.SequenceNumber:         "0",
+						telemetry.SequenceNumber:         "42",
 						telemetry.TrustDomainID:          "example.org",
 						"x509_authorities_asn1_sha256.0": x509BundleHash,
 					},
@@ -1958,7 +1963,7 @@ func TestBatchCreateFederatedBundle(t *testing.T) {
 						telemetry.Status:                 "success",
 						telemetry.Type:                   "audit",
 						telemetry.RefreshHint:            "60",
-						telemetry.SequenceNumber:         "0",
+						telemetry.SequenceNumber:         "42",
 						telemetry.TrustDomainID:          "another-example.org",
 						"x509_authorities_asn1_sha256.0": x509BundleHash,
 					},
@@ -1979,7 +1984,7 @@ func TestBatchCreateFederatedBundle(t *testing.T) {
 						telemetry.StatusMessage:          "bundle already exists",
 						telemetry.Type:                   "audit",
 						telemetry.RefreshHint:            "60",
-						telemetry.SequenceNumber:         "0",
+						telemetry.SequenceNumber:         "42",
 						telemetry.TrustDomainID:          "another-example.org",
 						"x509_authorities_asn1_sha256.0": x509BundleHash,
 					},
@@ -2011,7 +2016,7 @@ func TestBatchCreateFederatedBundle(t *testing.T) {
 						telemetry.StatusMessage:          "unable to create bundle: datastore error",
 						telemetry.Type:                   "audit",
 						telemetry.RefreshHint:            "60",
-						telemetry.SequenceNumber:         "0",
+						telemetry.SequenceNumber:         "42",
 						telemetry.TrustDomainID:          "another-example.org",
 						"x509_authorities_asn1_sha256.0": x509BundleHash,
 					},
@@ -2022,7 +2027,7 @@ func TestBatchCreateFederatedBundle(t *testing.T) {
 			name: "Malformed bundle",
 			bundlesToCreate: []*types.Bundle{
 				{
-					TrustDomain: federatedTrustDomain.String(),
+					TrustDomain: federatedTrustDomain.Name(),
 					X509Authorities: []*types.X509Certificate{
 						{
 							Asn1: []byte("malformed"),
@@ -2125,7 +2130,7 @@ func TestBatchUpdateFederatedBundle(t *testing.T) {
 						telemetry.Status:                 "success",
 						telemetry.Type:                   "audit",
 						telemetry.RefreshHint:            "60",
-						telemetry.SequenceNumber:         "0",
+						telemetry.SequenceNumber:         "42",
 						telemetry.TrustDomainID:          "another-example.org",
 						"x509_authorities_asn1_sha256.0": x509BundleHash,
 					},
@@ -2138,6 +2143,7 @@ func TestBatchUpdateFederatedBundle(t *testing.T) {
 			bundlesToUpdate:   []*types.Bundle{makeValidBundle(t, federatedTrustDomain)},
 			inputMask: &types.BundleMask{
 				RefreshHint:     true,
+				SequenceNumber:  true,
 				JwtAuthorities:  true,
 				X509Authorities: true,
 			},
@@ -2162,6 +2168,7 @@ func TestBatchUpdateFederatedBundle(t *testing.T) {
 						telemetry.Status:                 "success",
 						telemetry.Type:                   "audit",
 						telemetry.RefreshHint:            "60",
+						telemetry.SequenceNumber:         "42",
 						telemetry.TrustDomainID:          "another-example.org",
 						"x509_authorities_asn1_sha256.0": x509BundleHash,
 					},
@@ -2179,7 +2186,7 @@ func TestBatchUpdateFederatedBundle(t *testing.T) {
 				{
 					Status: api.OK(),
 					Bundle: &types.Bundle{
-						TrustDomain: federatedTrustDomain.String(),
+						TrustDomain: federatedTrustDomain.Name(),
 						RefreshHint: makeValidBundle(t, federatedTrustDomain).RefreshHint,
 					},
 				},
@@ -2199,7 +2206,7 @@ func TestBatchUpdateFederatedBundle(t *testing.T) {
 						telemetry.Status:                 "success",
 						telemetry.Type:                   "audit",
 						telemetry.RefreshHint:            "60",
-						telemetry.SequenceNumber:         "0",
+						telemetry.SequenceNumber:         "42",
 						telemetry.TrustDomainID:          "another-example.org",
 						"x509_authorities_asn1_sha256.0": x509BundleHash,
 					},
@@ -2238,7 +2245,7 @@ func TestBatchUpdateFederatedBundle(t *testing.T) {
 						telemetry.Status:                 "error",
 						telemetry.Type:                   "audit",
 						telemetry.RefreshHint:            "60",
-						telemetry.SequenceNumber:         "0",
+						telemetry.SequenceNumber:         "42",
 						telemetry.TrustDomainID:          "malformed id",
 						"x509_authorities_asn1_sha256.0": x509BundleHash,
 						telemetry.StatusCode:             "InvalidArgument",
@@ -2274,7 +2281,7 @@ func TestBatchUpdateFederatedBundle(t *testing.T) {
 						telemetry.Status:                 "error",
 						telemetry.Type:                   "audit",
 						telemetry.RefreshHint:            "60",
-						telemetry.SequenceNumber:         "0",
+						telemetry.SequenceNumber:         "42",
 						telemetry.TrustDomainID:          "example.org",
 						"x509_authorities_asn1_sha256.0": x509BundleHash,
 						telemetry.StatusCode:             "InvalidArgument",
@@ -2306,7 +2313,7 @@ func TestBatchUpdateFederatedBundle(t *testing.T) {
 						telemetry.Status:                 "error",
 						telemetry.Type:                   "audit",
 						telemetry.RefreshHint:            "60",
-						telemetry.SequenceNumber:         "0",
+						telemetry.SequenceNumber:         "42",
 						telemetry.TrustDomainID:          "another-example.org",
 						"x509_authorities_asn1_sha256.0": x509BundleHash,
 						telemetry.StatusCode:             "NotFound",
@@ -2338,7 +2345,7 @@ func TestBatchUpdateFederatedBundle(t *testing.T) {
 						telemetry.Status:                 "error",
 						telemetry.Type:                   "audit",
 						telemetry.RefreshHint:            "60",
-						telemetry.SequenceNumber:         "0",
+						telemetry.SequenceNumber:         "42",
 						telemetry.TrustDomainID:          "another-example.org",
 						"x509_authorities_asn1_sha256.0": x509BundleHash,
 						telemetry.StatusCode:             "Internal",
@@ -2351,7 +2358,7 @@ func TestBatchUpdateFederatedBundle(t *testing.T) {
 			name: "Invalid bundle provided",
 			bundlesToUpdate: []*types.Bundle{
 				{
-					TrustDomain: federatedTrustDomain.String(),
+					TrustDomain: federatedTrustDomain.Name(),
 					X509Authorities: []*types.X509Certificate{
 						{
 							Asn1: []byte("malformed"),
@@ -2415,7 +2422,7 @@ func TestBatchUpdateFederatedBundle(t *testing.T) {
 						telemetry.Status:                 "error",
 						telemetry.Type:                   "audit",
 						telemetry.RefreshHint:            "60",
-						telemetry.SequenceNumber:         "0",
+						telemetry.SequenceNumber:         "42",
 						telemetry.TrustDomainID:          "non-existent-td",
 						"x509_authorities_asn1_sha256.0": x509BundleHash,
 						telemetry.StatusCode:             "NotFound",
@@ -2436,7 +2443,7 @@ func TestBatchUpdateFederatedBundle(t *testing.T) {
 						telemetry.Status:                 "success",
 						telemetry.Type:                   "audit",
 						telemetry.RefreshHint:            "60",
-						telemetry.SequenceNumber:         "0",
+						telemetry.SequenceNumber:         "42",
 						telemetry.TrustDomainID:          "another-example.org",
 						"x509_authorities_asn1_sha256.0": x509BundleHash,
 					},
@@ -2493,6 +2500,7 @@ func TestBatchSetFederatedBundle(t *testing.T) {
 	updatedBundle := makeValidBundle(t, federatedTrustDomain)
 	// Change the refresh hint
 	updatedBundle.RefreshHint = 120
+	updatedBundle.SequenceNumber = 42
 	x509BundleHash := api.HashByte(updatedBundle.X509Authorities[0].Asn1)
 
 	for _, tt := range []struct {
@@ -2531,7 +2539,7 @@ func TestBatchSetFederatedBundle(t *testing.T) {
 					Message: "API accessed",
 					Data: logrus.Fields{
 						telemetry.RefreshHint:            "60",
-						telemetry.SequenceNumber:         "0",
+						telemetry.SequenceNumber:         "42",
 						telemetry.Status:                 "success",
 						telemetry.TrustDomainID:          "another-example.org",
 						telemetry.Type:                   "audit",
@@ -2547,7 +2555,7 @@ func TestBatchSetFederatedBundle(t *testing.T) {
 			expectedResults: []*bundlev1.BatchSetFederatedBundleResponse_Result{
 				{
 					Status: api.OK(),
-					Bundle: &types.Bundle{TrustDomain: federatedTrustDomain.String()},
+					Bundle: &types.Bundle{TrustDomain: federatedTrustDomain.Name()},
 				},
 			},
 			expectedLogMsgs: []spiretest.LogEntry{
@@ -2563,7 +2571,7 @@ func TestBatchSetFederatedBundle(t *testing.T) {
 					Message: "API accessed",
 					Data: logrus.Fields{
 						telemetry.RefreshHint:            "60",
-						telemetry.SequenceNumber:         "0",
+						telemetry.SequenceNumber:         "42",
 						telemetry.Status:                 "success",
 						telemetry.TrustDomainID:          "another-example.org",
 						telemetry.Type:                   "audit",
@@ -2594,7 +2602,7 @@ func TestBatchSetFederatedBundle(t *testing.T) {
 					Message: "API accessed",
 					Data: logrus.Fields{
 						telemetry.RefreshHint:            "60",
-						telemetry.SequenceNumber:         "0",
+						telemetry.SequenceNumber:         "42",
 						telemetry.Status:                 "success",
 						telemetry.TrustDomainID:          "another-example.org",
 						telemetry.Type:                   "audit",
@@ -2633,7 +2641,7 @@ func TestBatchSetFederatedBundle(t *testing.T) {
 					Message: "API accessed",
 					Data: logrus.Fields{
 						telemetry.RefreshHint:            "60",
-						telemetry.SequenceNumber:         "0",
+						telemetry.SequenceNumber:         "42",
 						telemetry.Status:                 "success",
 						telemetry.TrustDomainID:          "another-example.org",
 						telemetry.Type:                   "audit",
@@ -2652,7 +2660,7 @@ func TestBatchSetFederatedBundle(t *testing.T) {
 					Message: "API accessed",
 					Data: logrus.Fields{
 						telemetry.RefreshHint:            "120",
-						telemetry.SequenceNumber:         "0",
+						telemetry.SequenceNumber:         "42",
 						telemetry.Status:                 "success",
 						telemetry.TrustDomainID:          "another-example.org",
 						telemetry.Type:                   "audit",
@@ -2687,7 +2695,7 @@ func TestBatchSetFederatedBundle(t *testing.T) {
 					Message: "API accessed",
 					Data: logrus.Fields{
 						telemetry.RefreshHint:            "60",
-						telemetry.SequenceNumber:         "0",
+						telemetry.SequenceNumber:         "42",
 						telemetry.Status:                 "error",
 						telemetry.StatusCode:             "InvalidArgument",
 						telemetry.StatusMessage:          "trust domain argument is not valid: trust domain characters are limited to lowercase letters, numbers, dots, dashes, and underscores",
@@ -2723,7 +2731,7 @@ func TestBatchSetFederatedBundle(t *testing.T) {
 					Message: "API accessed",
 					Data: logrus.Fields{
 						telemetry.RefreshHint:            "60",
-						telemetry.SequenceNumber:         "0",
+						telemetry.SequenceNumber:         "42",
 						telemetry.Status:                 "error",
 						telemetry.StatusCode:             "InvalidArgument",
 						telemetry.StatusMessage:          "setting a federated bundle for the server's own trust domain is not allowed",
@@ -2755,7 +2763,7 @@ func TestBatchSetFederatedBundle(t *testing.T) {
 					Message: "API accessed",
 					Data: logrus.Fields{
 						telemetry.RefreshHint:            "60",
-						telemetry.SequenceNumber:         "0",
+						telemetry.SequenceNumber:         "42",
 						telemetry.Status:                 "error",
 						telemetry.StatusCode:             "Internal",
 						telemetry.StatusMessage:          "failed to set bundle: datastore error",
@@ -2770,7 +2778,7 @@ func TestBatchSetFederatedBundle(t *testing.T) {
 			name: "Malformed bundle",
 			bundlesToSet: []*types.Bundle{
 				{
-					TrustDomain: federatedTrustDomain.String(),
+					TrustDomain: federatedTrustDomain.Name(),
 					X509Authorities: []*types.X509Certificate{
 						{
 							Asn1: []byte("malformed"),
@@ -2844,7 +2852,7 @@ func assertBundleWithMask(t *testing.T, expected, actual *types.Bundle, m *types
 		return
 	}
 
-	require.Equal(t, spiffeid.RequireTrustDomainFromString(expected.TrustDomain).String(), actual.TrustDomain)
+	require.Equal(t, spiffeid.RequireTrustDomainFromString(expected.TrustDomain).Name(), actual.TrustDomain)
 
 	if m == nil || m.RefreshHint {
 		require.Equal(t, expected.RefreshHint, actual.RefreshHint)
@@ -2898,9 +2906,6 @@ func setupServiceTest(t *testing.T) *serviceTest {
 
 	log, logHook := test.NewNullLogger()
 	log.Level = logrus.DebugLevel
-	registerFn := func(s *grpc.Server) {
-		bundle.RegisterService(s, service)
-	}
 
 	test := &serviceTest{
 		ds:          ds,
@@ -2909,7 +2914,7 @@ func setupServiceTest(t *testing.T) *serviceTest {
 		rateLimiter: rateLimiter,
 	}
 
-	ppMiddleware := middleware.Preprocess(func(ctx context.Context, fullMethod string, req interface{}) (context.Context, error) {
+	overrideContext := func(ctx context.Context) context.Context {
 		ctx = rpccontext.WithLogger(ctx, log)
 		if test.isAdmin {
 			ctx = rpccontext.WithAdminCaller(ctx)
@@ -2925,21 +2930,20 @@ func setupServiceTest(t *testing.T) *serviceTest {
 		}
 
 		ctx = rpccontext.WithRateLimiter(ctx, rateLimiter)
-		return ctx, nil
-	})
+		return ctx
+	}
 
-	unaryInterceptor, streamInterceptor := middleware.Interceptors(middleware.Chain(
-		ppMiddleware,
-		// Add audit log with local tracking disabled
-		middleware.WithAuditLog(false),
-	))
-	server := grpc.NewServer(
-		grpc.UnaryInterceptor(unaryInterceptor),
-		grpc.StreamInterceptor(streamInterceptor),
+	server := grpctest.StartServer(t, func(s grpc.ServiceRegistrar) {
+		bundle.RegisterService(s, service)
+	},
+		grpctest.OverrideContext(overrideContext),
+		grpctest.Middleware(middleware.WithAuditLog(false)),
 	)
-	conn, done := spiretest.NewAPIServerWithMiddleware(t, registerFn, server)
-	test.done = done
+
+	conn := server.Dial(t)
+
 	test.client = bundlev1.NewBundleClient(conn)
+	test.done = server.Stop
 
 	return test
 }
@@ -2949,8 +2953,9 @@ func makeValidBundle(t *testing.T, td spiffeid.TrustDomain) *types.Bundle {
 	require.NoError(t, err)
 
 	return &types.Bundle{
-		TrustDomain: b.TrustDomain().String(),
-		RefreshHint: 60,
+		TrustDomain:    b.TrustDomain().Name(),
+		RefreshHint:    60,
+		SequenceNumber: 42,
 		X509Authorities: func(certs []*x509.Certificate) []*types.X509Certificate {
 			var authorities []*types.X509Certificate
 			for _, c := range certs {
@@ -2998,7 +3003,7 @@ type fakeUpstreamPublisher struct {
 	expectKey *common.PublicKey
 }
 
-func (f *fakeUpstreamPublisher) PublishJWTKey(ctx context.Context, jwtKey *common.PublicKey) ([]*common.PublicKey, error) {
+func (f *fakeUpstreamPublisher) PublishJWTKey(_ context.Context, jwtKey *common.PublicKey) ([]*common.PublicKey, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -3013,7 +3018,7 @@ type fakeRateLimiter struct {
 	err   error
 }
 
-func (f *fakeRateLimiter) RateLimit(ctx context.Context, count int) error {
+func (f *fakeRateLimiter) RateLimit(_ context.Context, count int) error {
 	if f.count != count {
 		return fmt.Errorf("rate limiter got %d but expected %d", count, f.count)
 	}

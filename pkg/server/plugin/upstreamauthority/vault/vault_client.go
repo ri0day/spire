@@ -101,11 +101,11 @@ type Client struct {
 // SignCSRResponse includes certificates which are generates by Vault
 type SignCSRResponse struct {
 	// A certificate requested to sign
-	CertPEM string
-	// A certificate of CA(Vault)
 	CACertPEM string
+	// A certificate of CA(Vault)
+	UpstreamCACertPEM string
 	// Set of Upstream CA certificates
-	CACertChainPEM []string
+	UpstreamCACertChainPEM []string
 }
 
 // NewClientConfig returns a new *ClientConfig with default parameters.
@@ -163,7 +163,7 @@ func (c *ClientConfig) NewAuthenticatedClient(method AuthMethod, renewCh chan st
 		}
 	case CERT:
 		path := fmt.Sprintf("auth/%v/login", c.clientParams.CertAuthMountPoint)
-		sec, err = client.Auth(path, map[string]interface{}{
+		sec, err = client.Auth(path, map[string]any{
 			"name": c.clientParams.CertAuthRoleName,
 		})
 		if err != nil {
@@ -174,7 +174,7 @@ func (c *ClientConfig) NewAuthenticatedClient(method AuthMethod, renewCh chan st
 		}
 	case APPROLE:
 		path := fmt.Sprintf("auth/%v/login", c.clientParams.AppRoleAuthMountPoint)
-		body := map[string]interface{}{
+		body := map[string]any{
 			"role_id":   c.clientParams.AppRoleID,
 			"secret_id": c.clientParams.AppRoleSecretID,
 		}
@@ -191,7 +191,7 @@ func (c *ClientConfig) NewAuthenticatedClient(method AuthMethod, renewCh chan st
 			return nil, status.Errorf(codes.Internal, "failed to read k8s service account token: %v", err)
 		}
 		path := fmt.Sprintf("auth/%s/login", c.clientParams.K8sAuthMountPoint)
-		body := map[string]interface{}{
+		body := map[string]any{
 			"role": c.clientParams.K8sAuthRoleName,
 			"jwt":  string(b),
 		}
@@ -296,7 +296,7 @@ func (c *Client) SetToken(v string) {
 }
 
 // Auth authenticates to vault server with TLS certificate method
-func (c *Client) Auth(path string, body map[string]interface{}) (*vapi.Secret, error) {
+func (c *Client) Auth(path string, body map[string]any) (*vapi.Secret, error) {
 	c.vaultClient.ClearToken()
 	secret, err := c.vaultClient.Logical().Write(path, body)
 	if err != nil {
@@ -350,10 +350,19 @@ func (c *Client) LookupSelf(token string) (*vapi.Secret, error) {
 func (c *Client) SignIntermediate(ttl string, csr *x509.CertificateRequest) (*SignCSRResponse, error) {
 	csrPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csr.Raw})
 
-	reqData := map[string]interface{}{
+	var uris []string
+	for _, uri := range csr.URIs {
+		uris = append(uris, uri.String())
+	}
+	if len(uris) == 0 {
+		return nil, status.Errorf(codes.InvalidArgument, "CSR must have at least one URI")
+	}
+
+	reqData := map[string]any{
 		"common_name":  csr.Subject.CommonName,
 		"organization": strings.Join(csr.Subject.Organization, ","),
 		"country":      strings.Join(csr.Subject.Country, ","),
+		"uri_sans":     strings.Join(uris, ","),
 		"csr":          string(csrPEM),
 		"ttl":          ttl,
 	}
@@ -374,7 +383,7 @@ func (c *Client) SignIntermediate(ttl string, csr *x509.CertificateRequest) (*Si
 	if !ok {
 		return nil, status.Errorf(codes.Internal, "expected certificate data type %T but got %T", cert, certData)
 	}
-	resp.CertPEM = cert
+	resp.CACertPEM = cert
 
 	caCertData, ok := s.Data["issuing_ca"]
 	if !ok {
@@ -384,12 +393,11 @@ func (c *Client) SignIntermediate(ttl string, csr *x509.CertificateRequest) (*Si
 	if !ok {
 		return nil, status.Errorf(codes.Internal, "expected issuing_ca data type %T but got %T", caCert, caCertData)
 	}
-	resp.CACertPEM = caCert
+	resp.UpstreamCACertPEM = caCert
 
-	if caChainData, ok := s.Data["ca_chain"]; !ok {
-		// empty is general use case when Vault is Root CA.
-	} else {
-		caChainCertsObj, ok := caChainData.([]interface{})
+	// expect to be empty case when Vault is Root CA.
+	if caChainData, ok := s.Data["ca_chain"]; ok {
+		caChainCertsObj, ok := caChainData.([]any)
 		if !ok {
 			return nil, status.Errorf(codes.Internal, "expected ca_chain data type %T but got %T", caChainCertsObj, caChainData)
 		}
@@ -401,7 +409,7 @@ func (c *Client) SignIntermediate(ttl string, csr *x509.CertificateRequest) (*Si
 			}
 			caChainCerts = append(caChainCerts, caChainCert)
 		}
-		resp.CACertChainPEM = caChainCerts
+		resp.UpstreamCACertChainPEM = caChainCerts
 	}
 
 	return resp, nil

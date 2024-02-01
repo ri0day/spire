@@ -13,7 +13,7 @@ import (
 	"github.com/spiffe/spire/proto/spire/common"
 )
 
-func printEntry(e *types.Entry, printf func(string, ...interface{}) error) {
+func printEntry(e *types.Entry, printf func(string, ...any) error) {
 	_ = printf("Entry ID         : %s\n", printableEntryID(e.Id))
 	_ = printf("SPIFFE ID        : %s\n", protoToIDString(e.SpiffeId))
 	_ = printf("Parent ID        : %s\n", protoToIDString(e.ParentId))
@@ -23,10 +23,16 @@ func printEntry(e *types.Entry, printf func(string, ...interface{}) error) {
 		_ = printf("Downstream       : %t\n", e.Downstream)
 	}
 
-	if e.Ttl == 0 {
-		_ = printf("TTL              : default\n")
+	if e.X509SvidTtl == 0 {
+		_ = printf("X509-SVID TTL    : default\n")
 	} else {
-		_ = printf("TTL              : %d\n", e.Ttl)
+		_ = printf("X509-SVID TTL    : %d\n", e.X509SvidTtl)
+	}
+
+	if e.JwtSvidTtl == 0 {
+		_ = printf("JWT-SVID TTL     : default\n")
+	} else {
+		_ = printf("JWT-SVID TTL     : %d\n", e.JwtSvidTtl)
 	}
 
 	if e.ExpiresAt != 0 {
@@ -53,6 +59,10 @@ func printEntry(e *types.Entry, printf func(string, ...interface{}) error) {
 		_ = printf("StoreSvid        : %t\n", e.StoreSvid)
 	}
 
+	if e.Hint != "" {
+		_ = printf("Hint             : %s\n", e.Hint)
+	}
+
 	_ = printf("\n")
 }
 
@@ -63,7 +73,7 @@ func idStringToProto(id string) (*types.SPIFFEID, error) {
 		return nil, err
 	}
 	return &types.SPIFFEID{
-		TrustDomain: idType.TrustDomain().String(),
+		TrustDomain: idType.TrustDomain().Name(),
 		Path:        idType.Path(),
 	}, nil
 }

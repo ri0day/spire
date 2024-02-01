@@ -1,3 +1,5 @@
+//go:build !darwin
+
 package tpmdevid_test
 
 import (
@@ -10,7 +12,7 @@ import (
 	"runtime"
 	"testing"
 
-	"github.com/google/go-tpm/tpm2"
+	"github.com/google/go-tpm/legacy/tpm2"
 	"github.com/hashicorp/go-hclog"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	configv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/service/common/config/v1"

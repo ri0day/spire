@@ -54,7 +54,7 @@ func TestAuthorizedEntryFetcherWithFullCache(t *testing.T) {
 		return newStaticEntryCache(entryMap), nil
 	}
 
-	f, err := NewAuthorizedEntryFetcherWithFullCache(ctx, buildCache, log, clk, defaultCacheReloadInterval)
+	f, err := NewAuthorizedEntryFetcherWithFullCache(ctx, buildCache, log, clk, ds, defaultCacheReloadInterval, defaultPruneEventsOlderThan)
 	require.NoError(t, err)
 
 	entries, err := f.FetchAuthorizedEntries(context.Background(), agentID)
@@ -76,6 +76,7 @@ func TestAgentAuthorizer(t *testing.T) {
 		expectedMsg    string
 		expectedReason types.PermissionDeniedDetails_Reason
 		expectedLogs   []spiretest.LogEntry
+		expectedNode   *common.AttestedNode
 	}{
 		{
 			name: "authorized",
@@ -84,6 +85,10 @@ func TestAgentAuthorizer(t *testing.T) {
 				CertSerialNumber: agentSVID.SerialNumber.String(),
 			},
 			expectedCode: codes.OK,
+			expectedNode: &common.AttestedNode{
+				SpiffeId:         agentID.String(),
+				CertSerialNumber: agentSVID.SerialNumber.String(),
+			},
 		},
 		{
 			name:         "fail fetch",
@@ -94,7 +99,7 @@ func TestAgentAuthorizer(t *testing.T) {
 				{
 					Level:   logrus.ErrorLevel,
 					Message: "Unable to look up agent information",
-					Data: map[string]interface{}{
+					Data: map[string]any{
 						logrus.ErrorKey:      "fetch failed",
 						telemetry.CallerID:   agentID.String(),
 						telemetry.CallerAddr: "127.0.0.1",
@@ -116,7 +121,7 @@ func TestAgentAuthorizer(t *testing.T) {
 				{
 					Level:   logrus.ErrorLevel,
 					Message: "Agent SVID is expired",
-					Data: map[string]interface{}{
+					Data: map[string]any{
 						telemetry.CallerID:   agentID.String(),
 						telemetry.CallerAddr: "127.0.0.1",
 					},
@@ -132,7 +137,7 @@ func TestAgentAuthorizer(t *testing.T) {
 				{
 					Level:   logrus.ErrorLevel,
 					Message: "Agent is not attested",
-					Data: map[string]interface{}{
+					Data: map[string]any{
 						telemetry.CallerID:   agentID.String(),
 						telemetry.CallerAddr: "127.0.0.1",
 					},
@@ -151,7 +156,7 @@ func TestAgentAuthorizer(t *testing.T) {
 				{
 					Level:   logrus.ErrorLevel,
 					Message: "Agent is banned",
-					Data: map[string]interface{}{
+					Data: map[string]any{
 						telemetry.CallerID:   agentID.String(),
 						telemetry.CallerAddr: "127.0.0.1",
 					},
@@ -171,7 +176,7 @@ func TestAgentAuthorizer(t *testing.T) {
 				{
 					Level:   logrus.ErrorLevel,
 					Message: "Agent SVID is not active",
-					Data: map[string]interface{}{
+					Data: map[string]any{
 						telemetry.CallerID:         agentID.String(),
 						telemetry.CallerAddr:       "127.0.0.1",
 						telemetry.SVIDSerialNumber: agentSVID.SerialNumber.String(),
@@ -186,8 +191,15 @@ func TestAgentAuthorizer(t *testing.T) {
 				SpiffeId:            agentID.String(),
 				CertSerialNumber:    "CURRENT",
 				NewCertSerialNumber: agentSVID.SerialNumber.String(),
+				CanReattest:         true,
 			},
 			expectedCode: codes.OK,
+			expectedNode: &common.AttestedNode{
+				SpiffeId:            agentID.String(),
+				CertSerialNumber:    agentSVID.SerialNumber.String(),
+				NewCertSerialNumber: "",
+				CanReattest:         true,
+			},
 		},
 		{
 			name: "failed to activate new SVID",
@@ -203,7 +215,7 @@ func TestAgentAuthorizer(t *testing.T) {
 				{
 					Level:   logrus.WarnLevel,
 					Message: "Unable to activate the new agent SVID",
-					Data: map[string]interface{}{
+					Data: map[string]any{
 						telemetry.CallerID:         agentID.String(),
 						telemetry.CallerAddr:       "127.0.0.1",
 						telemetry.SVIDSerialNumber: agentSVID.SerialNumber.String(),
@@ -243,7 +255,7 @@ func TestAgentAuthorizer(t *testing.T) {
 			if !tt.time.IsZero() {
 				clk.Set(tt.time)
 			}
-			authorizer := AgentAuthorizer(log, ds, clk)
+			authorizer := AgentAuthorizer(ds, clk)
 			ctx := context.Background()
 			ctx = rpccontext.WithLogger(ctx, log.WithFields(logrus.Fields{
 				telemetry.CallerAddr: "127.0.0.1",
@@ -271,11 +283,9 @@ func TestAgentAuthorizer(t *testing.T) {
 				require.Fail(t, "unexpected error code")
 			}
 
-			// Assert the new SVID serial number (if existed) is now set as current
 			attestedNode, err := ds.FetchAttestedNode(context.Background(), tt.node.SpiffeId)
 			require.NoError(t, err)
-			require.Equal(t, agentSVID.SerialNumber.String(), attestedNode.CertSerialNumber)
-			require.Empty(t, attestedNode.NewCertSerialNumber)
+			spiretest.RequireProtoEqual(t, tt.expectedNode, attestedNode)
 		})
 	}
 }

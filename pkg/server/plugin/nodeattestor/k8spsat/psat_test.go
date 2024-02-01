@@ -17,6 +17,8 @@ import (
 	"testing"
 	"time"
 
+	jose "github.com/go-jose/go-jose/v3"
+	"github.com/go-jose/go-jose/v3/jwt"
 	"github.com/google/go-cmp/cmp"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/spire/pkg/common/catalog"
@@ -27,8 +29,6 @@ import (
 	"github.com/spiffe/spire/test/plugintest"
 	"github.com/spiffe/spire/test/spiretest"
 	"google.golang.org/grpc/codes"
-	jose "gopkg.in/square/go-jose.v2"
-	"gopkg.in/square/go-jose.v2/jwt"
 	authv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -522,7 +522,7 @@ func createNode(nodeName, nodeUID string) *corev1.Node {
 	}
 }
 
-func expectNoChallenge(ctx context.Context, challenge []byte) ([]byte, error) {
+func expectNoChallenge(context.Context, []byte) ([]byte, error) {
 	return nil, errors.New("challenge is not expected")
 }
 
@@ -557,7 +557,7 @@ func (c *fakeAPIServerClient) SetTokenStatus(token string, status *authv1.TokenR
 	c.status[token] = status
 }
 
-func (c *fakeAPIServerClient) GetNode(ctx context.Context, nodeName string) (*corev1.Node, error) {
+func (c *fakeAPIServerClient) GetNode(_ context.Context, nodeName string) (*corev1.Node, error) {
 	node, ok := c.nodes[nodeName]
 	if !ok {
 		return nil, fmt.Errorf("node %s not found", nodeName)
@@ -565,7 +565,7 @@ func (c *fakeAPIServerClient) GetNode(ctx context.Context, nodeName string) (*co
 	return node, nil
 }
 
-func (c *fakeAPIServerClient) GetPod(ctx context.Context, namespace, podName string) (*corev1.Pod, error) {
+func (c *fakeAPIServerClient) GetPod(_ context.Context, namespace, podName string) (*corev1.Pod, error) {
 	pod, ok := c.pods[namespacedName{namespace: namespace, name: podName}]
 	if !ok {
 		return nil, fmt.Errorf("pod %s/%s not found", namespace, podName)
@@ -573,7 +573,7 @@ func (c *fakeAPIServerClient) GetPod(ctx context.Context, namespace, podName str
 	return pod, nil
 }
 
-func (c *fakeAPIServerClient) ValidateToken(ctx context.Context, token string, audiences []string) (*authv1.TokenReviewStatus, error) {
+func (c *fakeAPIServerClient) ValidateToken(_ context.Context, token string, audiences []string) (*authv1.TokenReviewStatus, error) {
 	status, ok := c.status[token]
 	if !ok {
 		return nil, errors.New("no status configured by test for token")

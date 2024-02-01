@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/InVisionApp/go-health/v2"
+	"github.com/andres-erbsen/clock"
 	"github.com/sirupsen/logrus"
 	"github.com/spiffe/spire/pkg/common/telemetry"
 	"google.golang.org/grpc"
@@ -38,10 +38,10 @@ type State struct {
 	// Subsystems can return whatever details they want here as long as it is
 	// serializable via json.Marshal.
 	// LiveDetails are opaque details related to the live check.
-	LiveDetails interface{}
+	LiveDetails any
 
 	// ReadyDetails are opaque details related to the live check.
-	ReadyDetails interface{}
+	ReadyDetails any
 }
 
 // Checkable is the interface implemented by subsystems that the checker uses
@@ -61,13 +61,14 @@ type ServableChecker interface {
 }
 
 func NewChecker(config Config, log logrus.FieldLogger) ServableChecker {
-	hc := health.New()
-
 	l := log.WithField(telemetry.SubsystemName, "health")
-	hc.StatusListener = &statusListener{log: l}
-	hc.Logger = &logadapter{FieldLogger: l}
 
-	c := &checker{config: config, hc: hc, log: l}
+	c := &checker{
+		config: config,
+		log:    l,
+
+		cache: newCache(l, clock.New()),
+	}
 
 	// Start HTTP server if ListenerEnabled is true
 	if config.ListenerEnabled {
@@ -77,8 +78,9 @@ func NewChecker(config Config, log logrus.FieldLogger) ServableChecker {
 		handler.HandleFunc(config.getLivePath(), c.liveHandler)
 
 		c.server = &http.Server{
-			Addr:    config.getAddress(),
-			Handler: handler,
+			Addr:              config.getAddress(),
+			Handler:           handler,
+			ReadHeaderTimeout: time.Second * 10,
 		}
 	}
 
@@ -90,29 +92,24 @@ type checker struct {
 
 	server *http.Server
 
-	hc    *health.Health
-	mutex sync.Mutex // Mutex protects non-threadsafe hc
+	mutex sync.Mutex // Mutex protects non-threadsafe
 
-	log logrus.FieldLogger
+	log   logrus.FieldLogger
+	cache *cache
 }
 
 func (c *checker) AddCheck(name string, checkable Checkable) error {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
-	return c.hc.AddCheck(&health.Config{
-		Name:     name,
-		Checker:  checkableWrapper{checkable: checkable},
-		Interval: readyCheckInterval,
-		Fatal:    true,
-	})
+	return c.cache.addCheck(name, checkable)
 }
 
 func (c *checker) ListenAndServe(ctx context.Context) error {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
-	if err := c.hc.Start(); err != nil {
+	if err := c.cache.start(ctx); err != nil {
 		return err
 	}
 
@@ -133,15 +130,11 @@ func (c *checker) ListenAndServe(ctx context.Context) error {
 		defer wg.Done()
 		<-ctx.Done()
 		if c.server != nil {
-			c.server.Close()
+			_ = c.server.Close()
 		}
 	}()
 
 	wg.Wait()
-
-	if err := c.hc.Stop(); err != nil {
-		c.log.WithError(err).Warn("Error stopping health checks")
-	}
 
 	return nil
 }
@@ -168,32 +161,30 @@ func WaitForTestDial(ctx context.Context, addr net.Addr) {
 		return
 	}
 
-	conn.Close()
+	_ = conn.Close()
 }
 
 // LiveState returns the global live state and details.
-func (c *checker) LiveState() (bool, interface{}) {
-	states, _, _ := c.hc.State()
-	live, _, details, _ := c.checkStates(states)
+func (c *checker) LiveState() (bool, any) {
+	live, _, details, _ := c.checkStates()
 
 	return live, details
 }
 
 // ReadyState returns the global ready state and details.
-func (c *checker) ReadyState() (bool, interface{}) {
-	states, _, _ := c.hc.State()
-	_, ready, _, details := c.checkStates(states)
+func (c *checker) ReadyState() (bool, any) {
+	_, ready, _, details := c.checkStates()
 
 	return ready, details
 }
 
-func (c *checker) checkStates(states map[string]health.State) (bool, bool, interface{}, interface{}) {
+func (c *checker) checkStates() (bool, bool, any, any) {
 	isLive, isReady := true, true
 
-	liveDetails := make(map[string]interface{})
-	readyDetails := make(map[string]interface{})
-	for subsystemName, subsystemState := range states {
-		state := subsystemState.Details.(State)
+	liveDetails := make(map[string]any)
+	readyDetails := make(map[string]any)
+	for subsystemName, subsystemState := range c.cache.getStatuses() {
+		state := subsystemState.details
 		if !state.Live {
 			isLive = false
 		}
@@ -209,7 +200,7 @@ func (c *checker) checkStates(states map[string]health.State) (bool, bool, inter
 	return isLive, isReady, liveDetails, readyDetails
 }
 
-func (c *checker) liveHandler(w http.ResponseWriter, req *http.Request) {
+func (c *checker) liveHandler(w http.ResponseWriter, _ *http.Request) {
 	live, details := c.LiveState()
 
 	statusCode := http.StatusOK
@@ -222,7 +213,7 @@ func (c *checker) liveHandler(w http.ResponseWriter, req *http.Request) {
 	_ = json.NewEncoder(w).Encode(details)
 }
 
-func (c *checker) readyHandler(w http.ResponseWriter, req *http.Request) {
+func (c *checker) readyHandler(w http.ResponseWriter, _ *http.Request) {
 	ready, details := c.ReadyState()
 
 	statusCode := http.StatusOK
@@ -233,24 +224,4 @@ func (c *checker) readyHandler(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 	_ = json.NewEncoder(w).Encode(details)
-}
-
-// checkableWrapper wraps Checkable in something that conforms to health.ICheckable
-type checkableWrapper struct {
-	checkable Checkable
-}
-
-func (c checkableWrapper) Status() (interface{}, error) {
-	state := c.checkable.CheckHealth()
-	var err error
-	switch {
-	case state.Ready && state.Live:
-	case state.Ready && !state.Live:
-		err = errors.New("subsystem is not live")
-	case !state.Ready && state.Live:
-		err = errors.New("subsystem is not ready")
-	case !state.Ready && !state.Live:
-		err = errors.New("subsystem is not live or ready")
-	}
-	return state, err
 }

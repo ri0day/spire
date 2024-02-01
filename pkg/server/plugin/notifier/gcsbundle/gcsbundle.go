@@ -108,7 +108,7 @@ func (p *Plugin) NotifyAndAdvise(ctx context.Context, req *notifierv1.NotifyAndA
 	return &notifierv1.NotifyAndAdviseResponse{}, nil
 }
 
-func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) (resp *configv1.ConfigureResponse, err error) {
+func (p *Plugin) Configure(_ context.Context, req *configv1.ConfigureRequest) (resp *configv1.ConfigureResponse, err error) {
 	config := new(pluginConfig)
 	if err := hcl.Decode(&config, req.HclConfiguration); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "unable to decode configuration: %v", err)
@@ -156,7 +156,7 @@ func (p *Plugin) updateBundleObject(ctx context.Context, c *pluginConfig) (err e
 		}
 		p.log.Debug("Bundle object retrieved", telemetry.Generation, generation)
 
-		// Load bundle data from the the identity provider. The bundle has to
+		// Load bundle data from the identity provider. The bundle has to
 		// be loaded after fetching the generation so we can properly detect
 		// and correct a race updating the bundle (i.e. read-modify-write
 		// semantics).

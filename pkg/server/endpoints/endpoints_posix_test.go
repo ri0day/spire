@@ -1,15 +1,14 @@
 //go:build !windows
-// +build !windows
 
 package endpoints
 
 import (
+	"context"
 	"net"
 	"path/filepath"
 	"testing"
 
 	"github.com/spiffe/spire/test/spiretest"
-	"golang.org/x/net/context"
 )
 
 func getLocalAddr(t *testing.T) net.Addr {
@@ -17,6 +16,6 @@ func getLocalAddr(t *testing.T) net.Addr {
 	return &net.UnixAddr{Net: "unix", Name: filepath.Join(tempdir, "sockets")}
 }
 
-func testRemoteCaller(ctx context.Context, t *testing.T, target string) {
+func testRemoteCaller(context.Context, *testing.T, string) {
 	// No testing for UDS endpoints
 }

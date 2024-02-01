@@ -5,11 +5,17 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"time"
 
 	"github.com/sirupsen/logrus"
 	"github.com/spiffe/spire-plugin-sdk/pluginsdk"
+	"github.com/spiffe/spire-plugin-sdk/private"
 	"github.com/spiffe/spire/pkg/common/telemetry"
 	"google.golang.org/grpc"
+)
+
+const (
+	deinitTimeout = 10 * time.Second
 )
 
 // Plugin is a loaded plugin.
@@ -41,6 +47,16 @@ func newPlugin(ctx context.Context, conn grpc.ClientConnInterface, info PluginIn
 		return nil, err
 	}
 
+	closers = append(closers, closerFunc(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), deinitTimeout)
+		defer cancel()
+		if err := private.Deinit(ctx, conn); err != nil {
+			log.WithError(err).Error("Failed to deinitialize plugin")
+		} else {
+			log.Debug("Plugin deinitialized")
+		}
+	}))
+
 	return &pluginImpl{
 		conn:             conn,
 		info:             info,
@@ -71,13 +87,13 @@ func (p *pluginImpl) Bind(facades ...Facade) (Configurer, error) {
 	return configurer, nil
 }
 
-func (p *pluginImpl) bindFacade(repo bindable, facade Facade) interface{} {
+func (p *pluginImpl) bindFacade(repo bindable, facade Facade) any {
 	impl := p.initFacade(facade)
 	repo.bind(facade)
 	return impl
 }
 
-func (p *pluginImpl) initFacade(facade Facade) interface{} {
+func (p *pluginImpl) initFacade(facade Facade) any {
 	facade.InitInfo(p.info)
 	facade.InitLog(p.log)
 	return facade.InitClient(p.conn)
@@ -118,10 +134,10 @@ func (p *pluginImpl) makeConfigurer(grpcServiceNames map[string]struct{}) (Confi
 	return repo.configurer, nil
 }
 
-func (p *pluginImpl) bindRepo(repo bindableServiceRepo, grpcServiceNames map[string]struct{}) interface{} {
+func (p *pluginImpl) bindRepo(repo bindableServiceRepo, grpcServiceNames map[string]struct{}) any {
 	versions := repo.Versions()
 
-	var impl interface{}
+	var impl any
 	for _, version := range versions {
 		facade := version.New()
 		if _, ok := grpcServiceNames[facade.GRPCServiceName()]; ok {

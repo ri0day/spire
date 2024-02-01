@@ -8,6 +8,7 @@ import (
 	_ "net/http/pprof" //nolint: gosec // import registers routes on DefaultServeMux
 	"runtime"
 	"sync"
+	"time"
 
 	"github.com/spiffe/go-spiffe/v2/workloadapi"
 	admin_api "github.com/spiffe/spire/pkg/agent/api"
@@ -17,11 +18,13 @@ import (
 	"github.com/spiffe/spire/pkg/agent/endpoints"
 	"github.com/spiffe/spire/pkg/agent/manager"
 	"github.com/spiffe/spire/pkg/agent/manager/storecache"
+	"github.com/spiffe/spire/pkg/agent/plugin/nodeattestor"
 	"github.com/spiffe/spire/pkg/agent/storage"
 	"github.com/spiffe/spire/pkg/agent/svid/store"
 	"github.com/spiffe/spire/pkg/common/diskutil"
 	"github.com/spiffe/spire/pkg/common/health"
 	"github.com/spiffe/spire/pkg/common/profiling"
+	"github.com/spiffe/spire/pkg/common/rotationutil"
 	"github.com/spiffe/spire/pkg/common/telemetry"
 	"github.com/spiffe/spire/pkg/common/uptime"
 	"github.com/spiffe/spire/pkg/common/util"
@@ -65,14 +68,14 @@ func (a *Agent) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	telemetry.EmitVersion(metrics)
+	telemetry.EmitStarted(metrics, a.c.TrustDomain)
 	uptime.ReportMetrics(ctx, metrics)
 
 	cat, err := catalog.Load(ctx, catalog.Config{
-		Log:          a.c.Log.WithField(telemetry.SubsystemName, telemetry.Catalog),
-		Metrics:      metrics,
-		TrustDomain:  a.c.TrustDomain,
-		PluginConfig: a.c.PluginConfigs,
+		Log:           a.c.Log.WithField(telemetry.SubsystemName, telemetry.Catalog),
+		Metrics:       metrics,
+		TrustDomain:   a.c.TrustDomain,
+		PluginConfigs: a.c.PluginConfigs,
 	})
 	if err != nil {
 		return err
@@ -81,14 +84,19 @@ func (a *Agent) Run(ctx context.Context) error {
 
 	healthChecker := health.NewChecker(a.c.HealthChecks, a.c.Log)
 
-	as, err := a.attest(ctx, sto, cat, metrics)
+	nodeAttestor := nodeattestor.JoinToken(a.c.Log, a.c.JoinToken)
+	if a.c.JoinToken == "" {
+		nodeAttestor = cat.GetNodeAttestor()
+	}
+
+	as, err := a.attest(ctx, sto, cat, metrics, nodeAttestor)
 	if err != nil {
 		return err
 	}
 
 	svidStoreCache := a.newSVIDStoreCache()
 
-	manager, err := a.newManager(ctx, sto, cat, metrics, as, svidStoreCache)
+	manager, err := a.newManager(ctx, sto, cat, metrics, as, svidStoreCache, nodeAttestor)
 	if err != nil {
 		return err
 	}
@@ -115,7 +123,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 
 	if a.c.AdminBindAddress != nil {
-		adminEndpoints := a.newAdminEndpoints(manager, workloadAttestor, a.c.AuthorizedDelegates)
+		adminEndpoints := a.newAdminEndpoints(metrics, manager, workloadAttestor, a.c.AuthorizedDelegates)
 		tasks = append(tasks, adminEndpoints.ListenAndServe)
 	}
 
@@ -141,8 +149,9 @@ func (a *Agent) setupProfiling(ctx context.Context) (stop func()) {
 		grpc.EnableTracing = true
 
 		server := http.Server{
-			Addr:    fmt.Sprintf("localhost:%d", a.c.ProfilingPort),
-			Handler: http.DefaultServeMux,
+			Addr:              fmt.Sprintf("localhost:%d", a.c.ProfilingPort),
+			Handler:           http.DefaultServeMux,
+			ReadHeaderTimeout: time.Second * 10,
 		}
 
 		// kick off a goroutine to serve the pprof endpoints and one to
@@ -186,7 +195,7 @@ func (a *Agent) setupProfiling(ctx context.Context) (stop func()) {
 	}
 }
 
-func (a *Agent) attest(ctx context.Context, sto storage.Storage, cat catalog.Catalog, metrics telemetry.Metrics) (*node_attestor.AttestationResult, error) {
+func (a *Agent) attest(ctx context.Context, sto storage.Storage, cat catalog.Catalog, metrics telemetry.Metrics, na nodeattestor.NodeAttestor) (*node_attestor.AttestationResult, error) {
 	config := node_attestor.Config{
 		Catalog:           cat,
 		Metrics:           metrics,
@@ -197,24 +206,31 @@ func (a *Agent) attest(ctx context.Context, sto storage.Storage, cat catalog.Cat
 		Storage:           sto,
 		Log:               a.c.Log.WithField(telemetry.SubsystemName, telemetry.Attestor),
 		ServerAddress:     a.c.ServerAddress,
+		NodeAttestor:      na,
 	}
 	return node_attestor.New(&config).Attest(ctx)
 }
 
-func (a *Agent) newManager(ctx context.Context, sto storage.Storage, cat catalog.Catalog, metrics telemetry.Metrics, as *node_attestor.AttestationResult, cache *storecache.Cache) (manager.Manager, error) {
+func (a *Agent) newManager(ctx context.Context, sto storage.Storage, cat catalog.Catalog, metrics telemetry.Metrics, as *node_attestor.AttestationResult, cache *storecache.Cache, na nodeattestor.NodeAttestor) (manager.Manager, error) {
 	config := &manager.Config{
-		SVID:            as.SVID,
-		SVIDKey:         as.Key,
-		Bundle:          as.Bundle,
-		Catalog:         cat,
-		TrustDomain:     a.c.TrustDomain,
-		ServerAddr:      a.c.ServerAddress,
-		Log:             a.c.Log.WithField(telemetry.SubsystemName, telemetry.Manager),
-		Metrics:         metrics,
-		WorkloadKeyType: a.c.WorkloadKeyType,
-		Storage:         sto,
-		SyncInterval:    a.c.SyncInterval,
-		SVIDStoreCache:  cache,
+		SVID:                     as.SVID,
+		SVIDKey:                  as.Key,
+		Bundle:                   as.Bundle,
+		Reattestable:             as.Reattestable,
+		Catalog:                  cat,
+		TrustDomain:              a.c.TrustDomain,
+		ServerAddr:               a.c.ServerAddress,
+		Log:                      a.c.Log.WithField(telemetry.SubsystemName, telemetry.Manager),
+		Metrics:                  metrics,
+		WorkloadKeyType:          a.c.WorkloadKeyType,
+		Storage:                  sto,
+		SyncInterval:             a.c.SyncInterval,
+		UseSyncAuthorizedEntries: a.c.UseSyncAuthorizedEntries,
+		SVIDCacheMaxSize:         a.c.X509SVIDCacheMaxSize,
+		DisableLRUCache:          a.c.DisableLRUCache,
+		SVIDStoreCache:           cache,
+		NodeAttestor:             na,
+		RotationStrategy:         rotationutil.NewRotationStrategy(a.c.AvailabilityTarget),
 	}
 
 	mgr := manager.New(config)
@@ -263,11 +279,12 @@ func (a *Agent) newEndpoints(metrics telemetry.Metrics, mgr manager.Manager, att
 	})
 }
 
-func (a *Agent) newAdminEndpoints(mgr manager.Manager, attestor workload_attestor.Attestor, authorizedDelegates []string) admin_api.Server {
+func (a *Agent) newAdminEndpoints(metrics telemetry.Metrics, mgr manager.Manager, attestor workload_attestor.Attestor, authorizedDelegates []string) admin_api.Server {
 	config := &admin_api.Config{
 		BindAddr:            a.c.AdminBindAddress,
 		Manager:             mgr,
-		Log:                 a.c.Log.WithField(telemetry.SubsystemName, telemetry.DebugAPI),
+		Log:                 a.c.Log,
+		Metrics:             metrics,
 		TrustDomain:         a.c.TrustDomain,
 		Uptime:              uptime.Uptime,
 		Attestor:            attestor,

@@ -7,7 +7,7 @@ import (
 	"io"
 
 	"github.com/google/go-tpm-tools/client"
-	"github.com/google/go-tpm/tpm2"
+	"github.com/google/go-tpm/legacy/tpm2"
 	"github.com/google/go-tpm/tpmutil"
 	"github.com/hashicorp/go-hclog"
 	"github.com/spiffe/spire/pkg/common/plugin/tpmdevid"
@@ -22,7 +22,7 @@ const EKCertificateHandleRSA = tpmutil.Handle(0x01c00002)
 const randomPasswordSize = 32
 
 // Session represents a TPM with loaded DevID credentials and exposes methods
-// to perfom cryptographyc operations relevant to the SPIRE node attestation
+// to perform cryptographic operations relevant to the SPIRE node attestation
 // workflow.
 type Session struct {
 	devID    *SigningKey

@@ -23,6 +23,7 @@ import (
 	"github.com/spiffe/spire/pkg/server/svid"
 	"github.com/spiffe/spire/proto/spire/common"
 	"github.com/spiffe/spire/test/fakes/fakedatastore"
+	"github.com/spiffe/spire/test/grpctest"
 	"github.com/spiffe/spire/test/spiretest"
 	"github.com/spiffe/spire/test/testca"
 	"github.com/stretchr/testify/require"
@@ -86,7 +87,7 @@ func TestGetInfo(t *testing.T) {
 		SVID: svidWithIntermediate.Certificates,
 		Key:  svidWithIntermediate.PrivateKey.(*ecdsa.PrivateKey),
 	}
-	// Manually create SVID chain with intemediate
+	// Manually create SVID chain with intermediate
 	svidWithIntermediateChain := []*debugv1.GetInfoResponse_Cert{
 		{
 			Id:        &types.SPIFFEID{TrustDomain: "example.org", Path: "/spire/server"},
@@ -139,13 +140,13 @@ func TestGetInfo(t *testing.T) {
 	}
 
 	// Parse federated  bundle into DER raw
-	federatedBudle, err := pemutil.ParseCertificate([]byte(federatedBundle))
+	federatedBundle, err := pemutil.ParseCertificate([]byte(federatedBundle))
 	require.NoError(t, err)
 	commonFederatedBundle := &common.Bundle{
 		TrustDomainId: "spiffe://domain.io",
 		RootCas: []*common.Certificate{
 			{
-				DerBytes: federatedBudle.Raw,
+				DerBytes: federatedBundle.Raw,
 			},
 		},
 	}
@@ -368,7 +369,7 @@ func TestGetInfo(t *testing.T) {
 			bundles: []*common.Bundle{
 				{
 					TrustDomainId: td.IDString(),
-					RootCas:       []*common.Certificate{{DerBytes: federatedBudle.Raw}},
+					RootCas:       []*common.Certificate{{DerBytes: federatedBundle.Raw}},
 				},
 			},
 			code:  codes.Internal,
@@ -464,16 +465,19 @@ func setupServiceTest(t *testing.T) *serviceTest {
 		uptime:  fakeUptime,
 	}
 
-	registerFn := func(s *grpc.Server) {
+	registerFn := func(s grpc.ServiceRegistrar) {
 		debug.RegisterService(s, service)
 	}
-	contextFn := func(ctx context.Context) context.Context {
+	overrideContext := func(ctx context.Context) context.Context {
 		ctx = rpccontext.WithLogger(ctx, log)
 		return ctx
 	}
 
-	conn, done := spiretest.NewAPIServer(t, registerFn, contextFn)
-	test.done = done
+	server := grpctest.StartServer(t, registerFn, grpctest.OverrideContext(overrideContext))
+
+	conn := server.Dial(t)
+
+	test.done = server.Stop
 	test.client = debugv1.NewDebugClient(conn)
 
 	return test

@@ -24,6 +24,7 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/runtime/protoiface"
 )
 
 func TestWithAuthorizationPreprocess(t *testing.T) {
@@ -101,15 +102,17 @@ func TestWithAuthorizationPreprocess(t *testing.T) {
 
 	for _, tt := range []struct {
 		name            string
-		request         interface{}
+		request         any
 		fullMethod      string
 		peer            *peer.Peer
 		rego            string
 		agentAuthorizer middleware.AgentAuthorizer
+		entryFetcher    middleware.EntryFetcherFunc
 		adminIDs        []spiffeid.ID
 		authorizerErr   error
 		expectCode      codes.Code
 		expectMsg       string
+		expectDetails   []*types.PermissionDeniedDetails
 	}{
 		{
 			name:       "basic allow test",
@@ -219,6 +222,31 @@ func TestWithAuthorizationPreprocess(t *testing.T) {
 			expectMsg:       fmt.Sprintf("authorization denied for method %s", fakeFullMethod),
 		},
 		{
+			name:       "allow_if_agent non-agent caller test with details",
+			fullMethod: fakeFullMethod,
+			peer:       mtlsPeer,
+			rego: simpleRego(map[string]bool{
+				"allow_if_agent": true,
+			}),
+			agentAuthorizer: &testAgentAuthorizer{
+				isAgent: false,
+				details: []protoiface.MessageV1{
+					&types.PermissionDeniedDetails{
+						Reason: types.PermissionDeniedDetails_AGENT_BANNED,
+					},
+					// Add a custom details that will be ignored
+					&types.Bundle{TrustDomain: "td.com"},
+				},
+			},
+			expectCode: codes.PermissionDenied,
+			expectMsg:  fmt.Sprintf("authorization denied for method %s", fakeFullMethod),
+			expectDetails: []*types.PermissionDeniedDetails{
+				{
+					Reason: types.PermissionDeniedDetails_AGENT_BANNED,
+				},
+			},
+		},
+		{
 			name:       "check passing of caller id positive test",
 			fullMethod: fakeFullMethod,
 			peer:       mtlsPeer,
@@ -279,18 +307,32 @@ func TestWithAuthorizationPreprocess(t *testing.T) {
 			rego:       simpleRego(map[string]bool{}),
 			expectMsg:  "no peer information available",
 		},
+		{
+			name:       "entry fetcher error is handled",
+			fullMethod: fakeFullMethod,
+			peer:       downstreamPeer,
+			rego: simpleRego(map[string]bool{
+				"allow_if_downstream": true,
+			}),
+			entryFetcher: func(ctx context.Context, id spiffeid.ID) ([]*types.Entry, error) {
+				return nil, errors.New("entry fetcher error")
+			},
+			expectCode: codes.Internal,
+			expectMsg:  "failed to fetch caller entries: entry fetcher error",
+		},
 	} {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := context.Background()
-			policyEngine, err := authpolicy.NewEngineFromRego(ctx, tt.rego, inmem.NewFromObject(map[string]interface{}{}))
+			policyEngine, err := authpolicy.NewEngineFromRego(ctx, tt.rego, inmem.NewFromObject(map[string]any{}))
 			require.NoError(t, err, "failed to initialize policy engine")
 
 			// Set up an authorization middleware with one method.
 			if tt.agentAuthorizer == nil {
 				tt.agentAuthorizer = noAgentAuthorizer
 			}
-			m := middleware.WithAuthorization(policyEngine, entryFetcher, tt.agentAuthorizer, tt.adminIDs)
+
+			m := middleware.WithAuthorization(policyEngine, entryFetcherForTest(tt.entryFetcher), tt.agentAuthorizer, tt.adminIDs)
 
 			// Set up the incoming context with a logger and optionally a peer.
 			log, _ := test.NewNullLogger()
@@ -301,6 +343,24 @@ func TestWithAuthorizationPreprocess(t *testing.T) {
 
 			ctxOut, err := m.Preprocess(ctxIn, tt.fullMethod, tt.request)
 			spiretest.RequireGRPCStatus(t, err, tt.expectCode, tt.expectMsg)
+
+			// Get Status to validate details
+			st, ok := status.FromError(err)
+			require.True(t, ok)
+
+			var statusDetails []*types.PermissionDeniedDetails
+			for _, eachDetail := range st.Details() {
+				message, ok := eachDetail.(*types.PermissionDeniedDetails)
+				require.True(t, ok, "unexpected status detail type: %T", message)
+				statusDetails = append(statusDetails, message)
+			}
+
+			switch {
+			case len(tt.expectDetails) > 0:
+				spiretest.RequireProtoListEqual(t, tt.expectDetails, statusDetails)
+			case len(statusDetails) > 0:
+				require.Fail(t, "no status details expected")
+			}
 
 			// Assert the properties of the context returned by Preprocess.
 			if tt.expectCode != codes.OK {
@@ -377,13 +437,31 @@ var (
 
 type testAgentAuthorizer struct {
 	isAgent bool
+	details []protoiface.MessageV1
 }
 
-func (a *testAgentAuthorizer) AuthorizeAgent(ctx context.Context, agentID spiffeid.ID, agentSVID *x509.Certificate) error {
+func (a *testAgentAuthorizer) AuthorizeAgent(context.Context, spiffeid.ID, *x509.Certificate) error {
 	if a.isAgent {
 		return nil
 	}
-	return status.Error(codes.PermissionDenied, "not agent")
+	st := status.New(codes.PermissionDenied, "not agent")
+	if a.details != nil {
+		var err error
+		st, err = st.WithDetails(a.details...)
+		if err != nil {
+			return err
+		}
+	}
+
+	return st.Err()
+}
+
+func entryFetcherForTest(replace middleware.EntryFetcherFunc) middleware.EntryFetcherFunc {
+	if replace != nil {
+		return replace
+	}
+
+	return entryFetcher
 }
 
 func simpleRego(m map[string]bool) string {

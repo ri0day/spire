@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -21,10 +22,12 @@ import (
 	"github.com/hashicorp/hcl"
 	"github.com/hashicorp/hcl/hcl/ast"
 	"github.com/hashicorp/hcl/hcl/printer"
+	"github.com/hashicorp/hcl/hcl/token"
 	"github.com/imdario/mergo"
 	"github.com/mitchellh/cli"
 	"github.com/sirupsen/logrus"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"github.com/spiffe/spire/pkg/common/bundleutil"
 	"github.com/spiffe/spire/pkg/common/catalog"
 	common_cli "github.com/spiffe/spire/pkg/common/cli"
 	"github.com/spiffe/spire/pkg/common/fflag"
@@ -34,7 +37,8 @@ import (
 	"github.com/spiffe/spire/pkg/server"
 	"github.com/spiffe/spire/pkg/server/authpolicy"
 	bundleClient "github.com/spiffe/spire/pkg/server/bundle/client"
-	"github.com/spiffe/spire/pkg/server/ca"
+	"github.com/spiffe/spire/pkg/server/ca/manager"
+	"github.com/spiffe/spire/pkg/server/credtemplate"
 	"github.com/spiffe/spire/pkg/server/endpoints/bundle"
 	"github.com/spiffe/spire/pkg/server/plugin/keymanager"
 )
@@ -46,45 +50,42 @@ const (
 	defaultLogLevel   = "INFO"
 )
 
-var (
-	defaultCASubject = pkix.Name{
-		Country:      []string{"US"},
-		Organization: []string{"SPIFFE"},
-	}
-
-	defaultRateLimit = true
-)
+var defaultRateLimit = true
 
 // Config contains all available configurables, arranged by section
 type Config struct {
-	Server       *serverConfig               `hcl:"server"`
-	Plugins      *catalog.HCLPluginConfigMap `hcl:"plugins"`
-	Telemetry    telemetry.FileConfig        `hcl:"telemetry"`
-	HealthChecks health.Config               `hcl:"health_checks"`
-	UnusedKeys   []string                    `hcl:",unusedKeys"`
+	Server             *serverConfig          `hcl:"server"`
+	Plugins            ast.Node               `hcl:"plugins"`
+	Telemetry          telemetry.FileConfig   `hcl:"telemetry"`
+	HealthChecks       health.Config          `hcl:"health_checks"`
+	UnusedKeyPositions map[string][]token.Pos `hcl:",unusedKeyPositions"`
 }
 
 type serverConfig struct {
-	AdminIDs        []string           `hcl:"admin_ids"`
-	AgentTTL        string             `hcl:"agent_ttl"`
-	AuditLogEnabled bool               `hcl:"audit_log_enabled"`
-	BindAddress     string             `hcl:"bind_address"`
-	BindPort        int                `hcl:"bind_port"`
-	CAKeyType       string             `hcl:"ca_key_type"`
-	CASubject       *caSubjectConfig   `hcl:"ca_subject"`
-	CATTL           string             `hcl:"ca_ttl"`
-	DataDir         string             `hcl:"data_dir"`
-	DefaultSVIDTTL  string             `hcl:"default_svid_ttl"`
-	Experimental    experimentalConfig `hcl:"experimental"`
-	Federation      *federationConfig  `hcl:"federation"`
-	JWTIssuer       string             `hcl:"jwt_issuer"`
-	JWTKeyType      string             `hcl:"jwt_key_type"`
-	LogFile         string             `hcl:"log_file"`
-	LogLevel        string             `hcl:"log_level"`
-	LogFormat       string             `hcl:"log_format"`
-	RateLimit       rateLimitConfig    `hcl:"ratelimit"`
-	SocketPath      string             `hcl:"socket_path"`
-	TrustDomain     string             `hcl:"trust_domain"`
+	AdminIDs           []string           `hcl:"admin_ids"`
+	AgentTTL           string             `hcl:"agent_ttl"`
+	AuditLogEnabled    bool               `hcl:"audit_log_enabled"`
+	BindAddress        string             `hcl:"bind_address"`
+	BindPort           int                `hcl:"bind_port"`
+	CAKeyType          string             `hcl:"ca_key_type"`
+	CASubject          *caSubjectConfig   `hcl:"ca_subject"`
+	CATTL              string             `hcl:"ca_ttl"`
+	DataDir            string             `hcl:"data_dir"`
+	DefaultX509SVIDTTL string             `hcl:"default_x509_svid_ttl"`
+	DefaultJWTSVIDTTL  string             `hcl:"default_jwt_svid_ttl"`
+	Experimental       experimentalConfig `hcl:"experimental"`
+	Federation         *federationConfig  `hcl:"federation"`
+	JWTIssuer          string             `hcl:"jwt_issuer"`
+	JWTKeyType         string             `hcl:"jwt_key_type"`
+	LogFile            string             `hcl:"log_file"`
+	LogLevel           string             `hcl:"log_level"`
+	LogFormat          string             `hcl:"log_format"`
+	LogSourceLocation  bool               `hcl:"log_source_location"`
+	RateLimit          rateLimitConfig    `hcl:"ratelimit"`
+	SocketPath         string             `hcl:"socket_path"`
+	TrustDomain        string             `hcl:"trust_domain"`
+	// Temporary flag to allow disabling the inclusion of serial number in X509 CAs Subject field
+	ExcludeSNFromCASubject bool `hcl:"exclude_sn_from_ca_subject"`
 
 	ConfigPath string
 	ExpandEnv  bool
@@ -95,80 +96,98 @@ type serverConfig struct {
 	ProfilingFreq    int      `hcl:"profiling_freq"`
 	ProfilingNames   []string `hcl:"profiling_names"`
 
-	UnusedKeys []string `hcl:",unusedKeys"`
+	UnusedKeyPositions map[string][]token.Pos `hcl:",unusedKeyPositions"`
 }
 
 type experimentalConfig struct {
-	AuthOpaPolicyEngine *authpolicy.OpaEngineConfig `hcl:"auth_opa_policy_engine"`
-	CacheReloadInterval string                      `hcl:"cache_reload_interval"`
+	AuthOpaPolicyEngine  *authpolicy.OpaEngineConfig `hcl:"auth_opa_policy_engine"`
+	CacheReloadInterval  string                      `hcl:"cache_reload_interval"`
+	EventsBasedCache     bool                        `hcl:"events_based_cache"`
+	PruneEventsOlderThan string                      `hcl:"prune_events_older_than"`
 
 	Flags fflag.RawConfig `hcl:"feature_flags"`
 
 	NamedPipeName string `hcl:"named_pipe_name"`
 
-	UnusedKeys []string `hcl:",unusedKeys"`
+	UnusedKeyPositions map[string][]token.Pos `hcl:",unusedKeyPositions"`
 }
 
 type caSubjectConfig struct {
-	Country      []string `hcl:"country"`
-	Organization []string `hcl:"organization"`
-	CommonName   string   `hcl:"common_name"`
-	UnusedKeys   []string `hcl:",unusedKeys"`
+	Country            []string               `hcl:"country"`
+	Organization       []string               `hcl:"organization"`
+	CommonName         string                 `hcl:"common_name"`
+	UnusedKeyPositions map[string][]token.Pos `hcl:",unusedKeyPositions"`
 }
 
 type federationConfig struct {
-	BundleEndpoint *bundleEndpointConfig          `hcl:"bundle_endpoint"`
-	FederatesWith  map[string]federatesWithConfig `hcl:"federates_with"`
-	UnusedKeys     []string                       `hcl:",unusedKeys"`
+	BundleEndpoint     *bundleEndpointConfig          `hcl:"bundle_endpoint"`
+	FederatesWith      map[string]federatesWithConfig `hcl:"federates_with"`
+	UnusedKeyPositions map[string][]token.Pos         `hcl:",unusedKeyPositions"`
 }
 
 type bundleEndpointConfig struct {
-	Address    string                    `hcl:"address"`
-	Port       int                       `hcl:"port"`
-	ACME       *bundleEndpointACMEConfig `hcl:"acme"`
-	UnusedKeys []string                  `hcl:",unusedKeys"`
+	Address     string `hcl:"address"`
+	Port        int    `hcl:"port"`
+	RefreshHint string `hcl:"refresh_hint"`
+
+	ACME    *bundleEndpointACMEConfig `hcl:"acme"`
+	Profile ast.Node                  `hcl:"profile"`
+
+	UnusedKeyPositions map[string][]token.Pos `hcl:",unusedKeyPositions"`
 }
 
+type bundleEndpointConfigProfile struct {
+	HTTPSSPIFFE        *bundleEndpointProfileHTTPSSPIFFEConfig `hcl:"https_spiffe"`
+	HTTPSWeb           *bundleEndpointProfileHTTPSWebConfig    `hcl:"https_web"`
+	UnusedKeyPositions map[string][]token.Pos                  `hcl:",unusedKeyPositions"`
+}
+
+type bundleEndpointProfileHTTPSWebConfig struct {
+	ACME *bundleEndpointACMEConfig `hcl:"acme"`
+}
+
+type bundleEndpointProfileHTTPSSPIFFEConfig struct{}
+
 type bundleEndpointACMEConfig struct {
-	DirectoryURL string   `hcl:"directory_url"`
-	DomainName   string   `hcl:"domain_name"`
-	Email        string   `hcl:"email"`
-	ToSAccepted  bool     `hcl:"tos_accepted"`
-	UnusedKeys   []string `hcl:",unusedKeys"`
+	DirectoryURL       string                 `hcl:"directory_url"`
+	DomainName         string                 `hcl:"domain_name"`
+	Email              string                 `hcl:"email"`
+	ToSAccepted        bool                   `hcl:"tos_accepted"`
+	UnusedKeyPositions map[string][]token.Pos `hcl:",unusedKeyPositions"`
 }
 
 type federatesWithConfig struct {
-	BundleEndpointURL     string   `hcl:"bundle_endpoint_url"`
-	BundleEndpointProfile ast.Node `hcl:"bundle_endpoint_profile"`
-	UnusedKeys            []string `hcl:",unusedKeys"`
+	BundleEndpointURL     string                 `hcl:"bundle_endpoint_url"`
+	BundleEndpointProfile ast.Node               `hcl:"bundle_endpoint_profile"`
+	UnusedKeyPositions    map[string][]token.Pos `hcl:",unusedKeyPositions"`
 }
 
 type bundleEndpointProfileConfig struct {
-	HTTPSSPIFFE *httpsSPIFFEProfileConfig `hcl:"https_spiffe"`
-	HTTPSWeb    *httpsWebProfileConfig    `hcl:"https_web"`
-	UnusedKeys  []string                  `hcl:",unusedKeys"`
+	HTTPSSPIFFE        *httpsSPIFFEProfileConfig `hcl:"https_spiffe"`
+	HTTPSWeb           *httpsWebProfileConfig    `hcl:"https_web"`
+	UnusedKeyPositions map[string][]token.Pos    `hcl:",unusedKeyPositions"`
 }
 
 type httpsSPIFFEProfileConfig struct {
-	EndpointSPIFFEID string   `hcl:"endpoint_spiffe_id"`
-	UnusedKeys       []string `hcl:",unusedKeys"`
+	EndpointSPIFFEID   string                 `hcl:"endpoint_spiffe_id"`
+	UnusedKeyPositions map[string][]token.Pos `hcl:",unusedKeyPositions"`
 }
 
-type httpsWebProfileConfig struct {
-}
+type httpsWebProfileConfig struct{}
 
 type rateLimitConfig struct {
-	Attestation *bool    `hcl:"attestation"`
-	Signing     *bool    `hcl:"signing"`
-	UnusedKeys  []string `hcl:",unusedKeys"`
+	Attestation        *bool                  `hcl:"attestation"`
+	Signing            *bool                  `hcl:"signing"`
+	UnusedKeyPositions map[string][]token.Pos `hcl:",unusedKeyPositions"`
 }
 
-func NewRunCommand(logOptions []log.Option, allowUnknownConfig bool) cli.Command {
-	return newRunCommand(common_cli.DefaultEnv, logOptions, allowUnknownConfig)
+func NewRunCommand(ctx context.Context, logOptions []log.Option, allowUnknownConfig bool) cli.Command {
+	return newRunCommand(ctx, common_cli.DefaultEnv, logOptions, allowUnknownConfig)
 }
 
-func newRunCommand(env *common_cli.Env, logOptions []log.Option, allowUnknownConfig bool) *Command {
+func newRunCommand(ctx context.Context, env *common_cli.Env, logOptions []log.Option, allowUnknownConfig bool) *Command {
 	return &Command{
+		ctx:                ctx,
 		env:                env,
 		logOptions:         logOptions,
 		allowUnknownConfig: allowUnknownConfig,
@@ -177,6 +196,7 @@ func newRunCommand(env *common_cli.Env, logOptions []log.Option, allowUnknownCon
 
 // Run Command struct
 type Command struct {
+	ctx                context.Context
 	logOptions         []log.Option
 	env                *common_cli.Env
 	allowUnknownConfig bool
@@ -236,7 +256,11 @@ func (cmd *Command) Run(args []string) int {
 
 	s := server.New(*c)
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	ctx := cmd.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	err = s.Run(ctx)
@@ -301,6 +325,7 @@ func parseFlags(name string, args []string, output io.Writer) (*serverConfig, er
 	flags.StringVar(&c.DataDir, "dataDir", "", "Directory to store runtime data to")
 	flags.StringVar(&c.LogFile, "logFile", "", "File to write logs to")
 	flags.StringVar(&c.LogFormat, "logFormat", "", "'text' or 'json'")
+	flags.BoolVar(&c.LogSourceLocation, "logSourceLocation", false, "Include source file, line number and function name in log lines")
 	flags.StringVar(&c.LogLevel, "logLevel", "", "'debug', 'info', 'warn', or 'error'")
 	flags.StringVar(&c.TrustDomain, "trustDomain", "", "The trust domain that this server belongs to")
 	flags.BoolVar(&c.ExpandEnv, "expandEnv", false, "Expand environment variables in SPIRE config file")
@@ -347,6 +372,9 @@ func NewServerConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool
 		log.WithLevel(c.Server.LogLevel),
 		log.WithFormat(c.Server.LogFormat),
 	)
+	if c.Server.LogSourceLocation {
+		logOptions = append(logOptions, log.WithSourceLocation())
+	}
 	var reopenableFile *log.ReopenableFile
 	if c.Server.LogFile != "" {
 		reopenableFile, err := log.NewReopenableFile(c.Server.LogFile)
@@ -365,15 +393,11 @@ func NewServerConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool
 		sc.LogReopener = log.ReopenOnSignal(logger, reopenableFile)
 	}
 
-	ip := net.ParseIP(c.Server.BindAddress)
-	if ip == nil {
-		return nil, fmt.Errorf("could not parse bind_address %q", c.Server.BindAddress)
+	bindAddress, err := net.ResolveTCPAddr("tcp", fmt.Sprintf("%s:%d", c.Server.BindAddress, c.Server.BindPort))
+	if err != nil {
+		return nil, fmt.Errorf(`could not resolve bind address "%s:%d": %w`, c.Server.BindAddress, c.Server.BindPort, err)
 	}
-	sc.BindAddress = &net.TCPAddr{
-		IP:   ip,
-		Port: c.Server.BindPort,
-	}
-
+	sc.BindAddress = bindAddress
 	c.Server.setDefaultsIfNeeded()
 
 	addr, err := c.Server.getAddr()
@@ -411,14 +435,36 @@ func NewServerConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool
 				},
 			}
 
-			if acme := c.Server.Federation.BundleEndpoint.ACME; acme != nil {
-				sc.Federation.BundleEndpoint.ACME = &bundle.ACMEConfig{
-					DirectoryURL: acme.DirectoryURL,
-					DomainName:   acme.DomainName,
-					CacheDir:     filepath.Join(sc.DataDir, "bundle-acme"),
-					Email:        acme.Email,
-					ToSAccepted:  acme.ToSAccepted,
+			if c.Server.Federation.BundleEndpoint.RefreshHint != "" {
+				refreshHint, err := time.ParseDuration(c.Server.Federation.BundleEndpoint.RefreshHint)
+				if err != nil {
+					return nil, fmt.Errorf("could not parse refresh_hint %q: %w", c.Server.Federation.BundleEndpoint.RefreshHint, err)
 				}
+
+				if refreshHint >= 24*time.Hour {
+					sc.Log.Warn("Bundle endpoint refresh hint set to a high value. To cover " +
+						"the case of unscheduled trust bundle updates, it's recommended to " +
+						"have a smaller value, e.g. 5m")
+				}
+
+				if refreshHint < bundleutil.MinimumRefreshHint {
+					sc.Log.Warn("Bundle endpoint refresh hint set too low. SPIRE will not " +
+						"refresh more often than 1 minute")
+				}
+
+				sc.Federation.BundleEndpoint.RefreshHint = &refreshHint
+			} else {
+				sc.Log.Warn("Bundle endpoint refresh_hint is not set. This configuration " +
+					"will default to 5 minutes in a future release; please check if you " +
+					"need to specify it")
+			}
+
+			if c.Server.Federation.BundleEndpoint != nil {
+				acmeConfig, err := parseBundleEndpointConfigProfile(c.Server.Federation.BundleEndpoint, sc.DataDir, sc.Log)
+				if err != nil {
+					return nil, err
+				}
+				sc.Federation.BundleEndpoint.ACME = acmeConfig
 			}
 		}
 
@@ -452,11 +498,8 @@ func NewServerConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool
 
 	for _, adminID := range c.Server.AdminIDs {
 		id, err := spiffeid.FromString(adminID)
-		switch {
-		case err != nil:
+		if err != nil {
 			return nil, fmt.Errorf("could not parse admin ID %q: %w", adminID, err)
-		case !id.MemberOf(sc.TrustDomain):
-			return nil, fmt.Errorf("admin ID %q does not belong to trust domain %q", id, sc.TrustDomain)
 		}
 		sc.AdminIDs = append(sc.AdminIDs, id)
 	}
@@ -469,12 +512,29 @@ func NewServerConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool
 		sc.AgentTTL = ttl
 	}
 
-	if c.Server.DefaultSVIDTTL != "" {
-		ttl, err := time.ParseDuration(c.Server.DefaultSVIDTTL)
+	switch {
+	case c.Server.DefaultX509SVIDTTL != "":
+		ttl, err := time.ParseDuration(c.Server.DefaultX509SVIDTTL)
 		if err != nil {
-			return nil, fmt.Errorf("could not parse default SVID ttl %q: %w", c.Server.DefaultSVIDTTL, err)
+			return nil, fmt.Errorf("could not parse default X509 SVID ttl %q: %w", c.Server.DefaultX509SVIDTTL, err)
 		}
-		sc.SVIDTTL = ttl
+		sc.X509SVIDTTL = ttl
+	default:
+		// If neither new nor deprecated config value is set, then use hard-coded default TTL
+		// Note, due to back-compat issues we cannot set this default inside defaultConfig() function
+		sc.X509SVIDTTL = credtemplate.DefaultX509SVIDTTL
+	}
+
+	if c.Server.DefaultJWTSVIDTTL != "" {
+		ttl, err := time.ParseDuration(c.Server.DefaultJWTSVIDTTL)
+		if err != nil {
+			return nil, fmt.Errorf("could not parse default JWT SVID ttl %q: %w", c.Server.DefaultJWTSVIDTTL, err)
+		}
+		sc.JWTSVIDTTL = ttl
+	} else {
+		// If not set using new field then use hard-coded default TTL
+		// Note, due to back-compat issues we cannot set this default inside defaultConfig() function
+		sc.JWTSVIDTTL = credtemplate.DefaultJWTSVIDTTL
 	}
 
 	if c.Server.CATTL != "" {
@@ -487,43 +547,57 @@ func NewServerConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool
 
 	// If the configured TTLs can lead to surprises, then do our best to log an
 	// accurate message and guide the user to resolution
-	if !hasCompatibleTTLs(sc.CATTL, sc.SVIDTTL) {
-		msgCATTLTooSmall := fmt.Sprintf(
-			"The default_svid_ttl is too high for the configured ca_ttl value. "+
-				"SVIDs with shorter lifetimes may be issued. "+
-				"Please set the default_svid_ttl to %v or less, or the ca_ttl to %v or more, "+
-				"to guarantee the full default_svid_ttl lifetime when CA rotations are scheduled.",
-			printMaxSVIDTTL(sc.CATTL), printMinCATTL(sc.SVIDTTL),
-		)
-		msgSVIDTTLTooLargeAndCATTLTooSmall := fmt.Sprintf(
-			"The default_svid_ttl is too high and the ca_ttl is too low. "+
-				"SVIDs with shorter lifetimes may be issued. "+
-				"Please set the default_svid_ttl to %v or less, and the ca_ttl to %v or more, "+
-				"to guarantee the full default_svid_ttl lifetime when CA rotations are scheduled.",
-			printDuration(ca.MaxSVIDTTL()), printMinCATTL(ca.MaxSVIDTTL()),
-		)
-		msgSVIDTTLTooLarge := fmt.Sprintf(
-			"The default_svid_ttl is too high. "+
-				"SVIDs with shorter lifetimes may be issued. "+
-				"Please set the default_svid_ttl to %v or less "+
-				"to guarantee the full default_svid_ttl lifetime when CA rotations are scheduled.",
-			printMaxSVIDTTL(sc.CATTL),
-		)
+	ttlChecks := []struct {
+		name string
+		ttl  time.Duration
+	}{
+		{
+			name: "default_x509_svid_ttl",
+			ttl:  sc.X509SVIDTTL,
+		},
+		{
+			name: "default_jwt_svid_ttl",
+			ttl:  sc.JWTSVIDTTL,
+		},
+	}
 
-		switch {
-		case sc.SVIDTTL < ca.MaxSVIDTTL():
-			// The SVID TTL is smaller than our cap, but the CA TTL
-			// is not large enough to accommodate it
-			sc.Log.Warn(msgCATTLTooSmall)
-		case sc.CATTL < ca.MinCATTLForSVIDTTL(ca.MaxSVIDTTL()):
-			// The SVID TTL is larger than our cap, it needs to be
-			// decreased no matter what. Additionally, the CA TTL is
-			// too small to accommodate the maximum SVID TTL.
-			sc.Log.Warn(msgSVIDTTLTooLargeAndCATTLTooSmall)
-		default:
-			// The SVID TTL is larger than our cap and needs to be
-			// decreased.
-			sc.Log.Warn(msgSVIDTTLTooLarge)
+	for _, ttlCheck := range ttlChecks {
+		if !hasCompatibleTTL(sc.CATTL, ttlCheck.ttl) {
+			var message string
+
+			switch {
+			case ttlCheck.ttl < manager.MaxSVIDTTL():
+				// TTL is smaller than our cap, but the CA TTL
+				// is not large enough to accommodate it
+				message = fmt.Sprintf("%s is too high for the configured "+
+					"ca_ttl value. SVIDs with shorter lifetimes may "+
+					"be issued. Please set %s to %v or less, or the ca_ttl "+
+					"to %v or more, to guarantee the full %s lifetime "+
+					"when CA rotations are scheduled.",
+					ttlCheck.name, ttlCheck.name, printMaxSVIDTTL(sc.CATTL), printMinCATTL(ttlCheck.ttl), ttlCheck.name,
+				)
+			case sc.CATTL < manager.MinCATTLForSVIDTTL(manager.MaxSVIDTTL()):
+				// TTL is larger than our cap, it needs to be
+				// decreased no matter what. Additionally, the CA TTL is
+				// too small to accommodate the maximum SVID TTL.
+				message = fmt.Sprintf("%s is too high and "+
+					"the ca_ttl is too low. SVIDs with shorter lifetimes "+
+					"may be issued. Please set %s to %v or less, and the "+
+					"ca_ttl to %v or more, to guarantee the full %s "+
+					"lifetime when CA rotations are scheduled.",
+					ttlCheck.name, ttlCheck.name, printDuration(manager.MaxSVIDTTL()), printMinCATTL(manager.MaxSVIDTTL()), ttlCheck.name,
+				)
+			default:
+				// TTL is larger than our cap and needs to be
+				// decreased.
+				message = fmt.Sprintf("%s is too high. SVIDs with shorter "+
+					"lifetimes may be issued. Please set %s to %v or less "+
+					"to guarantee the full %s lifetime when CA rotations "+
+					"are scheduled.",
+					ttlCheck.name, ttlCheck.name, printMaxSVIDTTL(sc.CATTL), ttlCheck.name,
+				)
+			}
+			sc.Log.Warn(message)
 		}
 	}
 
@@ -560,10 +634,19 @@ func NewServerConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool
 	}
 	// RFC3280(4.1.2.4) requires the issuer DN be set.
 	if isPKIXNameEmpty(sc.CASubject) {
-		sc.CASubject = defaultCASubject
+		sc.CASubject = credtemplate.DefaultX509CASubject()
 	}
 
-	sc.PluginConfigs = *c.Plugins
+	sc.ExcludeSNFromCASubject = c.Server.ExcludeSNFromCASubject
+	// TODO: remove exclude_sn_from_ca_subject in SPIRE v1.10.0
+	if sc.ExcludeSNFromCASubject {
+		sc.Log.Warn("The deprecated exclude_sn_from_ca_subject configurable will be removed in a future release")
+	}
+
+	sc.PluginConfigs, err = catalog.PluginConfigsFromHCLNode(c.Plugins)
+	if err != nil {
+		return nil, err
+	}
 	sc.Telemetry = c.Telemetry
 	sc.HealthChecks = c.HealthChecks
 
@@ -585,6 +668,19 @@ func NewServerConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool
 		sc.CacheReloadInterval = interval
 	}
 
+	if c.Server.Experimental.PruneEventsOlderThan != "" {
+		interval, err := time.ParseDuration(c.Server.Experimental.PruneEventsOlderThan)
+		if err != nil {
+			return nil, fmt.Errorf("could not parse prune events interval: %w", err)
+		}
+		sc.PruneEventsOlderThan = interval
+	}
+
+	if c.Server.Experimental.EventsBasedCache {
+		sc.Log.Info("Using events based cache")
+	}
+
+	sc.EventsBasedCache = c.Server.Experimental.EventsBasedCache
 	sc.AuthOpaPolicyEngineConfig = c.Server.Experimental.AuthOpaPolicyEngine
 
 	for _, f := range c.Server.Experimental.Flags {
@@ -594,22 +690,65 @@ func NewServerConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool
 	return sc, nil
 }
 
-func parseBundleEndpointProfile(config federatesWithConfig) (trustDomainConfig *bundleClient.TrustDomainConfig, err error) {
-	// First check the number of bundle endpoint profiles in the config
-	objectList, ok := config.BundleEndpointProfile.(*ast.ObjectList)
-	if !ok {
-		return nil, errors.New("malformed configuration")
-	}
-	if len(objectList.Items) != 1 {
-		return nil, errors.New("exactly one bundle endpoint profile is expected")
+func parseBundleEndpointConfigProfile(config *bundleEndpointConfig, dataDir string, log logrus.FieldLogger) (*bundle.ACMEConfig, error) {
+	switch {
+	case config.ACME != nil && config.Profile != nil:
+		return nil, errors.New("either bundle endpoint 'acme' or 'profile' can be set, but not both")
+
+	case config.ACME != nil:
+		log.Warn("ACME configuration within the bundle_endpoint is deprecated. Please use ACME configuration as part of the https_web profile instead.")
+		return configToACMEConfig(config.ACME, dataDir), nil
+
+	case config.Profile == nil:
+		log.Warn("Bundle endpoint is configured but has no profile set, using https_spiffe as default; please configure a profile explicitly. This will be fatal in a future release.")
+		return nil, nil
 	}
 
-	// Parse the configuration
-	var data bytes.Buffer
-	if err := printer.DefaultConfig.Fprint(&data, config.BundleEndpointProfile); err != nil {
+	// Profile is set, parse it
+	configString, err := parseBundleEndpointProfileASTNode(config.Profile)
+	if err != nil {
 		return nil, err
 	}
-	configString := data.String()
+
+	profileConfig := new(bundleEndpointConfigProfile)
+	if err := hcl.Decode(profileConfig, configString); err != nil {
+		return nil, fmt.Errorf("failed to decode configuration: %w", err)
+	}
+
+	switch {
+	case profileConfig.HTTPSWeb != nil:
+		acme := profileConfig.HTTPSWeb.ACME
+		if acme == nil {
+			return nil, fmt.Errorf("malformed https_web profile configuration: ACME is required")
+		}
+		acmeConfig := configToACMEConfig(acme, dataDir)
+		return acmeConfig, nil
+
+	// For now ignore SPIFFE configuration
+	case profileConfig.HTTPSSPIFFE != nil:
+		return nil, nil
+
+	default:
+		return nil, errors.New(`unknown bundle endpoint profile configured; current supported profiles are "https_spiffe" and 'https_web"`)
+	}
+}
+
+func configToACMEConfig(acme *bundleEndpointACMEConfig, dataDir string) *bundle.ACMEConfig {
+	return &bundle.ACMEConfig{
+		DirectoryURL: acme.DirectoryURL,
+		DomainName:   acme.DomainName,
+		CacheDir:     filepath.Join(dataDir, "bundle-acme"),
+		Email:        acme.Email,
+		ToSAccepted:  acme.ToSAccepted,
+	}
+}
+
+func parseBundleEndpointProfile(config federatesWithConfig) (trustDomainConfig *bundleClient.TrustDomainConfig, err error) {
+	configString, err := parseBundleEndpointProfileASTNode(config.BundleEndpointProfile)
+	if err != nil {
+		return nil, err
+	}
+
 	profileConfig := new(bundleEndpointProfileConfig)
 	if err := hcl.Decode(profileConfig, configString); err != nil {
 		return nil, fmt.Errorf("failed to decode configuration: %w", err)
@@ -633,6 +772,23 @@ func parseBundleEndpointProfile(config federatesWithConfig) (trustDomainConfig *
 		EndpointURL:     config.BundleEndpointURL,
 		EndpointProfile: endpointProfile,
 	}, nil
+}
+
+func parseBundleEndpointProfileASTNode(node ast.Node) (string, error) {
+	// First check the number of bundle endpoint profiles in the config
+	objectList, ok := node.(*ast.ObjectList)
+	if !ok {
+		return "", errors.New("malformed configuration")
+	}
+	if len(objectList.Items) != 1 {
+		return "", errors.New("exactly one bundle endpoint profile is expected")
+	}
+
+	var data bytes.Buffer
+	if err := printer.DefaultConfig.Fprint(&data, node); err != nil {
+		return "", err
+	}
+	return data.String(), nil
 }
 
 func validateConfig(c *Config) error {
@@ -684,7 +840,13 @@ func validateConfig(c *Config) error {
 }
 
 func checkForUnknownConfig(c *Config, l logrus.FieldLogger) (err error) {
-	detectedUnknown := func(section string, keys []string) {
+	detectedUnknown := func(section string, keyPositions map[string][]token.Pos) {
+		var keys []string
+		for k := range keyPositions {
+			keys = append(keys, k)
+		}
+
+		sort.Strings(keys)
 		l.WithFields(logrus.Fields{
 			"section": section,
 			"keys":    strings.Join(keys, ","),
@@ -692,45 +854,45 @@ func checkForUnknownConfig(c *Config, l logrus.FieldLogger) (err error) {
 		err = errors.New("unknown configuration detected")
 	}
 
-	if len(c.UnusedKeys) != 0 {
-		detectedUnknown("top-level", c.UnusedKeys)
+	if len(c.UnusedKeyPositions) != 0 {
+		detectedUnknown("top-level", c.UnusedKeyPositions)
 	}
 
 	if c.Server != nil {
-		if len(c.Server.UnusedKeys) != 0 {
-			detectedUnknown("server", c.Server.UnusedKeys)
+		if len(c.Server.UnusedKeyPositions) != 0 {
+			detectedUnknown("server", c.Server.UnusedKeyPositions)
 		}
 
-		if cs := c.Server.CASubject; cs != nil && len(cs.UnusedKeys) != 0 {
-			detectedUnknown("ca_subject", cs.UnusedKeys)
+		if cs := c.Server.CASubject; cs != nil && len(cs.UnusedKeyPositions) != 0 {
+			detectedUnknown("ca_subject", cs.UnusedKeyPositions)
 		}
 
-		if rl := c.Server.RateLimit; len(rl.UnusedKeys) != 0 {
-			detectedUnknown("ratelimit", rl.UnusedKeys)
+		if rl := c.Server.RateLimit; len(rl.UnusedKeyPositions) != 0 {
+			detectedUnknown("ratelimit", rl.UnusedKeyPositions)
 		}
 
 		// TODO: Re-enable unused key detection for experimental config. See
 		// https://github.com/spiffe/spire/issues/1101 for more information
 		//
-		// if len(c.Server.Experimental.UnusedKeys) != 0 {
-		//	detectedUnknown("experimental", c.Server.Experimental.UnusedKeys)
+		// if len(c.Server.Experimental.UnusedKeyPositions) != 0 {
+		//	detectedUnknown("experimental", c.Server.Experimental.UnusedKeyPositions)
 		// }
 
 		if c.Server.Federation != nil {
 			// TODO: Re-enable unused key detection for federation config. See
 			// https://github.com/spiffe/spire/issues/1101 for more information
 			//
-			// if len(c.Server.Federation.UnusedKeys) != 0 {
-			//	detectedUnknown("federation", c.Server.Federation.UnusedKeys)
+			// if len(c.Server.Federation.UnusedKeyPositions) != 0 {
+			//	detectedUnknown("federation", c.Server.Federation.UnusedKeyPositions)
 			// }
 
 			if c.Server.Federation.BundleEndpoint != nil {
-				if len(c.Server.Federation.BundleEndpoint.UnusedKeys) != 0 {
-					detectedUnknown("bundle endpoint", c.Server.Federation.BundleEndpoint.UnusedKeys)
+				if len(c.Server.Federation.BundleEndpoint.UnusedKeyPositions) != 0 {
+					detectedUnknown("bundle endpoint", c.Server.Federation.BundleEndpoint.UnusedKeyPositions)
 				}
 
-				if bea := c.Server.Federation.BundleEndpoint.ACME; bea != nil && len(bea.UnusedKeys) != 0 {
-					detectedUnknown("bundle endpoint ACME", bea.UnusedKeys)
+				if bea := c.Server.Federation.BundleEndpoint.ACME; bea != nil && len(bea.UnusedKeyPositions) != 0 {
+					detectedUnknown("bundle endpoint ACME", bea.UnusedKeyPositions)
 				}
 			}
 
@@ -738,8 +900,8 @@ func checkForUnknownConfig(c *Config, l logrus.FieldLogger) (err error) {
 			// https://github.com/spiffe/spire/issues/1101 for more information
 			//
 			// for k, v := range c.Server.Federation.FederatesWith {
-			//	if len(v.UnusedKeys) != 0 {
-			//		detectedUnknown(fmt.Sprintf("federates_with %q", k), v.UnusedKeys)
+			//	if len(v.UnusedKeyPositions) != 0 {
+			//		detectedUnknown(fmt.Sprintf("federates_with %q", k), v.UnusedKeyPositions)
 			//	}
 			// }
 		}
@@ -748,38 +910,38 @@ func checkForUnknownConfig(c *Config, l logrus.FieldLogger) (err error) {
 	// TODO: Re-enable unused key detection for telemetry. See
 	// https://github.com/spiffe/spire/issues/1101 for more information
 	//
-	// if len(c.Telemetry.UnusedKeys) != 0 {
-	//	detectedUnknown("telemetry", c.Telemetry.UnusedKeys)
+	// if len(c.Telemetry.UnusedKeyPositions) != 0 {
+	//	detectedUnknown("telemetry", c.Telemetry.UnusedKeyPositions)
 	// }
 
-	if p := c.Telemetry.Prometheus; p != nil && len(p.UnusedKeys) != 0 {
-		detectedUnknown("Prometheus", p.UnusedKeys)
+	if p := c.Telemetry.Prometheus; p != nil && len(p.UnusedKeyPositions) != 0 {
+		detectedUnknown("Prometheus", p.UnusedKeyPositions)
 	}
 
 	for _, v := range c.Telemetry.DogStatsd {
-		if len(v.UnusedKeys) != 0 {
-			detectedUnknown("DogStatsd", v.UnusedKeys)
+		if len(v.UnusedKeyPositions) != 0 {
+			detectedUnknown("DogStatsd", v.UnusedKeyPositions)
 		}
 	}
 
 	for _, v := range c.Telemetry.Statsd {
-		if len(v.UnusedKeys) != 0 {
-			detectedUnknown("Statsd", v.UnusedKeys)
+		if len(v.UnusedKeyPositions) != 0 {
+			detectedUnknown("Statsd", v.UnusedKeyPositions)
 		}
 	}
 
 	for _, v := range c.Telemetry.M3 {
-		if len(v.UnusedKeys) != 0 {
-			detectedUnknown("M3", v.UnusedKeys)
+		if len(v.UnusedKeyPositions) != 0 {
+			detectedUnknown("M3", v.UnusedKeyPositions)
 		}
 	}
 
-	if p := c.Telemetry.InMem; p != nil && len(p.UnusedKeys) != 0 {
-		detectedUnknown("InMem", p.UnusedKeys)
+	if p := c.Telemetry.InMem; p != nil && len(p.UnusedKeyPositions) != 0 {
+		detectedUnknown("InMem", p.UnusedKeyPositions)
 	}
 
-	if len(c.HealthChecks.UnusedKeys) != 0 {
-		detectedUnknown("health check", c.HealthChecks.UnusedKeys)
+	if len(c.HealthChecks.UnusedKeyPositions) != 0 {
+		detectedUnknown("health check", c.HealthChecks.UnusedKeyPositions)
 	}
 
 	return err
@@ -788,13 +950,12 @@ func checkForUnknownConfig(c *Config, l logrus.FieldLogger) (err error) {
 func defaultConfig() *Config {
 	return &Config{
 		Server: &serverConfig{
-			BindAddress:    "0.0.0.0",
-			BindPort:       8081,
-			CATTL:          ca.DefaultCATTL.String(),
-			LogLevel:       defaultLogLevel,
-			LogFormat:      log.DefaultFormat,
-			DefaultSVIDTTL: ca.DefaultX509SVIDTTL.String(),
-			Experimental:   experimentalConfig{},
+			BindAddress:  "0.0.0.0",
+			BindPort:     8081,
+			CATTL:        credtemplate.DefaultX509CATTL.String(),
+			LogLevel:     defaultLogLevel,
+			LogFormat:    log.DefaultFormat,
+			Experimental: experimentalConfig{},
 		},
 	}
 }
@@ -814,21 +975,22 @@ func keyTypeFromString(s string) (keymanager.KeyType, error) {
 	}
 }
 
-// hasCompatibleTTLs checks if we can guarantee the configured SVID TTL given the
-// configurd CA TTL. If we detect that a new SVIDs TTL may be cut short due to
-// a scheduled CA rotation, this function will return false.
-func hasCompatibleTTLs(caTTL, svidTTL time.Duration) bool {
-	return ca.MaxSVIDTTLForCATTL(caTTL) >= svidTTL
+// hasCompatibleTTL checks if we can guarantee the configured SVID TTL given the
+// configured CA TTL. If we detect that a new SVID TTL may be cut short due to
+// a scheduled CA rotation, this function will return false. This method should
+// be called for each SVID TTL we may use
+func hasCompatibleTTL(caTTL time.Duration, svidTTL time.Duration) bool {
+	return svidTTL <= manager.MaxSVIDTTLForCATTL(caTTL)
 }
 
 // printMaxSVIDTTL calculates the display string for a sufficiently short SVID TTL
 func printMaxSVIDTTL(caTTL time.Duration) string {
-	return printDuration(ca.MaxSVIDTTLForCATTL(caTTL))
+	return printDuration(manager.MaxSVIDTTLForCATTL(caTTL))
 }
 
 // printMinCATTL calculates the display string for a sufficiently large CA TTL
 func printMinCATTL(svidTTL time.Duration) string {
-	return printDuration(ca.MinCATTLForSVIDTTL(svidTTL))
+	return printDuration(manager.MinCATTLForSVIDTTL(svidTTL))
 }
 
 func printDuration(d time.Duration) string {

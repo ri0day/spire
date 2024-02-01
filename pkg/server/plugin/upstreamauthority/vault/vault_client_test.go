@@ -500,7 +500,7 @@ func TestConfigureTLSWithCertAuth(t *testing.T) {
 
 	testPool, err := testRootCAs()
 	require.NoError(t, err)
-	require.Equal(t, testPool.Subjects(), tcc.RootCAs.Subjects()) // nolint // these pools are not system pools so the use of Subjects() is ok for now
+	require.True(t, testPool.Equal(tcc.RootCAs))
 }
 
 func TestConfigureTLSWithTokenAuth(t *testing.T) {
@@ -521,7 +521,7 @@ func TestConfigureTLSWithTokenAuth(t *testing.T) {
 
 	testPool, err := testRootCAs()
 	require.NoError(t, err)
-	require.Equal(t, testPool.Subjects(), tcc.RootCAs.Subjects()) // nolint // these pools are not system pools so the use of Subjects() is ok for now
+	require.Equal(t, testPool.Subjects(), tcc.RootCAs.Subjects()) //nolint: staticcheck // these pools are not system pools so the use of Subjects() is ok for now
 }
 
 func TestConfigureTLSWithAppRoleAuth(t *testing.T) {
@@ -543,7 +543,7 @@ func TestConfigureTLSWithAppRoleAuth(t *testing.T) {
 
 	testPool, err := testRootCAs()
 	require.NoError(t, err)
-	require.Equal(t, testPool.Subjects(), tcc.RootCAs.Subjects()) // nolint // these pools are not system pools so the use of Subjects() is ok for now
+	require.Equal(t, testPool.Subjects(), tcc.RootCAs.Subjects()) //nolint: staticcheck // these pools are not system pools so the use of Subjects() is ok for now
 }
 
 func TestConfigureTLSInvalidCACert(t *testing.T) {
@@ -633,14 +633,28 @@ func TestSignIntermediate(t *testing.T) {
 	require.NoError(t, err)
 
 	testTTL := "0"
+	spiffeID := "spiffe://intermediate-spire"
 	csr, err := pemutil.LoadCertificateRequest(testReqCSR)
 	require.NoError(t, err)
 
 	resp, err := client.SignIntermediate(testTTL, csr)
 	require.NoError(t, err)
+	require.NotNil(t, resp.UpstreamCACertPEM)
+	require.NotNil(t, resp.UpstreamCACertChainPEM)
 	require.NotNil(t, resp.CACertPEM)
-	require.NotNil(t, resp.CACertChainPEM)
-	require.NotNil(t, resp.CertPEM)
+
+	cert, err := pemutil.ParseCertificate([]byte(resp.CACertPEM))
+	require.NoError(t, err)
+
+	hasURISAN := func(spiffeID string, cert *x509.Certificate) bool {
+		for _, uri := range cert.URIs {
+			if uri.String() == spiffeID {
+				return true
+			}
+		}
+		return false
+	}(spiffeID, cert)
+	require.True(t, hasURISAN)
 }
 
 func TestSignIntermediateErrorFromEndpoint(t *testing.T) {

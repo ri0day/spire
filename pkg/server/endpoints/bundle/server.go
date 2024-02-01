@@ -6,19 +6,21 @@ import (
 	"crypto/x509"
 	"net"
 	"net/http"
+	"time"
 
 	"github.com/sirupsen/logrus"
+	"github.com/spiffe/go-spiffe/v2/bundle/spiffebundle"
 	"github.com/spiffe/spire/pkg/common/bundleutil"
 	"github.com/zeebo/errs"
 )
 
 type Getter interface {
-	GetBundle(ctx context.Context) (*bundleutil.Bundle, error)
+	GetBundle(ctx context.Context) (*spiffebundle.Bundle, error)
 }
 
-type GetterFunc func(ctx context.Context) (*bundleutil.Bundle, error)
+type GetterFunc func(ctx context.Context) (*spiffebundle.Bundle, error)
 
-func (fn GetterFunc) GetBundle(ctx context.Context) (*bundleutil.Bundle, error) {
+func (fn GetterFunc) GetBundle(ctx context.Context) (*spiffebundle.Bundle, error) {
 	return fn(ctx)
 }
 
@@ -27,10 +29,11 @@ type ServerAuth interface {
 }
 
 type ServerConfig struct {
-	Log        logrus.FieldLogger
-	Address    string
-	Getter     Getter
-	ServerAuth ServerAuth
+	Log         logrus.FieldLogger
+	Address     string
+	Getter      Getter
+	ServerAuth  ServerAuth
+	RefreshHint *time.Duration
 
 	// test hooks
 	listen func(network, address string) (net.Listener, error)
@@ -62,8 +65,9 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	tlsConfig.MinVersion = tls.VersionTLS12
 
 	server := &http.Server{
-		Handler:   http.HandlerFunc(s.serveHTTP),
-		TLSConfig: tlsConfig,
+		Handler:           http.HandlerFunc(s.serveHTTP),
+		TLSConfig:         tlsConfig,
+		ReadHeaderTimeout: time.Second * 10,
 	}
 
 	errCh := make(chan error, 1)
@@ -97,7 +101,12 @@ func (s *Server) serveHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	refreshHint := bundleutil.CalculateRefreshHint(b)
+	var refreshHint time.Duration
+	if s.c.RefreshHint != nil {
+		refreshHint = *s.c.RefreshHint
+	} else {
+		refreshHint = bundleutil.CalculateRefreshHint(b)
+	}
 
 	// TODO: bundle sequence number?
 	opts := []bundleutil.MarshalOption{

@@ -9,31 +9,39 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/spire/pkg/agent/catalog"
-	"github.com/spiffe/spire/pkg/agent/manager/cache"
+	managerCache "github.com/spiffe/spire/pkg/agent/manager/cache"
 	"github.com/spiffe/spire/pkg/agent/manager/storecache"
 	"github.com/spiffe/spire/pkg/agent/plugin/keymanager"
+	"github.com/spiffe/spire/pkg/agent/plugin/nodeattestor"
 	"github.com/spiffe/spire/pkg/agent/storage"
 	"github.com/spiffe/spire/pkg/agent/svid"
 	"github.com/spiffe/spire/pkg/agent/workloadkey"
+	"github.com/spiffe/spire/pkg/common/rotationutil"
 	"github.com/spiffe/spire/pkg/common/telemetry"
 )
 
 // Config holds a cache manager configuration
 type Config struct {
 	// Agent SVID and key resulting from successful attestation.
-	SVID             []*x509.Certificate
-	SVIDKey          keymanager.Key
-	Bundle           *cache.Bundle
-	Catalog          catalog.Catalog
-	TrustDomain      spiffeid.TrustDomain
-	Log              logrus.FieldLogger
-	Metrics          telemetry.Metrics
-	ServerAddr       string
-	Storage          storage.Storage
-	WorkloadKeyType  workloadkey.KeyType
-	SyncInterval     time.Duration
-	RotationInterval time.Duration
-	SVIDStoreCache   *storecache.Cache
+	SVID                     []*x509.Certificate
+	SVIDKey                  keymanager.Key
+	Bundle                   *managerCache.Bundle
+	Reattestable             bool
+	Catalog                  catalog.Catalog
+	TrustDomain              spiffeid.TrustDomain
+	Log                      logrus.FieldLogger
+	Metrics                  telemetry.Metrics
+	ServerAddr               string
+	Storage                  storage.Storage
+	WorkloadKeyType          workloadkey.KeyType
+	SyncInterval             time.Duration
+	UseSyncAuthorizedEntries bool
+	RotationInterval         time.Duration
+	SVIDStoreCache           *storecache.Cache
+	SVIDCacheMaxSize         int
+	DisableLRUCache          bool
+	NodeAttestor             nodeattestor.NodeAttestor
+	RotationStrategy         *rotationutil.RotationStrategy
 
 	// Clk is the clock the manager will use to get time
 	Clk clock.Clock
@@ -57,19 +65,30 @@ func newManager(c *Config) *manager {
 		c.Clk = clock.New()
 	}
 
-	cache := cache.New(c.Log.WithField(telemetry.SubsystemName, telemetry.CacheManager), c.TrustDomain, c.Bundle, c.Metrics)
+	var cache Cache
+	if c.DisableLRUCache {
+		cache = managerCache.New(c.Log.WithField(telemetry.SubsystemName, telemetry.CacheManager), c.TrustDomain, c.Bundle,
+			c.Metrics)
+	} else {
+		// use LRU cache implementation
+		cache = managerCache.NewLRUCache(c.Log.WithField(telemetry.SubsystemName, telemetry.CacheManager), c.TrustDomain, c.Bundle,
+			c.Metrics, c.SVIDCacheMaxSize, c.Clk)
+	}
 
 	rotCfg := &svid.RotatorConfig{
-		SVIDKeyManager: keymanager.ForSVID(c.Catalog.GetKeyManager()),
-		Log:            c.Log,
-		Metrics:        c.Metrics,
-		SVID:           c.SVID,
-		SVIDKey:        c.SVIDKey,
-		BundleStream:   cache.SubscribeToBundleChanges(),
-		ServerAddr:     c.ServerAddr,
-		TrustDomain:    c.TrustDomain,
-		Interval:       c.RotationInterval,
-		Clk:            c.Clk,
+		SVIDKeyManager:   keymanager.ForSVID(c.Catalog.GetKeyManager()),
+		Log:              c.Log,
+		Metrics:          c.Metrics,
+		SVID:             c.SVID,
+		SVIDKey:          c.SVIDKey,
+		BundleStream:     cache.SubscribeToBundleChanges(),
+		ServerAddr:       c.ServerAddr,
+		TrustDomain:      c.TrustDomain,
+		Interval:         c.RotationInterval,
+		Clk:              c.Clk,
+		NodeAttestor:     c.NodeAttestor,
+		Reattestable:     c.Reattestable,
+		RotationStrategy: c.RotationStrategy,
 	}
 	svidRotator, client := svid.NewRotator(rotCfg)
 

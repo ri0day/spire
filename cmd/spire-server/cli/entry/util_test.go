@@ -2,6 +2,7 @@ package entry
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"path"
 	"testing"
@@ -15,9 +16,10 @@ import (
 	"github.com/spiffe/spire/test/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 )
+
+var availableFormats = []string{"pretty", "json"}
 
 func TestParseEntryJSON(t *testing.T) {
 	testCases := []struct {
@@ -69,10 +71,11 @@ func TestParseEntryJSON(t *testing.T) {
 						Value: "uid:1111",
 					},
 				},
-				SpiffeId: &types.SPIFFEID{TrustDomain: "example.org", Path: "/Blog"},
-				ParentId: &types.SPIFFEID{TrustDomain: "example.org", Path: "/spire/agent/join_token/TokenBlog"},
-				Ttl:      200,
-				Admin:    true,
+				SpiffeId:    &types.SPIFFEID{TrustDomain: "example.org", Path: "/Blog"},
+				ParentId:    &types.SPIFFEID{TrustDomain: "example.org", Path: "/spire/agent/join_token/TokenBlog"},
+				X509SvidTtl: 200,
+				JwtSvidTtl:  30,
+				Admin:       true,
 			}
 			entry2 := &types.Entry{
 				Selectors: []*types.Selector{
@@ -81,9 +84,11 @@ func TestParseEntryJSON(t *testing.T) {
 						Value: "uid:1111",
 					},
 				},
-				SpiffeId: &types.SPIFFEID{TrustDomain: "example.org", Path: "/Database"},
-				ParentId: &types.SPIFFEID{TrustDomain: "example.org", Path: "/spire/agent/join_token/TokenDatabase"},
-				Ttl:      200,
+				SpiffeId:    &types.SPIFFEID{TrustDomain: "example.org", Path: "/Database"},
+				ParentId:    &types.SPIFFEID{TrustDomain: "example.org", Path: "/spire/agent/join_token/TokenDatabase"},
+				X509SvidTtl: 200,
+				JwtSvidTtl:  30,
+				Hint:        "internal",
 			}
 			entry3 := &types.Entry{
 				Selectors: []*types.Selector{
@@ -96,10 +101,11 @@ func TestParseEntryJSON(t *testing.T) {
 						Value: "key2:value",
 					},
 				},
-				SpiffeId:  &types.SPIFFEID{TrustDomain: "example.org", Path: "/storesvid"},
-				ParentId:  &types.SPIFFEID{TrustDomain: "example.org", Path: "/spire/agent/join_token/TokenDatabase"},
-				StoreSvid: true,
-				Ttl:       200,
+				SpiffeId:    &types.SPIFFEID{TrustDomain: "example.org", Path: "/storesvid"},
+				ParentId:    &types.SPIFFEID{TrustDomain: "example.org", Path: "/spire/agent/join_token/TokenDatabase"},
+				StoreSvid:   true,
+				X509SvidTtl: 200,
+				JwtSvidTtl:  30,
 			}
 
 			expectedEntries := []*types.Entry{
@@ -172,14 +178,14 @@ type fakeEntryServer struct {
 	batchUpdateEntryResp *entryv1.BatchUpdateEntryResponse
 }
 
-func (f fakeEntryServer) CountEntries(ctx context.Context, req *entryv1.CountEntriesRequest) (*entryv1.CountEntriesResponse, error) {
+func (f fakeEntryServer) CountEntries(context.Context, *entryv1.CountEntriesRequest) (*entryv1.CountEntriesResponse, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
 	return f.countEntriesResp, nil
 }
 
-func (f fakeEntryServer) ListEntries(ctx context.Context, req *entryv1.ListEntriesRequest) (*entryv1.ListEntriesResponse, error) {
+func (f fakeEntryServer) ListEntries(_ context.Context, req *entryv1.ListEntriesRequest) (*entryv1.ListEntriesResponse, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -187,7 +193,7 @@ func (f fakeEntryServer) ListEntries(ctx context.Context, req *entryv1.ListEntri
 	return f.listEntriesResp, nil
 }
 
-func (f fakeEntryServer) GetEntry(ctx context.Context, req *entryv1.GetEntryRequest) (*types.Entry, error) {
+func (f fakeEntryServer) GetEntry(_ context.Context, req *entryv1.GetEntryRequest) (*types.Entry, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -195,7 +201,7 @@ func (f fakeEntryServer) GetEntry(ctx context.Context, req *entryv1.GetEntryRequ
 	return f.getEntryResp, nil
 }
 
-func (f fakeEntryServer) BatchDeleteEntry(ctx context.Context, req *entryv1.BatchDeleteEntryRequest) (*entryv1.BatchDeleteEntryResponse, error) {
+func (f fakeEntryServer) BatchDeleteEntry(_ context.Context, req *entryv1.BatchDeleteEntryRequest) (*entryv1.BatchDeleteEntryResponse, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -203,7 +209,7 @@ func (f fakeEntryServer) BatchDeleteEntry(ctx context.Context, req *entryv1.Batc
 	return f.batchDeleteEntryResp, nil
 }
 
-func (f fakeEntryServer) BatchCreateEntry(ctx context.Context, req *entryv1.BatchCreateEntryRequest) (*entryv1.BatchCreateEntryResponse, error) {
+func (f fakeEntryServer) BatchCreateEntry(_ context.Context, req *entryv1.BatchCreateEntryRequest) (*entryv1.BatchCreateEntryResponse, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -211,7 +217,7 @@ func (f fakeEntryServer) BatchCreateEntry(ctx context.Context, req *entryv1.Batc
 	return f.batchCreateEntryResp, nil
 }
 
-func (f fakeEntryServer) BatchUpdateEntry(ctx context.Context, req *entryv1.BatchUpdateEntryRequest) (*entryv1.BatchUpdateEntryResponse, error) {
+func (f fakeEntryServer) BatchUpdateEntry(_ context.Context, req *entryv1.BatchUpdateEntryRequest) (*entryv1.BatchUpdateEntryResponse, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -249,4 +255,17 @@ func setupTest(t *testing.T, newClient func(*common_cli.Env) cli.Command) *entry
 	})
 
 	return test
+}
+
+func requireOutputBasedOnFormat(t *testing.T, format, stdoutString string, expectedStdoutPretty, expectedStdoutJSON string) {
+	switch format {
+	case "pretty":
+		require.Contains(t, stdoutString, expectedStdoutPretty)
+	case "json":
+		if expectedStdoutJSON != "" {
+			require.JSONEq(t, expectedStdoutJSON, stdoutString)
+		} else {
+			require.Empty(t, stdoutString)
+		}
+	}
 }

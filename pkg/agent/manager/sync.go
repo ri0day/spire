@@ -8,14 +8,13 @@ import (
 
 	"github.com/sirupsen/logrus"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"github.com/spiffe/spire/pkg/agent/client"
 	"github.com/spiffe/spire/pkg/agent/manager/cache"
 	"github.com/spiffe/spire/pkg/agent/workloadkey"
 	"github.com/spiffe/spire/pkg/common/bundleutil"
-	"github.com/spiffe/spire/pkg/common/rotationutil"
 	"github.com/spiffe/spire/pkg/common/telemetry"
 	telemetry_agent "github.com/spiffe/spire/pkg/common/telemetry/agent"
 	"github.com/spiffe/spire/pkg/common/util"
-	"github.com/spiffe/spire/pkg/server/api/limits"
 	"github.com/spiffe/spire/proto/spire/common"
 )
 
@@ -25,7 +24,7 @@ type csrRequest struct {
 	CurrentSVIDExpiresAt time.Time
 }
 
-type Cache interface {
+type SVIDCache interface {
 	// UpdateEntries updates entries on cache
 	UpdateEntries(update *cache.UpdateEntries, checkSVID func(*common.RegistrationEntry, *common.RegistrationEntry, *cache.X509SVID) bool)
 
@@ -34,6 +33,15 @@ type Cache interface {
 
 	// GetStaleEntries gets a list of records that need update SVIDs
 	GetStaleEntries() []*cache.StaleEntry
+}
+
+func (m *manager) syncSVIDs(ctx context.Context) (err error) {
+	// perform syncSVIDs only if using LRU cache
+	if m.c.SVIDCacheMaxSize > 0 {
+		m.cache.SyncSVIDsWithSubscribers()
+		return m.updateSVIDs(ctx, m.c.Log.WithField(telemetry.CacheType, "workload"), m.cache)
+	}
+	return nil
 }
 
 // synchronize fetches the authorized entries from the server, updates the
@@ -57,12 +65,11 @@ func (m *manager) synchronize(ctx context.Context) (err error) {
 	return nil
 }
 
-func (m *manager) updateCache(ctx context.Context, update *cache.UpdateEntries, log logrus.FieldLogger, cacheType string, c Cache) error {
+func (m *manager) updateCache(ctx context.Context, update *cache.UpdateEntries, log logrus.FieldLogger, cacheType string, c SVIDCache) error {
 	// update the cache and build a list of CSRs that need to be processed
 	// in this interval.
 	//
 	// the values in `update` now belong to the cache. DO NOT MODIFY.
-	var csrs []csrRequest
 	var expiring int
 	var outdated int
 	c.UpdateEntries(update, func(existingEntry, newEntry *common.RegistrationEntry, svid *cache.X509SVID) bool {
@@ -75,7 +82,7 @@ func (m *manager) updateCache(ctx context.Context, update *cache.UpdateEntries, 
 				telemetry.RegistrationID: newEntry.EntryId,
 				telemetry.SPIFFEID:       newEntry.SpiffeId,
 			}).Warn("cached X509 SVID is empty")
-		case rotationutil.ShouldRotateX509(m.c.Clk.Now(), svid.Chain[0]):
+		case m.c.RotationStrategy.ShouldRotateX509(m.c.Clk.Now(), svid.Chain[0]):
 			expiring++
 		case existingEntry != nil && existingEntry.RevisionNumber != newEntry.RevisionNumber:
 			// Registration entry has been updated
@@ -98,22 +105,32 @@ func (m *manager) updateCache(ctx context.Context, update *cache.UpdateEntries, 
 		log.WithField(telemetry.OutdatedSVIDs, outdated).Debug("Updating SVIDs with outdated attributes in cache")
 	}
 
+	return m.updateSVIDs(ctx, log, c)
+}
+
+func (m *manager) updateSVIDs(ctx context.Context, log logrus.FieldLogger, c SVIDCache) error {
+	m.updateSVIDMu.Lock()
+	defer m.updateSVIDMu.Unlock()
+
 	staleEntries := c.GetStaleEntries()
 	if len(staleEntries) > 0 {
+		var csrs []csrRequest
+		sizeLimit := m.csrSizeLimitedBackoff.NextBackOff()
 		log.WithFields(logrus.Fields{
 			telemetry.Count: len(staleEntries),
-			telemetry.Limit: limits.SignLimitPerIP,
+			telemetry.Limit: sizeLimit,
 		}).Debug("Renewing stale entries")
-		for _, staleEntry := range staleEntries {
+
+		for _, entry := range staleEntries {
 			// we've exceeded the CSR limit, don't make any more CSRs
-			if len(csrs) >= limits.SignLimitPerIP {
+			if len(csrs) >= sizeLimit {
 				break
 			}
 
 			csrs = append(csrs, csrRequest{
-				EntryID:              staleEntry.Entry.EntryId,
-				SpiffeID:             staleEntry.Entry.SpiffeId,
-				CurrentSVIDExpiresAt: staleEntry.ExpiresAt,
+				EntryID:              entry.Entry.EntryId,
+				SpiffeID:             entry.Entry.SpiffeId,
+				CurrentSVIDExpiresAt: entry.SVIDExpiresAt,
 			})
 		}
 
@@ -124,7 +141,6 @@ func (m *manager) updateCache(ctx context.Context, update *cache.UpdateEntries, 
 		// the values in `update` now belong to the cache. DO NOT MODIFY.
 		c.UpdateSVIDs(update)
 	}
-
 	return nil
 }
 
@@ -132,12 +148,20 @@ func (m *manager) fetchSVIDs(ctx context.Context, csrs []csrRequest) (_ *cache.U
 	// Put all the CSRs in an array to make just one call with all the CSRs.
 	counter := telemetry_agent.StartManagerFetchSVIDsUpdatesCall(m.c.Metrics)
 	defer counter.Done(&err)
+	defer func() {
+		if err == nil {
+			m.csrSizeLimitedBackoff.Success()
+		}
+	}()
 
 	csrsIn := make(map[string][]byte)
 
 	privateKeys := make(map[string]crypto.Signer, len(csrs))
 	for _, csr := range csrs {
-		log := m.c.Log.WithField("spiffe_id", csr.SpiffeID)
+		log := m.c.Log.WithFields(logrus.Fields{
+			"spiffe_id": csr.SpiffeID,
+			"entry_id":  csr.EntryID,
+		})
 		if !csr.CurrentSVIDExpiresAt.IsZero() {
 			log = log.WithField("expires_at", csr.CurrentSVIDExpiresAt.Format(time.RFC3339))
 		}
@@ -148,7 +172,11 @@ func (m *manager) fetchSVIDs(ctx context.Context, csrs []csrRequest) (_ *cache.U
 			continue
 		}
 
-		log.Info("Renewing X509-SVID")
+		if csr.CurrentSVIDExpiresAt.IsZero() {
+			log.Info("Creating X509-SVID")
+		} else {
+			log.Info("Renewing X509-SVID")
+		}
 
 		spiffeID, err := spiffeid.FromString(csr.SpiffeID)
 		if err != nil {
@@ -164,6 +192,8 @@ func (m *manager) fetchSVIDs(ctx context.Context, csrs []csrRequest) (_ *cache.U
 
 	svidsOut, err := m.client.NewX509SVIDs(ctx, csrsIn)
 	if err != nil {
+		// Reduce csr size for next invocation
+		m.csrSizeLimitedBackoff.Failure()
 		return nil, err
 	}
 
@@ -177,6 +207,16 @@ func (m *manager) fetchSVIDs(ctx context.Context, csrs []csrRequest) (_ *cache.U
 		if err != nil {
 			return nil, err
 		}
+
+		svidLifetime := chain[0].NotAfter.Sub(chain[0].NotBefore)
+		if m.c.RotationStrategy.ShouldFallbackX509DefaultRotation(svidLifetime) {
+			log := m.c.Log.WithFields(logrus.Fields{
+				"spiffe_id": chain[0].URIs[0].String(),
+				"entry_id":  entryID,
+			})
+			log.Warn("X509 SVID lifetime isn't long enough to guarantee the availability_target, falling back to the default rotation strategy")
+		}
+
 		byEntryID[entryID] = &cache.X509SVID{
 			Chain:      chain,
 			PrivateKey: privateKey,
@@ -195,9 +235,22 @@ func (m *manager) fetchEntries(ctx context.Context) (_ *cache.UpdateEntries, _ *
 	counter := telemetry_agent.StartManagerFetchEntriesUpdatesCall(m.c.Metrics)
 	defer counter.Done(&err)
 
-	update, err := m.client.FetchUpdates(ctx)
-	if err != nil {
-		return nil, nil, err
+	var update *client.Update
+	if m.c.UseSyncAuthorizedEntries {
+		stats, err := m.client.SyncUpdates(ctx, m.syncedEntries, m.syncedBundles)
+		if err != nil {
+			return nil, nil, err
+		}
+		telemetry_agent.SetSyncStats(m.c.Metrics, stats)
+		update = &client.Update{
+			Entries: m.syncedEntries,
+			Bundles: m.syncedBundles,
+		}
+	} else {
+		update, err = m.client.FetchUpdates(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 
 	bundles, err := parseBundles(update.Bundles)
@@ -242,11 +295,11 @@ func newCSR(spiffeID spiffeid.ID, keyType workloadkey.KeyType) (crypto.Signer, [
 func parseBundles(bundles map[string]*common.Bundle) (map[spiffeid.TrustDomain]*cache.Bundle, error) {
 	out := make(map[spiffeid.TrustDomain]*cache.Bundle, len(bundles))
 	for _, bundle := range bundles {
-		bundle, err := bundleutil.BundleFromProto(bundle)
+		bundle, err := bundleutil.SPIFFEBundleFromProto(bundle)
 		if err != nil {
 			return nil, err
 		}
-		td, err := spiffeid.TrustDomainFromString(bundle.TrustDomainID())
+		td, err := spiffeid.TrustDomainFromString(bundle.TrustDomain().IDString())
 		if err != nil {
 			return nil, err
 		}

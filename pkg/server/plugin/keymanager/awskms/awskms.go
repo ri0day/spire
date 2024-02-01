@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -17,12 +18,13 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/kms"
 	"github.com/aws/aws-sdk-go-v2/service/kms/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
-	"github.com/gofrs/uuid"
+	"github.com/gofrs/uuid/v5"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/hcl"
 	keymanagerv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/plugin/server/keymanager/v1"
 	configv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/service/common/config/v1"
 	"github.com/spiffe/spire/pkg/common/catalog"
+	"github.com/spiffe/spire/pkg/common/diskutil"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -91,11 +93,13 @@ type Plugin struct {
 
 // Config provides configuration context for the plugin
 type Config struct {
-	AccessKeyID     string `hcl:"access_key_id" json:"access_key_id"`
-	SecretAccessKey string `hcl:"secret_access_key" json:"secret_access_key"`
-	Region          string `hcl:"region" json:"region"`
-	KeyMetadataFile string `hcl:"key_metadata_file" json:"key_metadata_file"`
-	KeyPolicyFile   string `hcl:"key_policy_file" json:"key_policy_file"`
+	AccessKeyID        string `hcl:"access_key_id" json:"access_key_id"`
+	SecretAccessKey    string `hcl:"secret_access_key" json:"secret_access_key"`
+	Region             string `hcl:"region" json:"region"`
+	KeyMetadataFile    string `hcl:"key_metadata_file" json:"key_metadata_file"`
+	KeyIdentifierFile  string `hcl:"key_identifier_file" json:"key_identifier_file"`
+	KeyIdentifierValue string `hcl:"key_identifier_value" json:"key_identifier_value"`
+	KeyPolicyFile      string `hcl:"key_policy_file" json:"key_policy_file"`
 }
 
 // New returns an instantiated plugin
@@ -105,7 +109,8 @@ func New() *Plugin {
 
 func newPlugin(
 	newKMSClient func(aws.Config) (kmsClient, error),
-	newSTSClient func(aws.Config) (stsClient, error)) *Plugin {
+	newSTSClient func(aws.Config) (stsClient, error),
+) *Plugin {
 	return &Plugin{
 		entries: make(map[string]keyEntry),
 		hooks: pluginHooks{
@@ -129,12 +134,6 @@ func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) 
 		return nil, err
 	}
 
-	serverID, err := loadServerID(config.KeyMetadataFile)
-	if err != nil {
-		return nil, err
-	}
-	p.log.Debug("Loaded server id", "server_id", serverID)
-
 	if config.KeyPolicyFile != "" {
 		policyBytes, err := os.ReadFile(config.KeyPolicyFile)
 		if err != nil {
@@ -143,6 +142,22 @@ func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) 
 		policyStr := string(policyBytes)
 		p.keyPolicy = &policyStr
 	}
+
+	var serverID = config.KeyIdentifierValue
+	if serverID == "" && config.KeyMetadataFile != "" {
+		p.log.Warn("'key_metadata_file' is deprecated in favor of 'key_identifier_file' and will be removed in a future version")
+		serverID, err = getOrCreateServerID(config.KeyMetadataFile)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if serverID == "" && config.KeyIdentifierFile != "" {
+		serverID, err = getOrCreateServerID(config.KeyIdentifierFile)
+		if err != nil {
+			return nil, err
+		}
+	}
+	p.log.Debug("Loaded server id", "server_id", serverID)
 
 	awsCfg, err := newAWSConfig(ctx, config)
 	if err != nil {
@@ -264,7 +279,7 @@ func (p *Plugin) SignData(ctx context.Context, req *keymanagerv1.SignDataRequest
 }
 
 // GetPublicKey returns the public key for a given key
-func (p *Plugin) GetPublicKey(ctx context.Context, req *keymanagerv1.GetPublicKeyRequest) (*keymanagerv1.GetPublicKeyResponse, error) {
+func (p *Plugin) GetPublicKey(_ context.Context, req *keymanagerv1.GetPublicKeyRequest) (*keymanagerv1.GetPublicKeyResponse, error) {
 	if req.KeyId == "" {
 		return nil, status.Error(codes.InvalidArgument, "key id is required")
 	}
@@ -476,6 +491,7 @@ func (p *Plugin) refreshAliases(ctx context.Context) error {
 	defer p.mu.RUnlock()
 	var errs []string
 	for _, entry := range p.entries {
+		entry := entry
 		_, err := p.kmsClient.UpdateAlias(ctx, &kms.UpdateAliasInput{
 			AliasName:   &entry.AliasName,
 			TargetKeyId: &entry.Arn,
@@ -754,7 +770,7 @@ func (p *Plugin) createDefaultPolicy(ctx context.Context) (*string, error) {
 	roleName, err := roleNameFromARN(*result.Arn)
 	if err != nil {
 		// the server has not assumed any role, use default KMS policy and log a warn message
-		p.log.Warn("In a future version of SPIRE, it will be mandatory for the SPIRE servers to assume an AWS IAM Role when using the default AWS KMS key policy. Please assign an IAM role to this SPIRE Server instace.")
+		p.log.Warn("In a future version of SPIRE, it will be mandatory for the SPIRE servers to assume an AWS IAM Role when using the default AWS KMS key policy. Please assign an IAM role to this SPIRE Server instance.")
 		return nil, nil
 	}
 
@@ -829,14 +845,32 @@ func parseAndValidateConfig(c string) (*Config, error) {
 		return nil, status.Error(codes.InvalidArgument, "configuration is missing a region")
 	}
 
-	if config.KeyMetadataFile == "" {
-		return nil, status.Error(codes.InvalidArgument, "configuration is missing server id file path")
+	if config.KeyIdentifierValue != "" {
+		re := regexp.MustCompile(".*[^A-z0-9/_-].*")
+		if re.MatchString(config.KeyIdentifierValue) {
+			return nil, status.Error(codes.InvalidArgument, "Key identifier must contain only alphanumeric characters, forward slashes (/), underscores (_), and dashes (-)")
+		}
+		if strings.HasPrefix(config.KeyIdentifierValue, "alias/aws/") {
+			return nil, status.Error(codes.InvalidArgument, "Key identifier must not start with alias/aws/")
+		}
+		if len(config.KeyIdentifierValue) > 256 {
+			return nil, status.Error(codes.InvalidArgument, "Key identifier must not be longer than 256 characters")
+		}
+	}
+	if config.KeyMetadataFile == "" && config.KeyIdentifierFile == "" && config.KeyIdentifierValue == "" {
+		return nil, status.Error(codes.InvalidArgument, "configuration requires server id or server id file path")
+	}
+	if (config.KeyMetadataFile != "" || config.KeyIdentifierFile != "") && config.KeyIdentifierValue != "" {
+		return nil, status.Error(codes.InvalidArgument, "configuration must not contain both server id and server id file path")
+	}
+	if config.KeyMetadataFile != "" && config.KeyIdentifierFile != "" {
+		return nil, status.Error(codes.InvalidArgument, "configuration must not contain both 'key_identifier_file' and deprecated 'key_metadata_file'")
 	}
 
 	return config, nil
 }
 
-func signingAlgorithmForKMS(keyType keymanagerv1.KeyType, signerOpts interface{}) (types.SigningAlgorithmSpec, error) {
+func signingAlgorithmForKMS(keyType keymanagerv1.KeyType, signerOpts any) (types.SigningAlgorithmSpec, error) {
 	var (
 		hashAlgo keymanagerv1.HashAlgorithm
 		isPSS    bool
@@ -920,7 +954,7 @@ func min(x, y time.Duration) time.Duration {
 	return y
 }
 
-func loadServerID(idPath string) (string, error) {
+func getOrCreateServerID(idPath string) (string, error) {
 	// get id from path
 	data, err := os.ReadFile(idPath)
 	switch {
@@ -947,7 +981,7 @@ func createServerID(idPath string) (string, error) {
 	id := u.String()
 
 	// persist id
-	err = os.WriteFile(idPath, []byte(id), 0600)
+	err = diskutil.WritePrivateFile(idPath, []byte(id))
 	if err != nil {
 		return "", status.Errorf(codes.Internal, "failed to persist server id on path: %v", err)
 	}

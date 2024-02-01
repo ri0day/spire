@@ -26,7 +26,7 @@ const (
 )
 
 // RegisterService registers debug service on provided server
-func RegisterService(s *grpc.Server, service *Service) {
+func RegisterService(s grpc.ServiceRegistrar, service *Service) {
 	debugv1.RegisterDebugServer(s, service)
 }
 
@@ -70,7 +70,7 @@ type getInfoResp struct {
 }
 
 // GetInfo gets SPIRE Server debug information
-func (s *Service) GetInfo(ctx context.Context, req *debugv1.GetInfoRequest) (*debugv1.GetInfoResponse, error) {
+func (s *Service) GetInfo(ctx context.Context, _ *debugv1.GetInfoRequest) (*debugv1.GetInfoResponse, error) {
 	log := rpccontext.Logger(ctx)
 
 	s.getInfoResp.mtx.Lock()
@@ -163,7 +163,7 @@ func spiffeIDFromCert(cert *x509.Certificate) *types.SPIFFEID {
 	}
 
 	return &types.SPIFFEID{
-		TrustDomain: id.TrustDomain().String(),
+		TrustDomain: id.TrustDomain().Name(),
 		Path:        id.Path(),
 	}
 }

@@ -24,7 +24,7 @@ const (
 )
 
 // RegisterService registers debug service on provided server
-func RegisterService(s *grpc.Server, service *Service) {
+func RegisterService(s grpc.ServiceRegistrar, service *Service) {
 	debugv1.RegisterDebugServer(s, service)
 }
 
@@ -68,7 +68,7 @@ type getInfoResp struct {
 }
 
 // GetInfo gets SPIRE Agent debug information
-func (s *Service) GetInfo(ctx context.Context, req *debugv1.GetInfoRequest) (*debugv1.GetInfoResponse, error) {
+func (s *Service) GetInfo(context.Context, *debugv1.GetInfoRequest) (*debugv1.GetInfoResponse, error) {
 	s.getInfoResp.mtx.Lock()
 	defer s.getInfoResp.mtx.Unlock()
 
@@ -113,7 +113,7 @@ func spiffeIDFromCert(cert *x509.Certificate) *types.SPIFFEID {
 	}
 
 	return &types.SPIFFEID{
-		TrustDomain: id.TrustDomain().String(),
+		TrustDomain: id.TrustDomain().Name(),
 		Path:        id.Path(),
 	}
 }
@@ -123,7 +123,7 @@ func (s *Service) getCertificateChain(svid []*x509.Certificate) ([]*x509.Certifi
 	cachedBundle := s.m.GetBundle()
 
 	// Create bundle source using SVID roots, and verify certificate to extract SVID chain
-	bundleSource := x509bundle.FromX509Authorities(s.td, cachedBundle.RootCAs())
+	bundleSource := x509bundle.FromX509Authorities(s.td, cachedBundle.X509Authorities())
 	_, certs, err := x509svid.Verify(svid, bundleSource)
 	if err != nil {
 		s.log.WithError(err).Error("Failed to verify agent SVID")

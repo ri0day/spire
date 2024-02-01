@@ -8,22 +8,23 @@ import (
 
 	"github.com/mitchellh/cli"
 	"github.com/spiffe/go-spiffe/v2/proto/spiffe/workload"
-	common_cli "github.com/spiffe/spire/pkg/common/cli"
+	commoncli "github.com/spiffe/spire/pkg/common/cli"
 	"github.com/spiffe/spire/pkg/common/cliprinter"
 )
 
 func NewFetchJWTCommand() cli.Command {
-	return newFetchJWTCommand(common_cli.DefaultEnv, newWorkloadClient)
+	return newFetchJWTCommandWithEnv(commoncli.DefaultEnv, newWorkloadClient)
 }
 
-func newFetchJWTCommand(env *common_cli.Env, clientMaker workloadClientMaker) cli.Command {
-	return adaptCommand(env, clientMaker, new(fetchJWTCommand))
+func newFetchJWTCommandWithEnv(env *commoncli.Env, clientMaker workloadClientMaker) cli.Command {
+	return adaptCommand(env, clientMaker, &fetchJWTCommand{env: env})
 }
 
 type fetchJWTCommand struct {
-	audience common_cli.CommaStringsFlag
+	audience commoncli.CommaStringsFlag
 	spiffeID string
 	printer  cliprinter.Printer
+	env      *commoncli.Env
 }
 
 func (c *fetchJWTCommand) name() string {
@@ -34,7 +35,7 @@ func (c *fetchJWTCommand) synopsis() string {
 	return "Fetches a JWT SVID from the Workload API"
 }
 
-func (c *fetchJWTCommand) run(ctx context.Context, env *common_cli.Env, client *workloadClient) error {
+func (c *fetchJWTCommand) run(ctx context.Context, _ *commoncli.Env, client *workloadClient) error {
 	if len(c.audience) == 0 {
 		return errors.New("audience must be specified")
 	}
@@ -48,15 +49,14 @@ func (c *fetchJWTCommand) run(ctx context.Context, env *common_cli.Env, client *
 		return err
 	}
 
-	c.printer.MustPrintProto(svidResp, bundlesResp)
-	return nil
+	return c.printer.PrintProto(svidResp, bundlesResp)
 }
 
 func (c *fetchJWTCommand) appendFlags(fs *flag.FlagSet) {
 	fs.Var(&c.audience, "audience", "comma separated list of audience values")
 	fs.StringVar(&c.spiffeID, "spiffeID", "", "SPIFFE ID subject (optional)")
-
-	cliprinter.AppendFlagWithCustomPretty(&c.printer, fs, printPrettyResult)
+	outputValue := cliprinter.AppendFlagWithCustomPretty(&c.printer, fs, c.env, printPrettyResult)
+	fs.Var(outputValue, "format", "deprecated; use -output")
 }
 
 func (c *fetchJWTCommand) fetchJWTSVID(ctx context.Context, client *workloadClient) (*workload.JWTSVIDResponse, error) {
@@ -78,27 +78,28 @@ func (c *fetchJWTCommand) fetchJWTBundles(ctx context.Context, client *workloadC
 	return stream.Recv()
 }
 
-func printPrettyResult(results ...interface{}) error {
-	errMsg := "internal error: cli printer; please report this bug"
-
+func printPrettyResult(env *commoncli.Env, results ...any) error {
 	svidResp, ok := results[0].(*workload.JWTSVIDResponse)
 	if !ok {
-		fmt.Println(errMsg)
-		return errors.New(errMsg)
+		env.Println(cliprinter.ErrInternalCustomPrettyFunc.Error())
+		return cliprinter.ErrInternalCustomPrettyFunc
 	}
 
 	bundlesResp, ok := results[1].(*workload.JWTBundlesResponse)
 	if !ok {
-		fmt.Println(errMsg)
-		return errors.New(errMsg)
+		env.Println(cliprinter.ErrInternalCustomPrettyFunc.Error())
+		return cliprinter.ErrInternalCustomPrettyFunc
 	}
 
 	for _, svid := range svidResp.Svids {
-		fmt.Printf("token(%s):\n\t%s\n", svid.SpiffeId, svid.Svid)
+		env.Printf("token(%s):\n\t%s\n", svid.SpiffeId, svid.Svid)
+		if svid.Hint != "" {
+			env.Printf("hint(%s):\n\t%s\n", svid.SpiffeId, svid.Hint)
+		}
 	}
 
 	for trustDomainID, jwksJSON := range bundlesResp.Bundles {
-		fmt.Printf("bundle(%s):\n\t%s\n", trustDomainID, string(jwksJSON))
+		env.Printf("bundle(%s):\n\t%s\n", trustDomainID, string(jwksJSON))
 	}
 
 	return nil

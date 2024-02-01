@@ -14,6 +14,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-jose/go-jose/v3"
+	"github.com/go-jose/go-jose/v3/cryptosigner"
+	"github.com/go-jose/go-jose/v3/jwt"
 	"github.com/spiffe/go-spiffe/v2/bundle/jwtbundle"
 	"github.com/spiffe/go-spiffe/v2/bundle/spiffebundle"
 	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
@@ -21,11 +24,9 @@ import (
 	"github.com/spiffe/go-spiffe/v2/svid/jwtsvid"
 	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 	"github.com/spiffe/spire/pkg/common/util"
+	"github.com/spiffe/spire/pkg/common/x509util"
 	"github.com/spiffe/spire/test/testkey"
 	"github.com/stretchr/testify/require"
-	"gopkg.in/square/go-jose.v2"
-	"gopkg.in/square/go-jose.v2/cryptosigner"
-	"gopkg.in/square/go-jose.v2/jwt"
 )
 
 var (
@@ -164,6 +165,7 @@ func CreateCACertificate(tb testing.TB, parent *x509.Certificate, parentKey cryp
 	now := time.Now()
 	serial := newSerial(tb)
 	key := testkey.NewEC256(tb)
+	ski, _ := x509util.GetSubjectKeyID(key.Public())
 	tmpl := &x509.Certificate{
 		SerialNumber: serial,
 		Subject: pkix.Name{
@@ -173,6 +175,7 @@ func CreateCACertificate(tb testing.TB, parent *x509.Certificate, parentKey cryp
 		IsCA:                  true,
 		NotBefore:             now,
 		NotAfter:              now.Add(time.Hour),
+		SubjectKeyId:          ski,
 	}
 
 	applyOptions(tmpl, options...)
@@ -216,7 +219,7 @@ func CreateX509SVID(tb testing.TB, parent *x509.Certificate, parentKey crypto.Si
 	return CreateX509Certificate(tb, parent, parentKey, options...)
 }
 
-func CreateCertificate(tb testing.TB, tmpl, parent *x509.Certificate, pub, priv interface{}) *x509.Certificate {
+func CreateCertificate(tb testing.TB, tmpl, parent *x509.Certificate, pub, priv any) *x509.Certificate {
 	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, parent, pub, priv)
 	require.NoError(tb, err)
 	cert, err := x509.ParseCertificate(certDER)

@@ -1,5 +1,4 @@
 //go:build windows
-// +build windows
 
 package run
 
@@ -10,7 +9,7 @@ import (
 
 	"github.com/spiffe/spire/cmd/spire-agent/cli/common"
 	"github.com/spiffe/spire/pkg/agent"
-	"github.com/spiffe/spire/pkg/common/util"
+	"github.com/spiffe/spire/pkg/common/namedpipe"
 )
 
 func (c *agentConfig) addOSFlags(flags *flag.FlagSet) {
@@ -22,11 +21,11 @@ func (c *agentConfig) setPlatformDefaults() {
 }
 
 func (c *agentConfig) getAddr() (net.Addr, error) {
-	return util.GetNamedPipeAddr(c.Experimental.NamedPipeName), nil
+	return namedpipe.AddrFromName(c.Experimental.NamedPipeName), nil
 }
 
 func (c *agentConfig) getAdminAddr() (net.Addr, error) {
-	return util.GetNamedPipeAddr(c.Experimental.AdminNamedPipeName), nil
+	return namedpipe.AddrFromName(c.Experimental.AdminNamedPipeName), nil
 }
 
 func (c *agentConfig) hasAdminAddr() bool {
@@ -44,7 +43,7 @@ func (c *agentConfig) validateOS() error {
 	return nil
 }
 
-func prepareEndpoints(c *agent.Config) error {
+func prepareEndpoints(*agent.Config) error {
 	// Nothing to do in this platform
 	return nil
 }

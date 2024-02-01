@@ -52,11 +52,11 @@ func TestAttestor(t *testing.T) {
 	agentCert := createAgentCertificate(t, caCert, agentKey, "/test/foo")
 	expiredCert := createExpiredCertificate(t, caCert, agentKey)
 	bundle := &types.Bundle{
-		TrustDomain:     trustDomain.String(),
+		TrustDomain:     trustDomain.Name(),
 		X509Authorities: []*types.X509Certificate{{Asn1: caCert.Raw}},
 	}
 	svid := &types.X509SVID{
-		Id:        &types.SPIFFEID{TrustDomain: trustDomain.String(), Path: "/test/foo"},
+		Id:        &types.SPIFFEID{TrustDomain: trustDomain.Name(), Path: "/test/foo"},
 		CertChain: [][]byte{agentCert.Raw},
 	}
 
@@ -76,6 +76,7 @@ func TestAttestor(t *testing.T) {
 		insecureBootstrap           bool
 		cachedBundle                *x509.Certificate
 		cachedSVID                  *x509.Certificate
+		cachedReattestable          bool
 		err                         string
 		keepAgentKey                bool
 		failFetchingAttestationData bool
@@ -156,6 +157,17 @@ func TestAttestor(t *testing.T) {
 			},
 		},
 		{
+			name:            "success with bootstrap bundle and reattestable",
+			bootstrapBundle: caCert,
+			agentService: &fakeAgentService{
+				svid:         svid,
+				reattestable: true,
+			},
+			bundleService: &fakeBundleService{
+				bundle: bundle,
+			},
+		},
+		{
 			name:         "success with cached bundle",
 			cachedBundle: caCert,
 			agentService: &fakeAgentService{
@@ -181,7 +193,7 @@ func TestAttestor(t *testing.T) {
 			bootstrapBundle: caCert,
 			agentService: &fakeAgentService{
 				svid: &types.X509SVID{
-					Id:        &types.SPIFFEID{TrustDomain: trustDomain.String(), Path: "/join_token/JOINTOKEN"},
+					Id:        &types.SPIFFEID{TrustDomain: trustDomain.Name(), Path: "/join_token/JOINTOKEN"},
 					CertChain: [][]byte{createAgentCertificate(t, caCert, agentKey, "/join_token/JOINTOKEN").Raw},
 				},
 				joinToken: "JOINTOKEN",
@@ -228,6 +240,21 @@ func TestAttestor(t *testing.T) {
 			},
 		},
 		{
+			name:               "success with cached svid, private key, bundle, and reattestable",
+			cachedBundle:       caCert,
+			cachedSVID:         agentCert,
+			cachedReattestable: true,
+			keepAgentKey:       true,
+			agentService: &fakeAgentService{
+				svid:            svid,
+				reattestable:    true,
+				failAttestAgent: true,
+			},
+			bundleService: &fakeBundleService{
+				bundle: bundle,
+			},
+		},
+		{
 			name:            "missing key in keymanager ignored",
 			bootstrapBundle: caCert,
 			cachedSVID:      agentCert,
@@ -260,7 +287,7 @@ func TestAttestor(t *testing.T) {
 			require := require.New(t)
 
 			// prepare the temp directory holding the cached bundle/svid
-			sto := prepareTestDir(t, testCase.cachedSVID, testCase.cachedBundle)
+			sto := prepareTestDir(t, testCase.cachedSVID, testCase.cachedBundle, testCase.cachedReattestable)
 
 			// load up the fake agent-side node attestor
 			agentNA := fakeagentnodeattestor.New(t, fakeagentnodeattestor.Config{
@@ -301,6 +328,7 @@ func TestAttestor(t *testing.T) {
 				TrustBundle:       makeTrustBundle(testCase.bootstrapBundle),
 				InsecureBootstrap: testCase.insecureBootstrap,
 				ServerAddress:     listener.Addr().String(),
+				NodeAttestor:      agentNA,
 			})
 
 			// perform attestation
@@ -321,20 +349,22 @@ func TestAttestor(t *testing.T) {
 			require.NotNil(result.Key)
 			require.NotNil(result.Bundle)
 
-			rootCAs := result.Bundle.RootCAs()
+			rootCAs := result.Bundle.X509Authorities()
 			require.Len(rootCAs, 1)
 			require.Equal(rootCAs[0].Raw, caCert.Raw)
+			require.Equal(result.Reattestable, testCase.agentService.reattestable)
 		})
 	}
 }
 
 type fakeAgentService struct {
+	agentv1.AgentServer
+
 	failAttestAgent    bool
 	challengeResponses []string
 	joinToken          string
 	svid               *types.X509SVID
-
-	agentv1.AgentServer
+	reattestable       bool
 }
 
 func (s *fakeAgentService) AttestAgent(stream agentv1.Agent_AttestAgentServer) error {
@@ -373,7 +403,8 @@ func (s *fakeAgentService) AttestAgent(stream agentv1.Agent_AttestAgentServer) e
 	return stream.Send(&agentv1.AttestAgentResponse{
 		Step: &agentv1.AttestAgentResponse_Result_{
 			Result: &agentv1.AttestAgentResponse_Result{
-				Svid: s.svid,
+				Svid:         s.svid,
+				Reattestable: s.reattestable,
 			},
 		},
 	})
@@ -386,7 +417,7 @@ type fakeBundleService struct {
 	bundlev1.BundleServer
 }
 
-func (c *fakeBundleService) GetBundle(ctx context.Context, in *bundlev1.GetBundleRequest) (*types.Bundle, error) {
+func (c *fakeBundleService) GetBundle(context.Context, *bundlev1.GetBundleRequest) (*types.Bundle, error) {
 	if c.getBundleErr != nil {
 		return nil, c.getBundleErr
 	}
@@ -394,14 +425,14 @@ func (c *fakeBundleService) GetBundle(ctx context.Context, in *bundlev1.GetBundl
 	return c.bundle, nil
 }
 
-func prepareTestDir(t *testing.T, cachedSVID, cachedBundle *x509.Certificate) storage.Storage {
+func prepareTestDir(t *testing.T, cachedSVID, cachedBundle *x509.Certificate, cachedReattestable bool) storage.Storage {
 	dir := spiretest.TempDir(t)
 
 	sto, err := storage.Open(dir)
 	require.NoError(t, err)
 
 	if cachedSVID != nil {
-		require.NoError(t, sto.StoreSVID([]*x509.Certificate{cachedSVID}))
+		require.NoError(t, sto.StoreSVID([]*x509.Certificate{cachedSVID}, cachedReattestable))
 	}
 	if cachedBundle != nil {
 		require.NoError(t, sto.StoreBundle([]*x509.Certificate{cachedBundle}))

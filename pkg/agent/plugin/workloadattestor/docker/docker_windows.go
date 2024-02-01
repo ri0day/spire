@@ -1,11 +1,10 @@
 //go:build windows
-// +build windows
 
 package docker
 
 import (
 	hclog "github.com/hashicorp/go-hclog"
-	"github.com/spiffe/spire/pkg/agent/plugin/workloadattestor/docker/process"
+	"github.com/spiffe/spire/pkg/common/container/process"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -15,7 +14,7 @@ type OSConfig struct {
 	DockerHost string `hcl:"docker_host" json:"docker_host"`
 }
 
-func createHelper(c *dockerPluginConfig) (*containerHelper, error) {
+func createHelper(*dockerPluginConfig) (*containerHelper, error) {
 	return &containerHelper{
 		ph: process.CreateHelper(),
 	}, nil

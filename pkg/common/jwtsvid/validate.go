@@ -7,10 +7,10 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/go-jose/go-jose/v3"
+	"github.com/go-jose/go-jose/v3/jwt"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/zeebo/errs"
-	"gopkg.in/square/go-jose.v2"
-	"gopkg.in/square/go-jose.v2/jwt"
 )
 
 type KeyStore interface {
@@ -27,7 +27,7 @@ func NewKeyStore(trustDomainKeys map[spiffeid.TrustDomain]map[string]crypto.Publ
 	}
 }
 
-func (t *keyStore) FindPublicKey(ctx context.Context, td spiffeid.TrustDomain, keyID string) (crypto.PublicKey, error) {
+func (t *keyStore) FindPublicKey(_ context.Context, td spiffeid.TrustDomain, keyID string) (crypto.PublicKey, error) {
 	publicKeys, ok := t.trustDomainKeys[td]
 	if !ok {
 		return nil, fmt.Errorf("no keys found for trust domain %q", td)
@@ -39,7 +39,7 @@ func (t *keyStore) FindPublicKey(ctx context.Context, td spiffeid.TrustDomain, k
 	return publicKey, nil
 }
 
-func ValidateToken(ctx context.Context, token string, keyStore KeyStore, audience []string) (spiffeid.ID, map[string]interface{}, error) {
+func ValidateToken(ctx context.Context, token string, keyStore KeyStore, audience []string) (spiffeid.ID, map[string]any, error) {
 	tok, err := jwt.ParseSigned(token)
 	if err != nil {
 		return spiffeid.ID{}, nil, errs.New("unable to parse JWT token")
@@ -87,7 +87,7 @@ func ValidateToken(ctx context.Context, token string, keyStore KeyStore, audienc
 	}
 
 	// Now obtain the generic claims map verified using the obtained key
-	claimsMap := make(map[string]interface{})
+	claimsMap := make(map[string]any)
 	if err := tok.Claims(key, &claimsMap); err != nil {
 		return spiffeid.ID{}, nil, errs.Wrap(err)
 	}

@@ -23,7 +23,7 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// newServerClient creates a new spire-sever client
+// newServerClient creates a new spire-server client
 func newServerClient(serverID spiffeid.ID, serverAddr string, workloadAPIAddr net.Addr, log hclog.Logger) *serverClient {
 	return &serverClient{
 		serverID:        serverID,
@@ -157,18 +157,18 @@ type logAdapter struct {
 	log hclog.Logger
 }
 
-func (l *logAdapter) Debugf(format string, args ...interface{}) {
+func (l *logAdapter) Debugf(format string, args ...any) {
 	l.log.Debug(fmt.Sprintf(format, args...))
 }
 
-func (l *logAdapter) Infof(format string, args ...interface{}) {
+func (l *logAdapter) Infof(format string, args ...any) {
 	l.log.Info(fmt.Sprintf(format, args...))
 }
 
-func (l *logAdapter) Warnf(format string, args ...interface{}) {
+func (l *logAdapter) Warnf(format string, args ...any) {
 	l.log.Warn(fmt.Sprintf(format, args...))
 }
 
-func (l *logAdapter) Errorf(format string, args ...interface{}) {
+func (l *logAdapter) Errorf(format string, args ...any) {
 	l.log.Error(fmt.Sprintf(format, args...))
 }

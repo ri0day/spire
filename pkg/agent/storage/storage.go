@@ -5,12 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"sync"
-	"time"
 
 	"github.com/spiffe/spire/pkg/common/diskutil"
 	"github.com/spiffe/spire/pkg/common/pemutil"
@@ -23,15 +21,15 @@ var (
 type Storage interface {
 	// LoadSVID loads the SVID from storage. Returns ErrNotCached if the SVID
 	// does not exist in the cache.
-	LoadSVID() ([]*x509.Certificate, error)
+	LoadSVID() ([]*x509.Certificate, bool, error)
 
 	// StoreSVID stores the SVID.
-	StoreSVID(certs []*x509.Certificate) error
+	StoreSVID(certs []*x509.Certificate, reattestable bool) error
 
 	// DeleteSVID deletes the SVID.
 	DeleteSVID() error
 
-	// LoadBundle loads the SVID from storage. Returns ErrNotCached if the
+	// LoadBundle loads the bundle from storage. Returns ErrNotCached if the
 	// bundle does not exist in the cache.
 	LoadBundle() ([]*x509.Certificate, error)
 
@@ -40,40 +38,17 @@ type Storage interface {
 }
 
 func Open(dir string) (Storage, error) {
-	// TODO: stop updating and instead delete legacy files in 1.5.0
-
-	legacySVID, legacySVIDTime, err := loadLegacySVID(dir)
+	data, err := loadData(dir)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return nil, err
 	}
 
-	legacyBundle, legacyBundleTime, err := loadLegacyBundle(dir)
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return nil, err
-	}
-
-	data, dataTime, err := loadData(dir)
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return nil, err
-	}
-
-	storeNow := false
-
-	if !legacySVIDTime.IsZero() && (dataTime.IsZero() || dataTime.Before(legacySVIDTime)) {
-		storeNow = true
-		data.SVID = legacySVID
-	}
-
-	if !legacyBundleTime.IsZero() && (dataTime.IsZero() || dataTime.Before(legacyBundleTime)) {
-		storeNow = true
-		data.Bundle = legacyBundle
-	}
-
-	if storeNow {
-		if err := storeData(dir, data); err != nil {
-			return nil, err
-		}
-	}
+	// TODO: Can be removed after 1.10 release
+	// No point in checking for errors here, we're just
+	// trying to clean up some files that we will no longer
+	// use.
+	os.Remove(legacySVIDPath(dir))
+	os.Remove(legacyBundlePath(dir))
 
 	return &storage{
 		dir:  dir,
@@ -102,10 +77,6 @@ func (s *storage) StoreBundle(bundle []*x509.Certificate) error {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
-	if err := storeLegacyBundle(s.dir, bundle); err != nil {
-		return err
-	}
-
 	data := s.data
 	data.Bundle = bundle
 
@@ -117,26 +88,23 @@ func (s *storage) StoreBundle(bundle []*x509.Certificate) error {
 	return nil
 }
 
-func (s *storage) LoadSVID() ([]*x509.Certificate, error) {
+func (s *storage) LoadSVID() ([]*x509.Certificate, bool, error) {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
 
 	if len(s.data.SVID) == 0 {
-		return nil, ErrNotCached
+		return nil, false, ErrNotCached
 	}
-	return s.data.SVID, nil
+	return s.data.SVID, s.data.Reattestable, nil
 }
 
-func (s *storage) StoreSVID(svid []*x509.Certificate) error {
+func (s *storage) StoreSVID(svid []*x509.Certificate, reattestable bool) error {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
-	if err := storeLegacySVID(s.dir, svid); err != nil {
-		return err
-	}
-
 	data := s.data
 	data.SVID = svid
+	data.Reattestable = reattestable
 
 	if err := storeData(s.dir, data); err != nil {
 		return err
@@ -150,12 +118,9 @@ func (s *storage) DeleteSVID() error {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
-	if err := deleteLegacySVID(s.dir); err != nil {
-		return err
-	}
-
 	data := s.data
 	data.SVID = nil
+	data.Reattestable = false
 	if err := storeData(s.dir, data); err != nil {
 		return err
 	}
@@ -164,36 +129,16 @@ func (s *storage) DeleteSVID() error {
 	return nil
 }
 
-func readFile(path string) ([]byte, time.Time, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, time.Time{}, fmt.Errorf("failed to open file: %w", err)
-	}
-	defer func() {
-		_ = f.Close()
-	}()
-	fi, err := f.Stat()
-	if err != nil {
-		return nil, time.Time{}, fmt.Errorf("failed to stat file: %w", err)
-	}
-	data, err := io.ReadAll(f)
-	if err != nil {
-		return nil, time.Time{}, fmt.Errorf("failed to read file: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		return nil, time.Time{}, fmt.Errorf("failed to close file: %w", err)
-	}
-	return data, fi.ModTime(), nil
-}
-
 type storageJSON struct {
-	SVID   [][]byte `json:"svid"`
-	Bundle [][]byte `json:"bundle"`
+	SVID         [][]byte `json:"svid"`
+	Bundle       [][]byte `json:"bundle"`
+	Reattestable bool     `json:"reattestable"`
 }
 
 type storageData struct {
-	SVID   []*x509.Certificate
-	Bundle []*x509.Certificate
+	SVID         []*x509.Certificate
+	Bundle       []*x509.Certificate
+	Reattestable bool
 }
 
 func (d storageData) MarshalJSON() ([]byte, error) {
@@ -206,8 +151,9 @@ func (d storageData) MarshalJSON() ([]byte, error) {
 		return nil, fmt.Errorf("failed to encode bundle: %w", err)
 	}
 	return json.Marshal(storageJSON{
-		SVID:   svid,
-		Bundle: bundle,
+		SVID:         svid,
+		Bundle:       bundle,
+		Reattestable: d.Reattestable,
 	})
 }
 
@@ -227,6 +173,7 @@ func (d *storageData) UnmarshalJSON(b []byte) error {
 
 	d.SVID = svid
 	d.Bundle = bundle
+	d.Reattestable = j.Reattestable
 	return nil
 }
 
@@ -238,27 +185,27 @@ func storeData(dir string, data storageData) error {
 		return fmt.Errorf("failed to marshal data: %w", err)
 	}
 
-	if err := diskutil.AtomicWriteFile(path, marshaled, 0600); err != nil {
+	if err := diskutil.AtomicWritePrivateFile(path, marshaled); err != nil {
 		return fmt.Errorf("failed to write data file: %w", err)
 	}
 
 	return nil
 }
 
-func loadData(dir string) (storageData, time.Time, error) {
+func loadData(dir string) (storageData, error) {
 	path := dataPath(dir)
 
-	marshaled, mtime, err := readFile(path)
+	marshaled, err := os.ReadFile(path)
 	if err != nil {
-		return storageData{}, time.Time{}, fmt.Errorf("failed to read data: %w", err)
+		return storageData{}, fmt.Errorf("failed to read data: %w", err)
 	}
 
 	var data storageData
 	if err := json.Unmarshal(marshaled, &data); err != nil {
-		return storageData{}, time.Time{}, fmt.Errorf("failed to unmarshal data: %w", err)
+		return storageData{}, fmt.Errorf("failed to unmarshal data: %w", err)
 	}
 
-	return data, mtime, nil
+	return data, nil
 }
 
 func parseCertificates(certsPEM [][]byte) ([]*x509.Certificate, error) {
@@ -286,4 +233,12 @@ func encodeCertificates(certs []*x509.Certificate) ([][]byte, error) {
 
 func dataPath(dir string) string {
 	return filepath.Join(dir, "agent-data.json")
+}
+
+func legacyBundlePath(dir string) string {
+	return filepath.Join(dir, "bundle.der")
+}
+
+func legacySVIDPath(dir string) string {
+	return filepath.Join(dir, "agent_svid.der")
 }

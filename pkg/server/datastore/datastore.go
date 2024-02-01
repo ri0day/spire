@@ -2,6 +2,7 @@ package datastore
 
 import (
 	"context"
+	"crypto"
 	"net/url"
 	"time"
 
@@ -23,6 +24,12 @@ type DataStore interface {
 	SetBundle(context.Context, *common.Bundle) (*common.Bundle, error)
 	UpdateBundle(context.Context, *common.Bundle, *common.BundleMask) (*common.Bundle, error)
 
+	// Keys
+	TaintX509CA(ctx context.Context, trustDomainID string, publicKeyToTaint crypto.PublicKey) error
+	RevokeX509CA(ctx context.Context, trustDomainID string, publicKeyToRevoke crypto.PublicKey) error
+	TaintJWTKey(ctx context.Context, trustDomainID string, authorityID string) (*common.PublicKey, error)
+	RevokeJWTKey(ctx context.Context, trustDomainID string, authorityID string) (*common.PublicKey, error)
+
 	// Entries
 	CountRegistrationEntries(context.Context) (int32, error)
 	CreateRegistrationEntry(context.Context, *common.RegistrationEntry) (*common.RegistrationEntry, error)
@@ -33,6 +40,11 @@ type DataStore interface {
 	PruneRegistrationEntries(ctx context.Context, expiresBefore time.Time) error
 	UpdateRegistrationEntry(context.Context, *common.RegistrationEntry, *common.RegistrationEntryMask) (*common.RegistrationEntry, error)
 
+	// Entries Events
+	ListRegistrationEntriesEvents(ctx context.Context, req *ListRegistrationEntriesEventsRequest) (*ListRegistrationEntriesEventsResponse, error)
+	PruneRegistrationEntriesEvents(ctx context.Context, olderThan time.Duration) error
+	GetLatestRegistrationEntryEventID(ctx context.Context) (uint, error)
+
 	// Nodes
 	CountAttestedNodes(context.Context) (int32, error)
 	CreateAttestedNode(context.Context, *common.AttestedNode) (*common.AttestedNode, error)
@@ -40,6 +52,11 @@ type DataStore interface {
 	FetchAttestedNode(ctx context.Context, spiffeID string) (*common.AttestedNode, error)
 	ListAttestedNodes(context.Context, *ListAttestedNodesRequest) (*ListAttestedNodesResponse, error)
 	UpdateAttestedNode(context.Context, *common.AttestedNode, *common.AttestedNodeMask) (*common.AttestedNode, error)
+
+	// Nodes Events
+	ListAttestedNodesEvents(ctx context.Context, req *ListAttestedNodesEventsRequest) (*ListAttestedNodesEventsResponse, error)
+	PruneAttestedNodesEvents(ctx context.Context, olderThan time.Duration) error
+	GetLatestAttestedNodeEventID(ctx context.Context) (uint, error)
 
 	// Node selectors
 	GetNodeSelectors(ctx context.Context, spiffeID string, dataConsistency DataConsistency) ([]*common.Selector, error)
@@ -58,6 +75,12 @@ type DataStore interface {
 	ListFederationRelationships(context.Context, *ListFederationRelationshipsRequest) (*ListFederationRelationshipsResponse, error)
 	DeleteFederationRelationship(context.Context, spiffeid.TrustDomain) error
 	UpdateFederationRelationship(context.Context, *FederationRelationship, *types.FederationRelationshipMask) (*FederationRelationship, error)
+
+	// CA Journals
+	SetCAJournal(ctx context.Context, caJournal *CAJournal) (*CAJournal, error)
+	FetchCAJournal(ctx context.Context, activeX509AuthorityID string) (*CAJournal, error)
+	PruneCAJournals(ctx context.Context, allCAsExpireBefore int64) error
+	ListCAJournalsForTesting(ctx context.Context) ([]*CAJournal, error)
 }
 
 // DataConsistency indicates the required data consistency for a read operation.
@@ -143,6 +166,20 @@ type ListAttestedNodesResponse struct {
 	Pagination *Pagination
 }
 
+type ListAttestedNodesEventsRequest struct {
+	GreaterThanEventID uint
+}
+
+type AttestedNodeEvent struct {
+	EventID  uint
+	SpiffeID string
+}
+
+type ListAttestedNodesEventsResponse struct {
+	Events       []AttestedNodeEvent
+	FirstEventID uint
+}
+
 type ListBundlesRequest struct {
 	Pagination *Pagination
 }
@@ -168,11 +205,32 @@ type ListRegistrationEntriesRequest struct {
 	BySpiffeID      string
 	Pagination      *Pagination
 	ByFederatesWith *ByFederatesWith
+	ByHint          string
+}
+
+type CAJournal struct {
+	ID                    uint
+	Data                  []byte
+	ActiveX509AuthorityID string
 }
 
 type ListRegistrationEntriesResponse struct {
 	Entries    []*common.RegistrationEntry
 	Pagination *Pagination
+}
+
+type ListRegistrationEntriesEventsRequest struct {
+	GreaterThanEventID uint
+}
+
+type RegistrationEntryEvent struct {
+	EventID uint
+	EntryID string
+}
+
+type ListRegistrationEntriesEventsResponse struct {
+	Events       []RegistrationEntryEvent
+	FirstEventID uint
 }
 
 type ListFederationRelationshipsRequest struct {

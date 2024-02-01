@@ -32,7 +32,7 @@ type cacheEntry struct {
 	client Client
 }
 
-type newClientCallback func(ctx context.Context, config *SessionConfig, region string, asssumeRoleARN string) (Client, error)
+type newClientCallback func(ctx context.Context, config *SessionConfig, region string, assumeRoleARN string) (Client, error)
 
 func newClientsCache(newClient newClientCallback) *clientsCache {
 	return &clientsCache{
@@ -76,12 +76,12 @@ func (cc *clientsCache) getClient(ctx context.Context, region, accountID string)
 		return nil, status.Error(codes.FailedPrecondition, "not configured")
 	}
 
-	var asssumeRoleArn string
+	var assumeRoleArn string
 	if cc.config.AssumeRole != "" {
-		asssumeRoleArn = fmt.Sprintf("arn:aws:iam::%s:role/%s", accountID, cc.config.AssumeRole)
+		assumeRoleArn = fmt.Sprintf("arn:%s:iam::%s:role/%s", cc.config.Partition, accountID, cc.config.AssumeRole)
 	}
 
-	client, err := cc.newClient(ctx, cc.config, region, asssumeRoleArn)
+	client, err := cc.newClient(ctx, cc.config, region, assumeRoleArn)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to create client: %v", err)
 	}
@@ -103,8 +103,8 @@ func (cc *clientsCache) getCachedClient(cacheKey string) *cacheEntry {
 	return r
 }
 
-func newClient(ctx context.Context, config *SessionConfig, region string, asssumeRoleARN string) (Client, error) {
-	conf, err := newAWSConfig(ctx, config.AccessKeyID, config.SecretAccessKey, region, asssumeRoleARN)
+func newClient(ctx context.Context, config *SessionConfig, region string, assumeRoleARN string) (Client, error) {
+	conf, err := newAWSConfig(ctx, config.AccessKeyID, config.SecretAccessKey, region, assumeRoleARN)
 	if err != nil {
 		return nil, err
 	}

@@ -6,10 +6,13 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"testing"
 	"time"
 
@@ -19,6 +22,7 @@ import (
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/iam"
 	iamtypes "github.com/aws/aws-sdk-go-v2/service/iam/types"
+	"github.com/fullsailor/pkcs7"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
@@ -43,19 +47,26 @@ const (
 )
 
 var (
-	testAWSCAKey       = testkey.MustRSA2048()
-	testInstance       = "test-instance"
-	testAccount        = "test-account"
-	testRegion         = "test-region"
-	testProfile        = "test-profile"
-	zeroDeviceIndex    = int32(0)
-	nonzeroDeviceIndex = int32(1)
-	instanceStoreType  = ec2types.DeviceTypeInstanceStore
-	ebsType            = ec2types.DeviceTypeEbs
+	testAWSCAKey         = testkey.MustRSA2048()
+	testInstance         = "test-instance"
+	testAccount          = "test-account"
+	testRegion           = "test-region"
+	testAvailabilityZone = "test-az"
+	testImageID          = "test-image-id"
+	testProfile          = "test-profile"
+	zeroDeviceIndex      = int32(0)
+	nonzeroDeviceIndex   = int32(1)
+	instanceStoreType    = ec2types.DeviceTypeInstanceStore
+	ebsType              = ec2types.DeviceTypeEbs
+	testAWSCACert        *x509.Certificate
+	otherAWSCACert       *x509.Certificate
 )
 
 func TestAttest(t *testing.T) {
-	defaultAttestationData := buildAttestationData(t)
+	testAWSCACert = generateCertificate(t, testAWSCAKey)
+	otherAWSCACert = generateCertificate(t, testkey.MustRSA2048())
+	defaultAttestationData := buildAttestationDataRSA2048Signature(t)
+	attentionDataWithRSA1024Signature := buildAttestationDataRSA1024Signature(t)
 
 	for _, tt := range []struct {
 		name                           string
@@ -73,6 +84,7 @@ func TestAttest(t *testing.T) {
 		expectMsgPrefix                string
 		expectID                       string
 		expectSelectors                []*common.Selector
+		overrideCACert                 *x509.Certificate
 	}{
 		{
 			name:            "plugin not configured",
@@ -95,20 +107,21 @@ func TestAttest(t *testing.T) {
 		{
 			name: "missing signature",
 			overrideAttestationData: func(data caws.IIDAttestationData) caws.IIDAttestationData {
+				data.SignatureRSA2048 = ""
 				data.Signature = ""
 				return data
 			},
 			expectCode:      codes.InvalidArgument,
-			expectMsgPrefix: "nodeattestor(aws_iid): failed to verify the cryptographic signature",
+			expectMsgPrefix: "nodeattestor(aws_iid): instance identity cryptographic signature is required",
 		},
 		{
 			name: "bad signature",
 			overrideAttestationData: func(data caws.IIDAttestationData) caws.IIDAttestationData {
-				data.Signature = "bad signature"
+				data.SignatureRSA2048 = "bad signature"
 				return data
 			},
 			expectCode:      codes.InvalidArgument,
-			expectMsgPrefix: "nodeattestor(aws_iid): failed to decode the IID signature",
+			expectMsgPrefix: "nodeattestor(aws_iid): failed to parse the instance identity cryptographic signature",
 		},
 		{
 			name:            "already attested",
@@ -139,8 +152,35 @@ func TestAttest(t *testing.T) {
 			expectMsgPrefix: "nodeattestor(aws_iid): failed to query AWS via describe-instances: returned no instances",
 		},
 		{
+			name:            "signature verification fails using AWS CA cert from other region",
+			expectCode:      codes.InvalidArgument,
+			expectMsgPrefix: "nodeattestor(aws_iid): failed verification of instance identity cryptographic signature",
+			overrideCACert:  otherAWSCACert,
+		},
+		{
 			name:     "success with zero device index",
 			expectID: "spiffe://example.org/spire/agent/aws_iid/test-account/test-region/test-instance",
+			expectSelectors: []*common.Selector{
+				{Type: caws.PluginName, Value: "az:test-az"},
+				{Type: caws.PluginName, Value: "image:id:test-image-id"},
+				{Type: caws.PluginName, Value: "instance:id:test-instance"},
+				{Type: caws.PluginName, Value: "region:test-region"},
+			},
+		},
+		{
+			name: "success with RSA-1024 signature",
+			overrideAttestationData: func(data caws.IIDAttestationData) caws.IIDAttestationData {
+				data.SignatureRSA2048 = ""
+				data.Signature = attentionDataWithRSA1024Signature.Signature
+				return data
+			},
+			expectID: "spiffe://example.org/spire/agent/aws_iid/test-account/test-region/test-instance",
+			expectSelectors: []*common.Selector{
+				{Type: caws.PluginName, Value: "az:test-az"},
+				{Type: caws.PluginName, Value: "image:id:test-image-id"},
+				{Type: caws.PluginName, Value: "instance:id:test-instance"},
+				{Type: caws.PluginName, Value: "region:test-region"},
+			},
 		},
 		{
 			name:   "success with non-zero device index when check is disabled",
@@ -149,6 +189,12 @@ func TestAttest(t *testing.T) {
 				output.Reservations[0].Instances[0].NetworkInterfaces[0].Attachment.DeviceIndex = &nonzeroDeviceIndex
 			},
 			expectID: "spiffe://example.org/spire/agent/aws_iid/test-account/test-region/test-instance",
+			expectSelectors: []*common.Selector{
+				{Type: caws.PluginName, Value: "az:test-az"},
+				{Type: caws.PluginName, Value: "image:id:test-image-id"},
+				{Type: caws.PluginName, Value: "instance:id:test-instance"},
+				{Type: caws.PluginName, Value: "region:test-region"},
+			},
 		},
 		{
 			name:   "success with non-zero device index when local account is allow-listed",
@@ -157,6 +203,12 @@ func TestAttest(t *testing.T) {
 				output.Reservations[0].Instances[0].NetworkInterfaces[0].Attachment.DeviceIndex = &nonzeroDeviceIndex
 			},
 			expectID: "spiffe://example.org/spire/agent/aws_iid/test-account/test-region/test-instance",
+			expectSelectors: []*common.Selector{
+				{Type: caws.PluginName, Value: "az:test-az"},
+				{Type: caws.PluginName, Value: "image:id:test-image-id"},
+				{Type: caws.PluginName, Value: "instance:id:test-instance"},
+				{Type: caws.PluginName, Value: "region:test-region"},
+			},
 		},
 		{
 			name: "block device anti-tampering check rejects non-zero network device index",
@@ -215,11 +267,23 @@ func TestAttest(t *testing.T) {
 				output.Reservations[0].Instances[0].NetworkInterfaces[0].Attachment.AttachTime = aws.Time(interfaceAttachTime)
 			},
 			expectID: "spiffe://example.org/spire/agent/aws_iid/test-account/test-region/test-instance",
+			expectSelectors: []*common.Selector{
+				{Type: caws.PluginName, Value: "az:test-az"},
+				{Type: caws.PluginName, Value: "image:id:test-image-id"},
+				{Type: caws.PluginName, Value: "instance:id:test-instance"},
+				{Type: caws.PluginName, Value: "region:test-region"},
+			},
 		},
 		{
 			name:     "success with agent_path_template",
 			config:   `agent_path_template = "/{{ .PluginName }}/custom/{{ .AccountID }}/{{ .Region }}/{{ .InstanceID }}"`,
 			expectID: "spiffe://example.org/spire/agent/aws_iid/custom/test-account/test-region/test-instance",
+			expectSelectors: []*common.Selector{
+				{Type: caws.PluginName, Value: "az:test-az"},
+				{Type: caws.PluginName, Value: "image:id:test-image-id"},
+				{Type: caws.PluginName, Value: "instance:id:test-instance"},
+				{Type: caws.PluginName, Value: "region:test-region"},
+			},
 		},
 		{
 			name: "success with tags in template",
@@ -231,9 +295,15 @@ func TestAttest(t *testing.T) {
 					},
 				}
 			},
-			config:          `agent_path_template = "/{{ .PluginName }}/zone1/{{ .Tags.Hostname }}"`,
-			expectID:        "spiffe://example.org/spire/agent/aws_iid/zone1/host1",
-			expectSelectors: []*common.Selector{{Type: "aws_iid", Value: "tag:Hostname:host1"}},
+			config:   `agent_path_template = "/{{ .PluginName }}/zone1/{{ .Tags.Hostname }}"`,
+			expectID: "spiffe://example.org/spire/agent/aws_iid/zone1/host1",
+			expectSelectors: []*common.Selector{
+				{Type: caws.PluginName, Value: "az:test-az"},
+				{Type: caws.PluginName, Value: "image:id:test-image-id"},
+				{Type: caws.PluginName, Value: "instance:id:test-instance"},
+				{Type: caws.PluginName, Value: "region:test-region"},
+				{Type: caws.PluginName, Value: "tag:Hostname:host1"},
+			},
 		},
 		{
 			name:            "fails with missing tags in template",
@@ -270,8 +340,12 @@ func TestAttest(t *testing.T) {
 			},
 			expectID: "spiffe://example.org/spire/agent/aws_iid/test-account/test-region/test-instance",
 			expectSelectors: []*common.Selector{
+				{Type: caws.PluginName, Value: "az:test-az"},
 				{Type: caws.PluginName, Value: "iamrole:role1"},
 				{Type: caws.PluginName, Value: "iamrole:role2"},
+				{Type: caws.PluginName, Value: "image:id:test-image-id"},
+				{Type: caws.PluginName, Value: "instance:id:test-instance"},
+				{Type: caws.PluginName, Value: "region:test-region"},
 				{Type: caws.PluginName, Value: "sg:id:TestGroup"},
 				{Type: caws.PluginName, Value: "sg:name:Test Group Name"},
 				{Type: caws.PluginName, Value: "tag:Hostname:host1"},
@@ -307,6 +381,10 @@ func TestAttest(t *testing.T) {
 			},
 			expectID: "spiffe://example.org/spire/agent/aws_iid/test-account/test-region/test-instance",
 			expectSelectors: []*common.Selector{
+				{Type: caws.PluginName, Value: "az:test-az"},
+				{Type: caws.PluginName, Value: "image:id:test-image-id"},
+				{Type: caws.PluginName, Value: "instance:id:test-instance"},
+				{Type: caws.PluginName, Value: "region:test-region"},
 				{Type: caws.PluginName, Value: "sg:id:TestGroup"},
 				{Type: caws.PluginName, Value: "sg:name:Test Group Name"},
 				{Type: caws.PluginName, Value: "tag:Hostname:host1"},
@@ -349,10 +427,15 @@ func TestAttest(t *testing.T) {
 			attestor.hooks.getenv = func(key string) string {
 				return tt.env[key]
 			}
-			attestor.hooks.getAWSCAPublicKey = func() (*rsa.PublicKey, error) {
-				return &testAWSCAKey.PublicKey, nil
+
+			attestor.hooks.getAWSCACertificate = func(string, PublicKeyType) (*x509.Certificate, error) {
+				if tt.overrideCACert != nil {
+					return otherAWSCACert, nil
+				}
+				return testAWSCACert, nil
 			}
-			attestor.clients = newClientsCache(func(ctx context.Context, config *SessionConfig, region string, asssumeRoleARN string) (Client, error) {
+
+			attestor.clients = newClientsCache(func(ctx context.Context, config *SessionConfig, region string, assumeRoleARN string) (Client, error) {
 				return client, nil
 			})
 
@@ -433,6 +516,20 @@ func TestConfigure(t *testing.T) {
 		spiretest.RequireGRPCStatusContains(t, err, codes.InvalidArgument, "failed to parse agent svid template")
 	})
 
+	t.Run("invalid partitions specified ", func(t *testing.T) {
+		err := doConfig(t, coreConfig, `
+		partition = "invalid-aws-partition"
+		`)
+		spiretest.RequireGRPCStatusContains(t, err, codes.InvalidArgument, "invalid partition \"invalid-aws-partition\", must be one of: [aws aws-cn aws-us-gov]")
+	})
+
+	t.Run("success when valid partitions specified ", func(t *testing.T) {
+		for _, partition := range partitions {
+			err := doConfig(t, coreConfig, fmt.Sprintf("partition = %q", partition))
+			require.NoError(t, err)
+		}
+	})
+
 	t.Run("success with envvars", func(t *testing.T) {
 		env[accessKeyIDVarName] = "ACCESSKEYID"
 		env[secretAccessKeyVarName] = "SECRETACCESSKEY"
@@ -501,7 +598,7 @@ func newFakeClient() *fakeClient {
 	}
 }
 
-func (c *fakeClient) DescribeInstances(ctx context.Context, input *ec2.DescribeInstancesInput, optFns ...func(*ec2.Options)) (*ec2.DescribeInstancesOutput, error) {
+func (c *fakeClient) DescribeInstances(_ context.Context, input *ec2.DescribeInstancesInput, _ ...func(*ec2.Options)) (*ec2.DescribeInstancesOutput, error) {
 	expectInput := &ec2.DescribeInstancesInput{
 		InstanceIds: []string{testInstance},
 		Filters:     instanceFilters,
@@ -512,7 +609,7 @@ func (c *fakeClient) DescribeInstances(ctx context.Context, input *ec2.DescribeI
 	return c.DescribeInstancesOutput, c.DescribeInstancesError
 }
 
-func (c *fakeClient) GetInstanceProfile(ctx context.Context, input *iam.GetInstanceProfileInput, optFns ...func(*iam.Options)) (*iam.GetInstanceProfileOutput, error) {
+func (c *fakeClient) GetInstanceProfile(_ context.Context, input *iam.GetInstanceProfileInput, _ ...func(*iam.Options)) (*iam.GetInstanceProfileOutput, error) {
 	expectInput := &iam.GetInstanceProfileInput{
 		InstanceProfileName: aws.String(testProfile),
 	}
@@ -522,33 +619,98 @@ func (c *fakeClient) GetInstanceProfile(ctx context.Context, input *iam.GetInsta
 	return c.GetInstanceProfileOutput, c.GetInstanceProfileError
 }
 
-func buildAttestationData(t *testing.T) caws.IIDAttestationData {
+func buildAttestationDataRSA2048Signature(t *testing.T) caws.IIDAttestationData {
 	// doc body
 	doc := imds.InstanceIdentityDocument{
-		AccountID:  testAccount,
-		InstanceID: testInstance,
-		Region:     testRegion,
+		AccountID:        testAccount,
+		InstanceID:       testInstance,
+		Region:           testRegion,
+		AvailabilityZone: testAvailabilityZone,
+		ImageID:          testImageID,
 	}
 	docBytes, err := json.Marshal(doc)
 	require.NoError(t, err)
 
-	// doc signature
-	docHash := sha256.Sum256(docBytes)
-	sig, err := rsa.SignPKCS1v15(rand.Reader, testAWSCAKey, crypto.SHA256, docHash[:])
+	signedData, err := pkcs7.NewSignedData(docBytes)
 	require.NoError(t, err)
 
+	privateKey := crypto.PrivateKey(testAWSCAKey)
+	err = signedData.AddSigner(testAWSCACert, privateKey, pkcs7.SignerInfoConfig{})
+	require.NoError(t, err)
+
+	signature := generatePKCS7Signature(t, docBytes, testAWSCAKey)
+
+	// base64 encode the signature
+	signatureEncoded := base64.StdEncoding.EncodeToString(signature)
+
 	return caws.IIDAttestationData{
-		Document:  string(docBytes),
-		Signature: base64.StdEncoding.EncodeToString(sig),
+		Document:         string(docBytes),
+		SignatureRSA2048: signatureEncoded,
 	}
 }
 
-func toJSON(t *testing.T, obj interface{}) []byte {
+func buildAttestationDataRSA1024Signature(t *testing.T) caws.IIDAttestationData {
+	// doc body
+	doc := imds.InstanceIdentityDocument{
+		AccountID:        testAccount,
+		InstanceID:       testInstance,
+		Region:           testRegion,
+		AvailabilityZone: testAvailabilityZone,
+		ImageID:          testImageID,
+	}
+	docBytes, err := json.Marshal(doc)
+	require.NoError(t, err)
+
+	rng := rand.Reader
+	docHash := sha256.Sum256(docBytes)
+	sig, err := rsa.SignPKCS1v15(rng, testAWSCAKey, crypto.SHA256, docHash[:])
+	require.NoError(t, err)
+
+	signatureEncoded := base64.StdEncoding.EncodeToString(sig)
+
+	return caws.IIDAttestationData{
+		Document:  string(docBytes),
+		Signature: signatureEncoded,
+	}
+}
+
+func generatePKCS7Signature(t *testing.T, docBytes []byte, key *rsa.PrivateKey) []byte {
+	signedData, err := pkcs7.NewSignedData(docBytes)
+	require.NoError(t, err)
+
+	cert := generateCertificate(t, key)
+	privateKey := crypto.PrivateKey(key)
+	err = signedData.AddSigner(cert, privateKey, pkcs7.SignerInfoConfig{})
+	require.NoError(t, err)
+
+	signature, err := signedData.Finish()
+	require.NoError(t, err)
+
+	return signature
+}
+
+func generateCertificate(t *testing.T, key crypto.Signer) *x509.Certificate {
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			CommonName: "test",
+		},
+		NotBefore: time.Now(),
+		NotAfter:  time.Now().Add(time.Hour),
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, key.Public(), key)
+	require.NoError(t, err)
+	cert, err := x509.ParseCertificate(certDER)
+	require.NoError(t, err)
+	return cert
+}
+
+func toJSON(t *testing.T, obj any) []byte {
 	jsonBytes, err := json.Marshal(obj)
 	require.NoError(t, err)
 	return jsonBytes
 }
 
-func expectNoChallenge(ctx context.Context, challenge []byte) ([]byte, error) {
+func expectNoChallenge(context.Context, []byte) ([]byte, error) {
 	return nil, errors.New("challenge is not expected")
 }

@@ -27,11 +27,9 @@ import (
 	"google.golang.org/grpc"
 )
 
-var (
-	coreConfig = catalog.CoreConfig{
-		TrustDomain: spiffeid.RequireTrustDomainFromString("example.org"),
-	}
-)
+var coreConfig = catalog.CoreConfig{
+	TrustDomain: spiffeid.RequireTrustDomainFromString("example.org"),
+}
 
 func TestBuiltInPlugin(t *testing.T) {
 	testPlugin(t, "")
@@ -86,9 +84,12 @@ func TestExternalPlugin(t *testing.T) {
 		testLoad(t, pluginPath, loadTest{
 			pluginMode: "bad",
 			expectErr: `failed to load plugin "test": failed to launch plugin: Unrecognized remote plugin message: 
-
-This usually means that the plugin is either invalid or simply
-needs to be recompiled to support the latest protocol.`,
+Failed to read any lines from plugin's stdout
+This usually means
+  the plugin was not compiled for this architecture,
+  the plugin is missing dynamic-link libraries necessary to run,
+  the plugin is not executable by this process due to file permissions, or
+  the plugin failed to negotiate the initial go-plugin protocol handshake`,
 		})
 	})
 }
@@ -295,7 +296,7 @@ func testPlugin(t *testing.T, pluginPath string) {
 }
 
 func testLoad(t *testing.T, pluginPath string, tt loadTest) {
-	log, _ := log_test.NewNullLogger()
+	log, hook := log_test.NewNullLogger()
 	config := catalog.Config{
 		Log:        log,
 		CoreConfig: coreConfig,
@@ -356,11 +357,20 @@ func testLoad(t *testing.T, pluginPath string, tt loadTest) {
 
 	closer, err := catalog.Load(context.Background(), config, repo)
 	if closer != nil {
-		defer closer.Close()
+		defer func() {
+			closer.Close()
+			if tt.expectPluginClient {
+				// Assert that the plugin io.Closer was invoked by looking at
+				// the logs. It's hard to use the full log entry since there
+				// is a bunch of unrelated, per-test-run type stuff in there,
+				// so just inspect the log messages.
+				assertContainsLogMessage(t, hook.AllEntries(), "CLOSED")
+			}
+		}()
 	}
 
 	if tt.expectErr != "" {
-		require.EqualError(t, err, tt.expectErr, "load should have failed")
+		require.ErrorContains(t, err, tt.expectErr, "load should have failed")
 		assert.Nil(t, closer, "closer should have been nil")
 	} else {
 		require.NoError(t, err, "load should not have failed")
@@ -447,14 +457,14 @@ func (r *Repo) Services() []catalog.ServiceRepo {
 }
 
 type PluginRepo struct {
-	binder      interface{}
+	binder      any
 	versions    []catalog.Version
 	clear       func()
 	constraints catalog.Constraints
 	builtIns    []catalog.BuiltIn
 }
 
-func (r *PluginRepo) Binder() interface{} {
+func (r *PluginRepo) Binder() any {
 	return r.binder
 }
 
@@ -475,12 +485,12 @@ func (r *PluginRepo) BuiltIns() []catalog.BuiltIn {
 }
 
 type ServiceRepo struct {
-	binder   interface{}
+	binder   any
 	versions []catalog.Version
 	clear    func()
 }
 
-func (r *ServiceRepo) Binder() interface{} {
+func (r *ServiceRepo) Binder() any {
 	return r.binder
 }
 
@@ -502,7 +512,7 @@ type SomePluginFacade struct {
 	test.SomePluginPluginClient
 }
 
-func (f *SomePluginFacade) PluginEcho(ctx context.Context, in string) (string, error) {
+func (f *SomePluginFacade) PluginEcho(_ context.Context, in string) (string, error) {
 	resp, err := f.SomePluginPluginClient.PluginEcho(context.Background(), &test.EchoRequest{In: in})
 	if err != nil {
 		return "", err
@@ -528,7 +538,7 @@ type SomeServiceFacade struct {
 	plugin.Facade
 }
 
-func (f *SomeServiceFacade) ServiceEcho(ctx context.Context, in string) (string, error) {
+func (f *SomeServiceFacade) ServiceEcho(_ context.Context, in string) (string, error) {
 	resp, err := f.SomeServiceServiceClient.ServiceEcho(context.Background(), &test.EchoRequest{In: in})
 	if err != nil {
 		return "", err
@@ -552,7 +562,15 @@ func (v badVersion) Deprecated() bool { return false }
 
 type badFacade struct{}
 
-func (badFacade) GRPCServiceName() string                              { return "bad" }
-func (badFacade) InitClient(conn grpc.ClientConnInterface) interface{} { return nil }
-func (badFacade) InitInfo(info catalog.PluginInfo)                     {}
-func (badFacade) InitLog(log logrus.FieldLogger)                       {}
+func (badFacade) GRPCServiceName() string                 { return "bad" }
+func (badFacade) InitClient(grpc.ClientConnInterface) any { return nil }
+func (badFacade) InitInfo(catalog.PluginInfo)             {}
+func (badFacade) InitLog(logrus.FieldLogger)              {}
+
+func assertContainsLogMessage(t *testing.T, entries []*logrus.Entry, message string) {
+	messages := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		messages = append(messages, entry.Message)
+	}
+	assert.Contains(t, messages, message)
+}

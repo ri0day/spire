@@ -132,22 +132,102 @@ import (
 // | v1.3.1  |        |                                                                           |
 // |---------|--------|---------------------------------------------------------------------------|
 // | v1.3.2  | 19     | Added x509_svid_ttl and jwt_svid_ttl columns to entries                   |
+// |---------|        |                                                                           |
+// | v1.3.3  |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.3.4  |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.3.5  |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.3.6  |        |                                                                           |
+// |*********|********|***************************************************************************|
+// | v1.4.0  |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.4.1  |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.4.2  |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.4.3  |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.4.4  |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.4.5  |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.4.6  |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.4.7  |        |                                                                           |
+// |*********|********|***************************************************************************|
+// | v1.5.0  |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.5.1  |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.5.2  |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.5.3  |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.5.4  |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.5.5  |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.5.6  |        |                                                                           |
+// |*********|********|***************************************************************************|
+// | v1.6.0  | 20     | Removed x509_svid_ttl column from registered_entries                      |
+// |         |--------|---------------------------------------------------------------------------|
+// |         | 21     | Added index in hint column from registered_entries                        |
+// |---------|        |                                                                           |
+// | v1.6.1  |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.6.2  |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.6.3  |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.6.4  |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.6.5  |        |                                                                           |
+// |*********|********|***************************************************************************|
+// | v1.7.0  |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.7.1  |        |                                                                           |
+// |---------|--------|---------------------------------------------------------------------------|
+// | v1.7.2  | 22     | Added registered_entries_events and attested_node_entries_events tables   |
+// |---------|        |                                                                           |
+// | v1.7.3  |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.7.4  |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.7.5  |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.7.6  |        |                                                                           |
+// |*********|********|***************************************************************************|
+// | v1.8.0  | 23     | Added ca_journals table                                                   |
+// |---------|        |                                                                           |
+// | v1.8.1  |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.8.2  |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.8.3  |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.8.4  |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.8.5  |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.8.6  |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.8.7  |        |                                                                           |
 // ================================================================================================
 
 const (
 	// the latest schema version of the database in the code
-	latestSchemaVersion = 19
+	latestSchemaVersion = 23
 
 	// lastMinorReleaseSchemaVersion is the schema version supported by the
 	// last minor release. When the migrations are opportunistically pruned
 	// from the code after a minor release, this number should be updated.
-	lastMinorReleaseSchemaVersion = 18
+	lastMinorReleaseSchemaVersion = 21
 )
 
-var (
-	// the current code version
-	codeVersion = semver.MustParse(version.Version())
-)
+// the current code version
+var codeVersion = semver.MustParse(version.Version())
 
 func migrateDB(db *gorm.DB, dbType string, disableMigration bool, log logrus.FieldLogger) (err error) {
 	// The version comparison logic in this package supports only 0.x and 1.x versioning semantics.
@@ -288,16 +368,19 @@ func initDB(db *gorm.DB, dbType string, log logrus.FieldLogger) (err error) {
 		return sqlError.Wrap(err)
 	}
 
-	tables := []interface{}{
+	tables := []any{
 		&Bundle{},
 		&AttestedNode{},
+		&AttestedNodeEvent{},
 		&NodeSelector{},
 		&RegisteredEntry{},
+		&RegisteredEntryEvent{},
 		&JoinToken{},
 		&Selector{},
 		&Migration{},
 		&DNSName{},
 		&FederatedTrustDomain{},
+		CAJournal{},
 	}
 
 	if err := tableOptionsForDialect(tx, dbType).AutoMigrate(tables...).Error; err != nil {
@@ -353,8 +436,12 @@ func migrateVersion(tx *gorm.DB, currVersion int, log logrus.FieldLogger) (versi
 	// list can be opportunistically pruned after every minor release but won't
 	// break things if it isn't.
 	switch currVersion {
-	case 18:
-		err = migrateToV19(tx)
+	case 21:
+		// TODO: remove this migration in 1.9.0
+		err = migrateToV22(tx)
+	case 22:
+		// TODO: remove this migration in 1.9.0
+		err = migrateToV23(tx)
 	default:
 		err = sqlError.New("no migration support for unknown schema version %d", currVersion)
 	}
@@ -365,8 +452,15 @@ func migrateVersion(tx *gorm.DB, currVersion int, log logrus.FieldLogger) (versi
 	return nextVersion, nil
 }
 
-func migrateToV19(tx *gorm.DB) error {
-	if err := tx.AutoMigrate(&RegisteredEntry{}).Error; err != nil {
+func migrateToV22(tx *gorm.DB) error {
+	if err := tx.AutoMigrate(&RegisteredEntryEvent{}, &AttestedNodeEvent{}).Error; err != nil {
+		return sqlError.Wrap(err)
+	}
+	return nil
+}
+
+func migrateToV23(tx *gorm.DB) error {
+	if err := tx.AutoMigrate(&CAJournal{}).Error; err != nil {
 		return sqlError.Wrap(err)
 	}
 	return nil

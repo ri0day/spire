@@ -19,11 +19,17 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+type Generator = keymanagerbase.Generator
+
 func BuiltIn() catalog.BuiltIn {
-	return builtin(New())
+	return asBuiltIn(newKeyManager(nil))
 }
 
-func builtin(p *KeyManager) catalog.BuiltIn {
+func TestBuiltIn(generator Generator) catalog.BuiltIn {
+	return asBuiltIn(newKeyManager(generator))
+}
+
+func asBuiltIn(p *KeyManager) catalog.BuiltIn {
 	return catalog.MakeBuiltIn("disk",
 		keymanagerv1.KeyManagerPluginServer(p),
 		configv1.ConfigServiceServer(p))
@@ -43,9 +49,10 @@ type KeyManager struct {
 	config *configuration
 }
 
-func New() *KeyManager {
+func newKeyManager(generator Generator) *KeyManager {
 	m := &KeyManager{}
-	m.Base = keymanagerbase.New(keymanagerbase.Funcs{
+	m.Base = keymanagerbase.New(keymanagerbase.Config{
+		Generator:    generator,
 		WriteEntries: m.writeEntries,
 	})
 	return m
@@ -55,7 +62,7 @@ func (m *KeyManager) SetLogger(log hclog.Logger) {
 	m.log = log
 }
 
-func (m *KeyManager) Configure(ctx context.Context, req *configv1.ConfigureRequest) (*configv1.ConfigureResponse, error) {
+func (m *KeyManager) Configure(_ context.Context, req *configv1.ConfigureRequest) (*configv1.ConfigureResponse, error) {
 	config := new(configuration)
 	if err := hcl.Decode(config, req.HclConfiguration); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "unable to decode configuration: %v", err)
@@ -98,7 +105,7 @@ func (m *KeyManager) loadEntries(dir string) error {
 	return nil
 }
 
-func (m *KeyManager) writeEntries(ctx context.Context, allEntries []*keymanagerbase.KeyEntry, newEntry *keymanagerbase.KeyEntry) error {
+func (m *KeyManager) writeEntries(_ context.Context, allEntries []*keymanagerbase.KeyEntry, _ *keymanagerbase.KeyEntry) error {
 	m.mu.Lock()
 	config := m.config
 	m.mu.Unlock()
@@ -160,7 +167,7 @@ func writeEntries(path string, entries []*keymanagerbase.KeyEntry) error {
 		return status.Errorf(codes.Internal, "unable to marshal entries: %v", err)
 	}
 
-	if err := diskutil.AtomicWriteFile(path, jsonBytes, 0600); err != nil {
+	if err := diskutil.AtomicWritePrivateFile(path, jsonBytes); err != nil {
 		return status.Errorf(codes.Internal, "unable to write entries: %v", err)
 	}
 

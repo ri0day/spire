@@ -1,12 +1,11 @@
 //go:build windows
-// +build windows
 
 package healthcheck
 
 import (
 	"testing"
 
-	"github.com/spiffe/spire/pkg/common/util"
+	"github.com/spiffe/spire/pkg/common/namedpipe"
 	"github.com/spiffe/spire/test/spiretest"
 	"google.golang.org/grpc"
 )
@@ -22,9 +21,9 @@ var (
 `
 	socketAddrArg         = "-namedPipeName"
 	socketAddrUnavailable = "doesnotexist"
-	unavailableErr        = "Failed to check health: rpc error: code = Unavailable desc = connection error: desc = \"transport: Error while dialing open \\\\\\\\.\\\\pipe\\\\doesnotexist: The system cannot find the file specified.\"\nAgent is unhealthy: unable to determine health\n"
+	unavailableErr        = "Failed to check health: rpc error: code = Unavailable desc = connection error: desc = \"transport: Error while dialing: open \\\\\\\\.\\\\pipe\\\\doesnotexist: The system cannot find the file specified.\"\nAgent is unhealthy: unable to determine health\n"
 )
 
 func startGRPCSocketServer(t *testing.T, registerFn func(srv *grpc.Server)) string {
-	return util.GetPipeName(spiretest.StartGRPCServer(t, registerFn).String())
+	return namedpipe.GetPipeName(spiretest.StartGRPCServer(t, registerFn).String())
 }

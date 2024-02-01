@@ -9,6 +9,8 @@ import (
 
 	"github.com/hashicorp/hcl"
 
+	"github.com/go-jose/go-jose/v3"
+	"github.com/go-jose/go-jose/v3/jwt"
 	hclog "github.com/hashicorp/go-hclog"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	nodeattestorv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/plugin/server/nodeattestor/v1"
@@ -21,8 +23,6 @@ import (
 	"google.golang.org/api/option"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"gopkg.in/square/go-jose.v2"
-	"gopkg.in/square/go-jose.v2/jwt"
 )
 
 const (
@@ -163,7 +163,7 @@ func (p *IITAttestorPlugin) Attest(stream nodeattestorv1.NodeAttestor_AttestServ
 }
 
 // Configure configures the IITAttestorPlugin.
-func (p *IITAttestorPlugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) (*configv1.ConfigureResponse, error) {
+func (p *IITAttestorPlugin) Configure(_ context.Context, req *configv1.ConfigureRequest) (*configv1.ConfigureResponse, error) {
 	hclConfig := new(IITAttestorConfig)
 	if err := hcl.Decode(hclConfig, req.HclConfiguration); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "unable to decode configuration: %v", err)

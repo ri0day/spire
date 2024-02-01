@@ -160,7 +160,10 @@ func (p *Plugin) startInformers(ctx context.Context, config *pluginConfig, clien
 	if config.WebhookLabel != "" || config.APIServiceLabel != "" {
 		informerSynced := []cache.InformerSynced{}
 		for _, client := range clients {
-			informer := client.Informer(p.hooks.informerCallback)
+			informer, err := client.Informer(p.hooks.informerCallback)
+			if err != nil {
+				return err
+			}
 			if informer != nil {
 				go informer.Run(stopCh)
 				informerSynced = append(informerSynced, informer.HasSynced)
@@ -413,7 +416,7 @@ func getKubeConfig(configPath string) (*rest.Config, error) {
 	return rest.InClusterConfig()
 }
 
-// kubeClient encapsulates the Kubenetes API for config maps, validating webhooks, and mutating webhooks
+// kubeClient encapsulates the Kubernetes API for config maps, validating webhooks, and mutating webhooks
 type informerCallback func(kubeClient, runtime.Object)
 
 type kubeClient interface {
@@ -421,10 +424,10 @@ type kubeClient interface {
 	GetList(ctx context.Context) (runtime.Object, error)
 	CreatePatch(ctx context.Context, obj runtime.Object, resp *identityproviderv1.FetchX509IdentityResponse) (runtime.Object, error)
 	Patch(ctx context.Context, namespace, name string, patchBytes []byte) error
-	Informer(callback informerCallback) cache.SharedIndexInformer
+	Informer(callback informerCallback) (cache.SharedIndexInformer, error)
 }
 
-// configMapClient encapsulates the Kubenetes API for updating the CA Bundle in a config map
+// configMapClient encapsulates the Kubernetes API for updating the CA Bundle in a config map
 type configMapClient struct {
 	*kubernetes.Clientset
 	namespace    string
@@ -447,7 +450,7 @@ func (c configMapClient) GetList(ctx context.Context) (runtime.Object, error) {
 	}, nil
 }
 
-func (c configMapClient) CreatePatch(ctx context.Context, obj runtime.Object, resp *identityproviderv1.FetchX509IdentityResponse) (runtime.Object, error) {
+func (c configMapClient) CreatePatch(_ context.Context, obj runtime.Object, resp *identityproviderv1.FetchX509IdentityResponse) (runtime.Object, error) {
 	configMap, ok := obj.(*corev1.ConfigMap)
 	if !ok {
 		return nil, status.Errorf(codes.InvalidArgument, "wrong type, expecting ConfigMap")
@@ -467,18 +470,18 @@ func (c configMapClient) Patch(ctx context.Context, namespace, name string, patc
 	return err
 }
 
-func (c configMapClient) Informer(callback informerCallback) cache.SharedIndexInformer {
-	return nil
+func (c configMapClient) Informer(informerCallback) (cache.SharedIndexInformer, error) {
+	return nil, nil
 }
 
-// apiServiceClient encapsulates the Kubenetes API for updating the CA Bundle in an API Service
+// apiServiceClient encapsulates the Kubernetes API for updating the CA Bundle in an API Service
 type apiServiceClient struct {
 	aggregator.Interface
 	apiServiceLabel string
 	factory         aggregatorinformers.SharedInformerFactory
 }
 
-func (c apiServiceClient) Get(ctx context.Context, namespace, name string) (runtime.Object, error) {
+func (c apiServiceClient) Get(ctx context.Context, _, name string) (runtime.Object, error) {
 	return c.ApiregistrationV1().APIServices().Get(ctx, name, metav1.GetOptions{})
 }
 
@@ -488,7 +491,7 @@ func (c apiServiceClient) GetList(ctx context.Context) (runtime.Object, error) {
 	})
 }
 
-func (c apiServiceClient) CreatePatch(ctx context.Context, obj runtime.Object, resp *identityproviderv1.FetchX509IdentityResponse) (runtime.Object, error) {
+func (c apiServiceClient) CreatePatch(_ context.Context, obj runtime.Object, resp *identityproviderv1.FetchX509IdentityResponse) (runtime.Object, error) {
 	apiService, ok := obj.(*apiregistrationv1.APIService)
 	if !ok {
 		return nil, status.Errorf(codes.InvalidArgument, "wrong type, expecting APIService")
@@ -513,32 +516,37 @@ func (c apiServiceClient) CreatePatch(ctx context.Context, obj runtime.Object, r
 	return patch, nil
 }
 
-func (c apiServiceClient) Patch(ctx context.Context, namespace, name string, patchBytes []byte) error {
+func (c apiServiceClient) Patch(ctx context.Context, _, name string, patchBytes []byte) error {
 	_, err := c.ApiregistrationV1().APIServices().Patch(ctx, name, types.StrategicMergePatchType, patchBytes, metav1.PatchOptions{})
 	return err
 }
 
-func (c apiServiceClient) Informer(callback informerCallback) cache.SharedIndexInformer {
+func (c apiServiceClient) Informer(callback informerCallback) (cache.SharedIndexInformer, error) {
 	informer := c.factory.Apiregistration().V1().APIServices().Informer()
-	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
+	// AddEventHandler now support returning event handler registration,
+	// to remove them if required (https://github.com/kubernetes-sigs/controller-runtime/pull/2046)
+	_, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj any) {
 			callback(c, obj.(runtime.Object))
 		},
-		UpdateFunc: func(oldObj, newObj interface{}) {
+		UpdateFunc: func(oldObj, newObj any) {
 			callback(c, newObj.(runtime.Object))
 		},
 	})
-	return informer
+	if err != nil {
+		return nil, err
+	}
+	return informer, nil
 }
 
-// mutatingWebhookClient encapsulates the Kubenetes API for updating the CA Bundle in a mutating webhook
+// mutatingWebhookClient encapsulates the Kubernetes API for updating the CA Bundle in a mutating webhook
 type mutatingWebhookClient struct {
 	kubernetes.Interface
 	webhookLabel string
 	factory      informers.SharedInformerFactory
 }
 
-func (c mutatingWebhookClient) Get(ctx context.Context, namespace, mutatingWebhook string) (runtime.Object, error) {
+func (c mutatingWebhookClient) Get(ctx context.Context, _, mutatingWebhook string) (runtime.Object, error) {
 	return c.AdmissionregistrationV1().MutatingWebhookConfigurations().Get(ctx, mutatingWebhook, metav1.GetOptions{})
 }
 
@@ -548,7 +556,7 @@ func (c mutatingWebhookClient) GetList(ctx context.Context) (runtime.Object, err
 	})
 }
 
-func (c mutatingWebhookClient) CreatePatch(ctx context.Context, obj runtime.Object, resp *identityproviderv1.FetchX509IdentityResponse) (runtime.Object, error) {
+func (c mutatingWebhookClient) CreatePatch(_ context.Context, obj runtime.Object, resp *identityproviderv1.FetchX509IdentityResponse) (runtime.Object, error) {
 	mutatingWebhook, ok := obj.(*admissionv1.MutatingWebhookConfiguration)
 	if !ok {
 		return nil, status.Errorf(codes.InvalidArgument, "wrong type, expecting MutatingWebhookConfiguration")
@@ -573,7 +581,7 @@ func (c mutatingWebhookClient) CreatePatch(ctx context.Context, obj runtime.Obje
 	}
 	patch.Webhooks = make([]admissionv1.MutatingWebhook, len(mutatingWebhook.Webhooks))
 
-	// Step through all the the webhooks in the MutatingWebhookConfiguration
+	// Step through all the webhooks in the MutatingWebhookConfiguration
 	for i := range patch.Webhooks {
 		patch.Webhooks[i].AdmissionReviewVersions = mutatingWebhook.Webhooks[i].AdmissionReviewVersions
 		patch.Webhooks[i].ClientConfig.CABundle = []byte(bundleData(resp.Bundle))
@@ -584,32 +592,35 @@ func (c mutatingWebhookClient) CreatePatch(ctx context.Context, obj runtime.Obje
 	return patch, nil
 }
 
-func (c mutatingWebhookClient) Patch(ctx context.Context, namespace, name string, patchBytes []byte) error {
+func (c mutatingWebhookClient) Patch(ctx context.Context, _, name string, patchBytes []byte) error {
 	_, err := c.AdmissionregistrationV1().MutatingWebhookConfigurations().Patch(ctx, name, types.StrategicMergePatchType, patchBytes, metav1.PatchOptions{})
 	return err
 }
 
-func (c mutatingWebhookClient) Informer(callback informerCallback) cache.SharedIndexInformer {
+func (c mutatingWebhookClient) Informer(callback informerCallback) (cache.SharedIndexInformer, error) {
 	informer := c.factory.Admissionregistration().V1().MutatingWebhookConfigurations().Informer()
-	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
+	_, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj any) {
 			callback(c, obj.(runtime.Object))
 		},
-		UpdateFunc: func(oldObj, newObj interface{}) {
+		UpdateFunc: func(oldObj, newObj any) {
 			callback(c, newObj.(runtime.Object))
 		},
 	})
-	return informer
+	if err != nil {
+		return nil, err
+	}
+	return informer, nil
 }
 
-// validatingWebhookClient encapsulates the Kubenetes API for updating the CA Bundle in a validating webhook
+// validatingWebhookClient encapsulates the Kubernetes API for updating the CA Bundle in a validating webhook
 type validatingWebhookClient struct {
 	kubernetes.Interface
 	webhookLabel string
 	factory      informers.SharedInformerFactory
 }
 
-func (c validatingWebhookClient) Get(ctx context.Context, namespace, validatingWebhook string) (runtime.Object, error) {
+func (c validatingWebhookClient) Get(ctx context.Context, _, validatingWebhook string) (runtime.Object, error) {
 	return c.AdmissionregistrationV1().ValidatingWebhookConfigurations().Get(ctx, validatingWebhook, metav1.GetOptions{})
 }
 
@@ -619,7 +630,7 @@ func (c validatingWebhookClient) GetList(ctx context.Context) (runtime.Object, e
 	})
 }
 
-func (c validatingWebhookClient) CreatePatch(ctx context.Context, obj runtime.Object, resp *identityproviderv1.FetchX509IdentityResponse) (runtime.Object, error) {
+func (c validatingWebhookClient) CreatePatch(_ context.Context, obj runtime.Object, resp *identityproviderv1.FetchX509IdentityResponse) (runtime.Object, error) {
 	validatingWebhook, ok := obj.(*admissionv1.ValidatingWebhookConfiguration)
 	if !ok {
 		return nil, status.Errorf(codes.InvalidArgument, "wrong type, expecting ValidatingWebhookConfiguration")
@@ -644,7 +655,7 @@ func (c validatingWebhookClient) CreatePatch(ctx context.Context, obj runtime.Ob
 	}
 	patch.Webhooks = make([]admissionv1.ValidatingWebhook, len(validatingWebhook.Webhooks))
 
-	// Step through all the the webhooks in the ValidatingWebhookConfiguration
+	// Step through all the webhooks in the ValidatingWebhookConfiguration
 	for i := range patch.Webhooks {
 		patch.Webhooks[i].AdmissionReviewVersions = validatingWebhook.Webhooks[i].AdmissionReviewVersions
 		patch.Webhooks[i].ClientConfig.CABundle = []byte(bundleData(resp.Bundle))
@@ -655,22 +666,25 @@ func (c validatingWebhookClient) CreatePatch(ctx context.Context, obj runtime.Ob
 	return patch, nil
 }
 
-func (c validatingWebhookClient) Patch(ctx context.Context, namespace, name string, patchBytes []byte) error {
+func (c validatingWebhookClient) Patch(ctx context.Context, _, name string, patchBytes []byte) error {
 	_, err := c.AdmissionregistrationV1().ValidatingWebhookConfigurations().Patch(ctx, name, types.StrategicMergePatchType, patchBytes, metav1.PatchOptions{})
 	return err
 }
 
-func (c validatingWebhookClient) Informer(callback informerCallback) cache.SharedIndexInformer {
+func (c validatingWebhookClient) Informer(callback informerCallback) (cache.SharedIndexInformer, error) {
 	informer := c.factory.Admissionregistration().V1().ValidatingWebhookConfigurations().Informer()
-	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
+	_, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj any) {
 			callback(c, obj.(runtime.Object))
 		},
-		UpdateFunc: func(oldObj, newObj interface{}) {
+		UpdateFunc: func(oldObj, newObj any) {
 			callback(c, newObj.(runtime.Object))
 		},
 	})
-	return informer
+	if err != nil {
+		return nil, err
+	}
+	return informer, nil
 }
 
 // bundleData formats the bundle data for inclusion in the config map

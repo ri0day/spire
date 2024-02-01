@@ -1,15 +1,15 @@
 package azure
 
 import (
-	"context"
 	"encoding/json"
 	"io"
 	"net/http"
-	"net/url"
-	"path"
 
+	"github.com/go-jose/go-jose/v3/jwt"
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"github.com/spiffe/spire/pkg/common/agentpathtemplate"
+	"github.com/spiffe/spire/pkg/common/idutil"
 	"github.com/zeebo/errs"
-	"gopkg.in/square/go-jose.v2/jwt"
 )
 
 const (
@@ -17,7 +17,11 @@ const (
 	// audience of the MSI token. The current value is the service ID for the
 	// Resource Manager API.
 	DefaultMSIResourceID = "https://management.azure.com/"
+	PluginName           = "azure_msi"
 )
+
+// DefaultAgentPathTemplate is the default text/template
+var DefaultAgentPathTemplate = agentpathtemplate.MustParse("/{{ .PluginName }}/{{ .TenantID }}/{{ .PrincipalID }}")
 
 type ComputeMetadata struct {
 	Name              string `json:"name"`
@@ -35,16 +39,8 @@ type MSIAttestationData struct {
 
 type MSITokenClaims struct {
 	jwt.Claims
-	TenantID string `json:"tid,omitempty"`
-}
-
-func (c *MSITokenClaims) AgentID(trustDomain string) string {
-	u := url.URL{
-		Scheme: "spiffe",
-		Host:   trustDomain,
-		Path:   path.Join("spire", "agent", "azure_msi", c.TenantID, c.Subject),
-	}
-	return u.String()
+	TenantID    string `json:"tid,omitempty"`
+	PrincipalID string `json:"sub,omitempty"`
 }
 
 type HTTPClient interface {
@@ -57,7 +53,7 @@ func (fn HTTPClientFunc) Do(req *http.Request) (*http.Response, error) {
 	return fn(req)
 }
 
-func FetchMSIToken(ctx context.Context, cl HTTPClient, resource string) (string, error) {
+func FetchMSIToken(cl HTTPClient, resource string) (string, error) {
 	req, err := http.NewRequest("GET", "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01", nil)
 	if err != nil {
 		return "", errs.Wrap(err)
@@ -92,7 +88,7 @@ func FetchMSIToken(ctx context.Context, cl HTTPClient, resource string) (string,
 	return r.AccessToken, nil
 }
 
-func FetchInstanceMetadata(ctx context.Context, cl HTTPClient) (*InstanceMetadata, error) {
+func FetchInstanceMetadata(cl HTTPClient) (*InstanceMetadata, error) {
 	req, err := http.NewRequest("GET", "http://169.254.169.254/metadata/instance?api-version=2017-08-01&format=json", nil)
 	if err != nil {
 		return nil, errs.Wrap(err)
@@ -123,6 +119,23 @@ func FetchInstanceMetadata(ctx context.Context, cl HTTPClient) (*InstanceMetadat
 	}
 
 	return metadata, nil
+}
+
+type agentPathTemplateData struct {
+	MSITokenClaims
+	PluginName string
+}
+
+func MakeAgentID(td spiffeid.TrustDomain, agentPathTemplate *agentpathtemplate.Template, claims *MSITokenClaims) (spiffeid.ID, error) {
+	agentPath, err := agentPathTemplate.Execute(agentPathTemplateData{
+		MSITokenClaims: *claims,
+		PluginName:     PluginName,
+	})
+	if err != nil {
+		return spiffeid.ID{}, err
+	}
+
+	return idutil.AgentID(td, agentPath)
 }
 
 func tryRead(r io.Reader) string {

@@ -8,13 +8,16 @@ import (
 	"time"
 
 	"github.com/andres-erbsen/clock"
-	"github.com/gofrs/uuid"
+	"github.com/gofrs/uuid/v5"
 	"github.com/sirupsen/logrus"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	agentv1 "github.com/spiffe/spire-api-sdk/proto/spire/api/server/agent/v1"
 	"github.com/spiffe/spire-api-sdk/proto/spire/api/types"
+	"github.com/spiffe/spire/pkg/common/errorutil"
+	"github.com/spiffe/spire/pkg/common/fflag"
 	"github.com/spiffe/spire/pkg/common/idutil"
 	"github.com/spiffe/spire/pkg/common/nodeutil"
+	"github.com/spiffe/spire/pkg/common/selector"
 	"github.com/spiffe/spire/pkg/common/telemetry"
 	"github.com/spiffe/spire/pkg/common/x509util"
 	"github.com/spiffe/spire/pkg/server/api"
@@ -37,7 +40,6 @@ type Config struct {
 	Clock       clock.Clock
 	DataStore   datastore.DataStore
 	ServerCA    ca.ServerCA
-	AgentTTL    time.Duration
 	TrustDomain spiffeid.TrustDomain
 }
 
@@ -45,33 +47,31 @@ type Config struct {
 type Service struct {
 	agentv1.UnsafeAgentServer
 
-	cat      catalog.Catalog
-	clk      clock.Clock
-	ds       datastore.DataStore
-	ca       ca.ServerCA
-	td       spiffeid.TrustDomain
-	agentTTL time.Duration
+	cat catalog.Catalog
+	clk clock.Clock
+	ds  datastore.DataStore
+	ca  ca.ServerCA
+	td  spiffeid.TrustDomain
 }
 
 // New creates a new agent service
 func New(config Config) *Service {
 	return &Service{
-		cat:      config.Catalog,
-		clk:      config.Clock,
-		ds:       config.DataStore,
-		ca:       config.ServerCA,
-		td:       config.TrustDomain,
-		agentTTL: config.AgentTTL,
+		cat: config.Catalog,
+		clk: config.Clock,
+		ds:  config.DataStore,
+		ca:  config.ServerCA,
+		td:  config.TrustDomain,
 	}
 }
 
 // RegisterService registers the agent service on the gRPC server/
-func RegisterService(s *grpc.Server, service *Service) {
+func RegisterService(s grpc.ServiceRegistrar, service *Service) {
 	agentv1.RegisterAgentServer(s, service)
 }
 
 // CountAgents returns the total number of agents.
-func (s *Service) CountAgents(ctx context.Context, req *agentv1.CountAgentsRequest) (*agentv1.CountAgentsResponse, error) {
+func (s *Service) CountAgents(ctx context.Context, _ *agentv1.CountAgentsRequest) (*agentv1.CountAgentsResponse, error) {
 	count, err := s.ds.CountAttestedNodes(ctx)
 	if err != nil {
 		log := rpccontext.Logger(ctx)
@@ -100,9 +100,14 @@ func (s *Service) ListAgents(ctx context.Context, req *agentv1.ListAgentsRequest
 		if filter.ByBanned != nil {
 			byBanned = &filter.ByBanned.Value
 		}
+		var byCanReattest *bool
+		if filter.ByCanReattest != nil {
+			byCanReattest = &filter.ByCanReattest.Value
+		}
 
 		listReq.ByAttestationType = filter.ByAttestationType
 		listReq.ByBanned = byBanned
+		listReq.ByCanReattest = byCanReattest
 
 		if filter.BySelectorMatch != nil {
 			selectors, err := api.SelectorsFromProto(filter.BySelectorMatch.Selectors)
@@ -320,13 +325,8 @@ func (s *Service) AttestAgent(stream agentv1.Agent_AttestAgentServer) error {
 		return err
 	}
 
-	// augment selectors with resolver
-	resolvedSelectors, err := s.resolveSelectors(ctx, agentID, params.Data.Type)
-	if err != nil {
-		return api.MakeErr(log, codes.Internal, "failed to resolve selectors", err)
-	}
-	// store augmented selectors
-	err = s.ds.SetNodeSelectors(ctx, agentID.String(), append(attestResult.Selectors, resolvedSelectors...))
+	// dedupe and store node selectors
+	err = s.ds.SetNodeSelectors(ctx, agentID.String(), selector.Dedupe(attestResult.Selectors))
 	if err != nil {
 		return api.MakeErr(log, codes.Internal, "failed to update selectors", err)
 	}
@@ -356,7 +356,7 @@ func (s *Service) AttestAgent(stream agentv1.Agent_AttestAgentServer) error {
 	}
 
 	// build and send response
-	response := getAttestAgentResponse(agentID, svid)
+	response := getAttestAgentResponse(agentID, svid, attestResult.CanReattest)
 
 	if p, ok := peer.FromContext(ctx); ok {
 		log = log.WithField(telemetry.Address, p.Addr.String())
@@ -385,6 +385,20 @@ func (s *Service) RenewAgent(ctx context.Context, req *agentv1.RenewAgentRequest
 	callerID, ok := rpccontext.CallerID(ctx)
 	if !ok {
 		return nil, api.MakeErr(log, codes.Internal, "caller ID missing from request context", nil)
+	}
+
+	attestedNode, err := s.ds.FetchAttestedNode(ctx, callerID.String())
+	if err != nil {
+		return nil, api.MakeErr(log, codes.Internal, "failed to fetch agent", err)
+	}
+
+	if attestedNode == nil {
+		return nil, api.MakeErr(log, codes.NotFound, "agent not found", err)
+	}
+
+	// Agent attempted to renew when it should've been reattesting
+	if attestedNode.CanReattest && fflag.IsSet(fflag.FlagReattestToRenew) {
+		return nil, errorutil.PermissionDenied(types.PermissionDeniedDetails_AGENT_MUST_REATTEST, "agent can't renew SVID, must reattest")
 	}
 
 	log.Info("Renewing agent SVID")
@@ -423,6 +437,11 @@ func (s *Service) RenewAgent(ctx context.Context, req *agentv1.RenewAgentRequest
 			CertChain: x509util.RawCertsFromCertificates(agentSVID),
 		},
 	}, nil
+}
+
+// PostStatus post agent status
+func (s *Service) PostStatus(context.Context, *agentv1.PostStatusRequest) (*agentv1.PostStatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "unimplemented")
 }
 
 // CreateJoinToken returns a new JoinToken for an agent.
@@ -521,13 +540,9 @@ func (s *Service) signSvid(ctx context.Context, agentID spiffeid.ID, csr []byte,
 	}
 
 	// Sign a new X509 SVID
-	x509Svid, err := s.ca.SignX509SVID(ctx, ca.X509SVIDParams{
-		SpiffeID:  agentID,
+	x509Svid, err := s.ca.SignAgentX509SVID(ctx, ca.AgentX509SVIDParams{
+		SPIFFEID:  agentID,
 		PublicKey: parsedCsr.PublicKey,
-
-		// If agent TTL is unset, CA will fall back to the default
-		// X509-SVID TTL which is the desired behavior
-		TTL: s.agentTTL,
 	})
 	if err != nil {
 		return nil, api.MakeErr(log, codes.Internal, "failed to sign X509 SVID", err)
@@ -607,13 +622,6 @@ func (s *Service) attestChallengeResponse(ctx context.Context, agentStream agent
 	return result, nil
 }
 
-func (s *Service) resolveSelectors(ctx context.Context, agentID spiffeid.ID, attestationType string) ([]*common.Selector, error) {
-	if nodeResolver, ok := s.cat.GetNodeResolverNamed(attestationType); ok {
-		return nodeResolver.Resolve(ctx, agentID.String())
-	}
-	return nil, nil
-}
-
 func applyMask(a *types.Agent, mask *types.AgentMask) {
 	if mask == nil {
 		return
@@ -637,6 +645,10 @@ func applyMask(a *types.Agent, mask *types.AgentMask) {
 	if !mask.Banned {
 		a.Banned = false
 	}
+
+	if !mask.CanReattest {
+		a.CanReattest = false
+	}
 }
 
 func validateAttestAgentParams(params *agentv1.AttestAgentRequest_Params) error {
@@ -658,7 +670,7 @@ func validateAttestAgentParams(params *agentv1.AttestAgentRequest_Params) error 
 	}
 }
 
-func getAttestAgentResponse(spiffeID spiffeid.ID, certificates []*x509.Certificate) *agentv1.AttestAgentResponse {
+func getAttestAgentResponse(spiffeID spiffeid.ID, certificates []*x509.Certificate, canReattest bool) *agentv1.AttestAgentResponse {
 	svid := &types.X509SVID{
 		Id:        api.ProtoFromID(spiffeID),
 		CertChain: x509util.RawCertsFromCertificates(certificates),
@@ -668,7 +680,8 @@ func getAttestAgentResponse(spiffeID spiffeid.ID, certificates []*x509.Certifica
 	return &agentv1.AttestAgentResponse{
 		Step: &agentv1.AttestAgentResponse_Result_{
 			Result: &agentv1.AttestAgentResponse_Result{
-				Svid: svid,
+				Svid:         svid,
+				Reattestable: canReattest,
 			},
 		},
 	}
@@ -683,6 +696,10 @@ func fieldsFromFilterRequest(filter *agentv1.ListAgentsRequest_Filter) logrus.Fi
 
 	if filter.ByBanned != nil {
 		fields[telemetry.ByBanned] = filter.ByBanned.Value
+	}
+
+	if filter.ByCanReattest != nil {
+		fields[telemetry.ByCanReattest] = filter.ByCanReattest.Value
 	}
 
 	if filter.BySelectorMatch != nil {

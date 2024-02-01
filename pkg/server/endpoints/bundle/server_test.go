@@ -18,8 +18,8 @@ import (
 
 	"github.com/sirupsen/logrus"
 	"github.com/sirupsen/logrus/hooks/test"
+	"github.com/spiffe/go-spiffe/v2/bundle/spiffebundle"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
-	"github.com/spiffe/spire/pkg/common/bundleutil"
 	"github.com/spiffe/spire/pkg/server/endpoints/bundle/internal/acmetest"
 	"github.com/spiffe/spire/test/fakes/fakeserverkeymanager"
 	"github.com/spiffe/spire/test/spiretest"
@@ -38,8 +38,8 @@ func TestServer(t *testing.T) {
 	// the root lifetimes are used to heuristically determine the refresh hint.
 	// since the content doesn't really matter, we'll just add the server cert.
 	trustDomain := spiffeid.RequireTrustDomainFromString("domain.test")
-	bundle := bundleutil.New(trustDomain)
-	bundle.AppendRootCA(serverCert)
+	bundle := spiffebundle.New(trustDomain)
+	bundle.AddX509Authority(serverCert)
 
 	// even though this will be SPIFFE authentication in production, there is
 	// no functional change in the code based on the server certificate
@@ -56,15 +56,18 @@ func TestServer(t *testing.T) {
 		},
 	}
 
+	fiveMinutes := time.Minute * 5
+
 	testCases := []struct {
-		name       string
-		method     string
-		path       string
-		status     int
-		body       string
-		bundle     *bundleutil.Bundle
-		serverCert *x509.Certificate
-		reqErr     string
+		name        string
+		method      string
+		path        string
+		status      int
+		body        string
+		bundle      *spiffebundle.Bundle
+		serverCert  *x509.Certificate
+		reqErr      string
+		refreshHint *time.Duration
 	}{
 		{
 			name:   "success",
@@ -86,6 +89,28 @@ func TestServer(t *testing.T) {
 			}`, base64.StdEncoding.EncodeToString(serverCert.Raw)),
 			bundle:     bundle,
 			serverCert: serverCert,
+		},
+		{
+			name:   "manually configured refresh hint",
+			method: "GET",
+			path:   "/",
+			status: http.StatusOK,
+			body: fmt.Sprintf(`{
+				"keys": [
+					{
+						"crv":"P-256",
+						"kty":"EC",
+						"use":"x509-svid",
+						"x":"kkEn5E2Hd_rvCRDCVMNj3deN0ADij9uJVmN-El0CJz0",
+						"y":"qNrnjhtzrtTR0bRgI2jPIC1nEgcWNX63YcZOEzyo1iA",
+						"x5c": [%q]
+					}
+				],
+				"spiffe_refresh_hint": 300
+			}`, base64.StdEncoding.EncodeToString(serverCert.Raw)),
+			bundle:      bundle,
+			serverCert:  serverCert,
+			refreshHint: &fiveMinutes,
 		},
 		{
 			name:       "invalid method",
@@ -123,6 +148,7 @@ func TestServer(t *testing.T) {
 			addr, done := newTestServer(t,
 				testGetter(testCase.bundle),
 				testSPIFFEAuth(testCase.serverCert, serverKey),
+				testCase.refreshHint,
 			)
 			defer done()
 
@@ -156,7 +182,7 @@ func TestACMEAuth(t *testing.T) {
 	dir := spiretest.TempDir(t)
 
 	trustDomain := spiffeid.RequireTrustDomainFromString("domain.test")
-	bundle := bundleutil.New(trustDomain)
+	bundle := spiffebundle.New(trustDomain)
 	km := fakeserverkeymanager.New(t)
 
 	ca := acmetest.NewCAServer([]string{"tls-alpn-01"}, []string{"domain.test"})
@@ -173,7 +199,7 @@ func TestACMEAuth(t *testing.T) {
 
 	// Perform the initial challenge to obtain a new certificate but without
 	// the TOS being accepted. This should fail. We require the ToSAccepted
-	// configurable to be set in order to funcion.
+	// configurable to be set in order to function.
 	t.Run("new-account-tos-not-accepted", func(t *testing.T) {
 		log, hook := test.NewNullLogger()
 		addr, done := newTestServer(t, testGetter(bundle),
@@ -184,6 +210,7 @@ func TestACMEAuth(t *testing.T) {
 				Email:        "admin@domain.test",
 				ToSAccepted:  false,
 			}),
+			nil,
 		)
 		defer done()
 
@@ -216,6 +243,7 @@ func TestACMEAuth(t *testing.T) {
 				Email:        "admin@domain.test",
 				ToSAccepted:  true,
 			}),
+			nil,
 		)
 		defer done()
 
@@ -264,6 +292,7 @@ func TestACMEAuth(t *testing.T) {
 				Email:        "admin@domain.test",
 				ToSAccepted:  true,
 			}),
+			nil,
 		)
 		defer done()
 
@@ -275,7 +304,7 @@ func TestACMEAuth(t *testing.T) {
 	})
 }
 
-func newTestServer(t *testing.T, getter Getter, serverAuth ServerAuth) (net.Addr, func()) {
+func newTestServer(t *testing.T, getter Getter, serverAuth ServerAuth, refreshHint *time.Duration) (net.Addr, func()) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	addrCh := make(chan net.Addr, 1)
@@ -290,11 +319,12 @@ func newTestServer(t *testing.T, getter Getter, serverAuth ServerAuth) (net.Addr
 
 	log, _ := test.NewNullLogger()
 	server := NewServer(ServerConfig{
-		Log:        log,
-		Address:    "localhost:0",
-		Getter:     getter,
-		ServerAuth: serverAuth,
-		listen:     listen,
+		Log:         log,
+		Address:     "localhost:0",
+		Getter:      getter,
+		ServerAuth:  serverAuth,
+		listen:      listen,
+		RefreshHint: refreshHint,
 	})
 
 	errCh := make(chan error, 1)
@@ -317,8 +347,8 @@ func newTestServer(t *testing.T, getter Getter, serverAuth ServerAuth) (net.Addr
 	return addr, cancel
 }
 
-func testGetter(bundle *bundleutil.Bundle) Getter {
-	return GetterFunc(func(ctx context.Context) (*bundleutil.Bundle, error) {
+func testGetter(bundle *spiffebundle.Bundle) Getter {
+	return GetterFunc(func(ctx context.Context) (*spiffebundle.Bundle, error) {
 		if bundle == nil {
 			return nil, errors.New("no bundle configured")
 		}

@@ -1,5 +1,4 @@
 //go:build windows
-// +build windows
 
 package run
 
@@ -9,7 +8,7 @@ import (
 	"net"
 
 	util_cmd "github.com/spiffe/spire/cmd/spire-server/util"
-	"github.com/spiffe/spire/pkg/common/util"
+	"github.com/spiffe/spire/pkg/common/namedpipe"
 )
 
 func (c *serverConfig) addOSFlags(flags *flag.FlagSet) {
@@ -17,7 +16,7 @@ func (c *serverConfig) addOSFlags(flags *flag.FlagSet) {
 }
 
 func (c *serverConfig) getAddr() (net.Addr, error) {
-	return util.GetNamedPipeAddr(c.Experimental.NamedPipeName), nil
+	return namedpipe.AddrFromName(c.Experimental.NamedPipeName), nil
 }
 
 func (c *serverConfig) setDefaultsIfNeeded() {

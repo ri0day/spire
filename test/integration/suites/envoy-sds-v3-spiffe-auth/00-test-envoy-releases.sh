@@ -20,6 +20,10 @@ setup-tests() {
     log-debug "creating federation relationship from downstream federated to upstream server and set bundle in same command..."
     docker-compose exec -T downstream-federated-spire-server \
         /opt/spire/bin/spire-server bundle show -format spiffe > conf/upstream/server/federated-domain.test.bundle
+
+    # On macOS, there can be a delay propagating the file on the bind mount to the other container
+    sleep 1
+
     docker-compose exec -T upstream-spire-server \
         /opt/spire/bin/spire-server federation create \
         -bundleEndpointProfile "https_spiffe" \
@@ -32,6 +36,10 @@ setup-tests() {
     log-debug "bootstrapping bundle from upstream to downstream federated server..."
     docker-compose exec -T upstream-spire-server \
         /opt/spire/bin/spire-server bundle show -format spiffe > conf/downstream-federated/server/domain.test.bundle
+
+    # On macOS, there can be a delay propagating the file on the bind mount to the other container
+    sleep 1
+
     docker-compose exec -T downstream-federated-spire-server \
         /opt/spire/bin/spire-server bundle set -format spiffe -id spiffe://domain.test -path /opt/spire/conf/server/domain.test.bundle
 
@@ -78,7 +86,7 @@ test-envoy() {
     local max_checks_per_port=15
     local check_interval=1
 	
-    # Remove howdy, it i neccesary for VERIFY to get again messages
+    # Remove howdy, it i necessary for VERIFY to get again messages
     docker-compose exec -T upstream-socat rm -f /tmp/howdy
     
     log-debug "Checking mTLS: ${mTLSSocat}"
