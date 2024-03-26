@@ -360,11 +360,17 @@ const (
 	// Kid tags some key ID
 	Kid = "kid"
 
+	// LaunchLogLevel log level when service started
+	LaunchLogLevel = "launch_log_level"
+
 	// LocalAuthorityID tags a local authority ID
 	LocalAuthorityID = "local_authority_id"
 
 	// Mode tags a bundle deletion mode
 	Mode = "mode"
+
+	// NewLogLevel tags a new log level
+	NewLogLevel = "new_log_level"
 
 	// Network tags some network name ("tcp", "udp")
 	Network = "network"
@@ -380,6 +386,9 @@ const (
 
 	// ParentID tags parent ID for an entry
 	ParentID = "parent_id"
+
+	// PartialSelectors is a partial set of selectors for a workload
+	PartialSelectors = "partial_selectors"
 
 	// Path declares some logic path, likely on the file system
 	Path = "path"
