@@ -2,11 +2,13 @@ package log
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/sirupsen/logrus"
 )
@@ -45,9 +47,17 @@ func WithOutputFile(file string) Option {
 	}
 }
 
-// WithReopenableOutputFile uses ReopenableFile to support handling a signal
-// to rotate log files (e.g. from a logrotate postrotate script).
-func WithReopenableOutputFile(reopenableFile *ReopenableFile) Option {
+func WithOutputWriter(w io.Writer) Option {
+	return func(logger *Logger) error {
+		logger.SetOutput(w)
+		return nil
+	}
+}
+
+// WithReopenableOutputFile takes either a ReopenableFile, to support handling a
+// signal to rotate log files (e.g. from a logrotate postrotate script), or a
+// RotatableFile, which rotates the file itself.
+func WithReopenableOutputFile(reopenableFile ReopenableWriteCloser) Option {
 	return func(logger *Logger) error {
 		logger.SetOutput(reopenableFile)
 
@@ -69,9 +79,13 @@ func WithFormat(format string) Option {
 		case DefaultFormat:
 			// Logrus has a default formatter set up in logrus.New(), so we don't change it
 		case JSONFormat:
-			logger.Formatter = &logrus.JSONFormatter{}
+			logger.Formatter = &logrus.JSONFormatter{
+				TimestampFormat: time.RFC3339Nano,
+			}
 		case TextFormat:
-			logger.Formatter = &logrus.TextFormatter{}
+			logger.Formatter = &logrus.TextFormatter{
+				TimestampFormat: time.RFC3339Nano,
+			}
 		default:
 			return fmt.Errorf("unknown logger format: %q", format)
 		}

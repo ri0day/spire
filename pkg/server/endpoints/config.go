@@ -14,12 +14,14 @@ import (
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/spire/pkg/common/bundleutil"
 	"github.com/spiffe/spire/pkg/common/telemetry"
+	"github.com/spiffe/spire/pkg/common/tlspolicy"
 	"github.com/spiffe/spire/pkg/server/api"
 	agentv1 "github.com/spiffe/spire/pkg/server/api/agent/v1"
 	bundlev1 "github.com/spiffe/spire/pkg/server/api/bundle/v1"
 	debugv1 "github.com/spiffe/spire/pkg/server/api/debug/v1"
 	entryv1 "github.com/spiffe/spire/pkg/server/api/entry/v1"
 	healthv1 "github.com/spiffe/spire/pkg/server/api/health/v1"
+	localauthorityv1 "github.com/spiffe/spire/pkg/server/api/localauthority/v1"
 	loggerv1 "github.com/spiffe/spire/pkg/server/api/logger/v1"
 	svidv1 "github.com/spiffe/spire/pkg/server/api/svid/v1"
 	trustdomainv1 "github.com/spiffe/spire/pkg/server/api/trustdomain/v1"
@@ -53,11 +55,14 @@ type Config struct {
 	// Server CA for signing SVIDs
 	ServerCA ca.ServerCA
 
+	// CATTL is the configured CA/signing key lifetime, used for TTL warnings.
+	CATTL time.Duration
+
 	// Bundle endpoint configuration
 	BundleEndpoint bundle.EndpointConfig
 
-	// JWTKey publisher
-	JWTKeyPublisher manager.JwtKeyPublisher
+	// Authority manager
+	AuthorityManager manager.AuthorityManager
 
 	// Makes policy decisions
 	AuthPolicyEngine *authpolicy.Engine
@@ -83,31 +88,62 @@ type Config struct {
 	// CacheReloadInterval controls how often the in-memory entry cache reloads
 	CacheReloadInterval time.Duration
 
+	// CacheReloadInterval controls how often the in-memory events based cache full reloads
+	FullCacheReloadInterval time.Duration
+
 	// EventsBasedCache enabled event driven cache reloads
 	EventsBasedCache bool
 
 	// PruneEventsOlderThan controls how long events can live before they are pruned
 	PruneEventsOlderThan time.Duration
 
-	AuditLogEnabled bool
+	// EventTimeout controls how long to wait for an event before giving up
+	EventTimeout time.Duration
+
+	AuditLogEnabled          bool
+	AuditLogExcludeAgentSync bool
+
+	// ProxyProtocolTrustedCIDRs is a list of trusted CIDRs for PROXY protocol.
+	// When non-empty, PROXY protocol is enabled and only connections from
+	// these CIDRs are allowed to send PROXY headers.
+	ProxyProtocolTrustedCIDRs []string
 
 	// AdminIDs are a list of fixed IDs that when presented by a caller in an
 	// X509-SVID, are granted admin rights.
 	AdminIDs []spiffeid.ID
 
 	BundleManager *bundle_client.Manager
+
+	// TLSPolicy determines the post-quantum-safe policy used for all TLS
+	// connections.
+	TLSPolicy tlspolicy.Policy
+
+	MaxAttestedNodeInfoStaleness time.Duration
+
+	AgentSpiffeIdAsSelector bool
+
+	AllowNonconformingAgentIDs bool
 }
 
-func (c *Config) maybeMakeBundleEndpointServer() Server {
+func (c *Config) maybeMakeBundleEndpointServer() (Server, func(context.Context) error) {
 	if c.BundleEndpoint.Address == nil {
-		return nil
+		return nil, nil
 	}
 	c.Log.WithField("addr", c.BundleEndpoint.Address).WithField("refresh_hint", c.BundleEndpoint.RefreshHint).Info("Serving bundle endpoint")
 
+	var certificateReloadTask func(context.Context) error
 	var serverAuth bundle.ServerAuth
-	if c.BundleEndpoint.ACME != nil {
+	switch {
+	case c.BundleEndpoint.ACME != nil:
 		serverAuth = bundle.ACMEAuth(c.Log.WithField(telemetry.SubsystemName, "bundle_acme"), c.Catalog.GetKeyManager(), *c.BundleEndpoint.ACME)
-	} else {
+	case c.BundleEndpoint.DiskCertManager != nil:
+		serverAuth = c.BundleEndpoint.DiskCertManager
+		// Start watching for file changes
+		certificateReloadTask = func(ctx context.Context) error {
+			c.BundleEndpoint.DiskCertManager.WatchFileChanges(ctx)
+			return nil
+		}
+	default:
 		serverAuth = bundle.SPIFFEAuth(func() ([]*x509.Certificate, crypto.PrivateKey, error) {
 			state := c.SVIDObserver.State()
 			return state.SVID, state.Key, nil
@@ -130,25 +166,27 @@ func (c *Config) maybeMakeBundleEndpointServer() Server {
 		}),
 		RefreshHint: c.BundleEndpoint.RefreshHint,
 		ServerAuth:  serverAuth,
-	})
+		TLSPolicy:   c.TLSPolicy,
+	}), certificateReloadTask
 }
 
 func (c *Config) makeAPIServers(entryFetcher api.AuthorizedEntryFetcher) APIServers {
 	ds := c.Catalog.GetDataStore()
-	upstreamPublisher := UpstreamPublisher(c.JWTKeyPublisher)
 
 	return APIServers{
 		AgentServer: agentv1.New(agentv1.Config{
-			DataStore:   ds,
-			ServerCA:    c.ServerCA,
-			TrustDomain: c.TrustDomain,
-			Catalog:     c.Catalog,
-			Clock:       c.Clock,
+			DataStore:                  ds,
+			ServerCA:                   c.ServerCA,
+			TrustDomain:                c.TrustDomain,
+			Catalog:                    c.Catalog,
+			Clock:                      c.Clock,
+			AgentSpiffeIdAsSelector:    c.AgentSpiffeIdAsSelector,
+			AllowNonconformingAgentIDs: c.AllowNonconformingAgentIDs,
 		}),
 		BundleServer: bundlev1.New(bundlev1.Config{
 			TrustDomain:       c.TrustDomain,
 			DataStore:         ds,
-			UpstreamPublisher: upstreamPublisher,
+			UpstreamPublisher: c.AuthorityManager,
 		}),
 		DebugServer: debugv1.New(debugv1.Config{
 			TrustDomain:  c.TrustDomain,
@@ -158,6 +196,7 @@ func (c *Config) makeAPIServers(entryFetcher api.AuthorizedEntryFetcher) APIServ
 			Uptime:       c.Uptime,
 		}),
 		EntryServer: entryv1.New(entryv1.Config{
+			CATTL:        c.CATTL,
 			TrustDomain:  c.TrustDomain,
 			DataStore:    ds,
 			EntryFetcher: entryFetcher,
@@ -170,6 +209,8 @@ func (c *Config) makeAPIServers(entryFetcher api.AuthorizedEntryFetcher) APIServ
 			Log: c.RootLog,
 		}),
 		SVIDServer: svidv1.New(svidv1.Config{
+			CATTL:        c.CATTL,
+			Clock:        c.Clock,
 			TrustDomain:  c.TrustDomain,
 			EntryFetcher: entryFetcher,
 			ServerCA:     c.ServerCA,
@@ -179,6 +220,11 @@ func (c *Config) makeAPIServers(entryFetcher api.AuthorizedEntryFetcher) APIServ
 			TrustDomain:     c.TrustDomain,
 			DataStore:       ds,
 			BundleRefresher: c.BundleManager,
+		}),
+		LocalAUthorityServer: localauthorityv1.New(localauthorityv1.Config{
+			TrustDomain: c.TrustDomain,
+			CAManager:   c.AuthorityManager,
+			DataStore:   ds,
 		}),
 	}
 }

@@ -3,7 +3,7 @@ package dscache
 import (
 	"context"
 	"encoding/base64"
-	"fmt"
+	"errors"
 	"testing"
 	"time"
 
@@ -147,7 +147,6 @@ func TestBundleInvalidations(t *testing.T) {
 			},
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			// Create datastore and cache
 			ds := fakedatastore.New(t)
@@ -162,10 +161,10 @@ func TestBundleInvalidations(t *testing.T) {
 			_, err = cache.FetchBundle(context.Background(), td)
 			require.NoError(t, err)
 
-			// Run the function that invalidates the bundle (Prune, Append, etc)
+			// Run the function that invalidates the bundle (Prune, Append, etc.)
 			// (which may or not fail according to dsFailure flag)
 			if tt.dsFailure {
-				ds.SetNextError(fmt.Errorf("failure"))
+				ds.SetNextError(errors.New("failure"))
 			}
 			tt.invalidatingFunc(cache)
 

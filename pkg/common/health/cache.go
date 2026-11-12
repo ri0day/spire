@@ -41,6 +41,7 @@ func newCache(log logrus.FieldLogger, clock clock.Clock) *cache {
 		checkerSubsystems: make(map[string]*checkerSubsystem),
 		log:               log,
 		clk:               clock,
+		checkInterval:     readyCheckInterval,
 	}
 }
 
@@ -49,6 +50,8 @@ type cache struct {
 
 	mtx sync.RWMutex
 	clk clock.Clock
+
+	checkInterval time.Duration
 
 	log   logrus.FieldLogger
 	hooks struct {
@@ -68,20 +71,6 @@ func (c *cache) addCheck(name string, checkable Checkable) error {
 		checkable: checkable,
 	}
 	return nil
-}
-
-func (c *cache) getCheckerSubsystems() map[string]*checkerSubsystem {
-	c.mtx.RLock()
-	defer c.mtx.RUnlock()
-
-	checkerSubsystems := make(map[string]*checkerSubsystem, len(c.checkerSubsystems))
-	for k, v := range c.checkerSubsystems {
-		checkerSubsystems[k] = &checkerSubsystem{
-			checkable: v.checkable,
-			state:     v.state,
-		}
-	}
-	return checkerSubsystems
 }
 
 func (c *cache) getStatuses() map[string]checkState {
@@ -104,62 +93,78 @@ func (c *cache) start(ctx context.Context) error {
 		return errors.New("no health checks defined")
 	}
 
-	c.startRunner(ctx)
+	c.startRunners(ctx)
 	return nil
 }
 
-func (c *cache) startRunner(ctx context.Context) {
+func (c *cache) startRunners(ctx context.Context) {
 	c.log.Debug("Initializing health checkers")
-	checkFunc := func() {
-		for name, checker := range c.getCheckerSubsystems() {
-			state, err := verifyStatus(checker.checkable)
+	for name, checker := range c.checkerSubsystems {
+		go c.runCheck(ctx, name, checker.checkable)
+	}
+}
 
-			checkState := checkState{
-				details:   state,
-				checkTime: c.clk.Now(),
-			}
-			if err != nil {
-				c.log.WithField("check", name).
-					WithError(err).
-					Error("Health check has failed")
-				checkState.err = err
-			}
+// runCheck runs one health check on its own schedule, so that a slow check
+// does not delay the others. A failing check is retried sooner so that its
+// recovery is detected quickly.
+func (c *cache) runCheck(ctx context.Context, name string, checkable Checkable) {
+	defer c.log.WithField(telemetry.Check, name).Debug("Finishing health checker")
 
-			c.setStatus(name, checker.state, checkState)
+	var prevState checkState
+	var seenStartupError string
+	var lastFailureLog time.Time
+	for {
+		now := c.clk.Now()
+		state, err := verifyStatus(checkable)
+
+		checkState := checkState{
+			details:   state,
+			checkTime: c.clk.Now(),
 		}
+		if err != nil {
+			if state.Started == nil || *state.Started {
+				if prevState.err == nil || now.Sub(lastFailureLog) >= failureLogInterval {
+					c.log.WithField(telemetry.Check, name).
+						WithError(err).
+						Error("Health check has failed")
+					lastFailureLog = now
+				}
+			} else if strErr := err.Error(); strErr != seenStartupError {
+				c.log.WithField(telemetry.Check, name).
+					WithError(err).
+					Warn("Health check has failed. Starting up still.")
+				seenStartupError = strErr
+			}
+			checkState.err = err
+		}
+
+		prevState = c.setStatus(name, prevState, checkState)
 		if c.hooks.statusUpdated != nil {
 			c.hooks.statusUpdated <- struct{}{}
 		}
-	}
 
-	ticker := c.clk.Ticker(readyCheckInterval)
-
-	go func() {
-		defer func() {
-			c.log.Debug("Finishing health checker")
-			ticker.Stop()
-		}()
-		for {
-			checkFunc()
-
-			select {
-			case <-ticker.C:
-			case <-ctx.Done():
-				return
-			}
+		interval := c.checkInterval
+		if err != nil {
+			interval = readyCheckFailureInterval
 		}
-	}()
+		select {
+		case <-c.clk.After(interval):
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
-func (c *cache) setStatus(name string, prevState checkState, state checkState) {
+func (c *cache) setStatus(name string, prevState checkState, state checkState) checkState {
 	c.embellishState(name, &prevState, &state)
 
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
 
-	// We are sure that checker exist in this place, to be able to check
+	// We are sure that checker exists in this place, to be able to check
 	// status of a subsystem we must call the checker inside this map
 	c.checkerSubsystems[name].state = state
+	return state
 }
 
 func (c *cache) embellishState(name string, prevState, state *checkState) {

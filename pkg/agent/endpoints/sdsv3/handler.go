@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
+	"os"
 	"sort"
 	"strconv"
 
@@ -22,7 +24,6 @@ import (
 	"github.com/spiffe/spire/pkg/common/pemutil"
 	"github.com/spiffe/spire/pkg/common/telemetry"
 	"github.com/spiffe/spire/proto/spire/common"
-	"github.com/zeebo/errs"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -31,20 +32,29 @@ import (
 
 const (
 	disableSPIFFECertValidationKey = "disable_spiffe_cert_validation"
+
+	MethodStreamSecrets = "/envoy.service.secret.v3.SecretDiscoveryService/StreamSecrets"
+	MethodFetchSecrets  = "/envoy.service.secret.v3.SecretDiscoveryService/FetchSecrets"
 )
+
+// RateLimiter enforces per-selector-set rate limiting on SDS methods.
+type RateLimiter interface {
+	RateLimit(fullMethod string, selectors []*common.Selector) error
+}
 
 type Attestor interface {
 	Attest(ctx context.Context) ([]*common.Selector, error)
 }
 
 type Manager interface {
-	SubscribeToCacheChanges(ctx context.Context, key cache.Selectors) (cache.Subscriber, error)
-	FetchWorkloadUpdate(selectors []*common.Selector) *cache.WorkloadUpdate
+	SubscribeToX509CacheChanges(ctx context.Context, key cache.Selectors) (cache.Subscriber[cache.X509WorkloadUpdate], error)
+	FetchWorkloadUpdate(selectors []*common.Selector) *cache.X509WorkloadUpdate
 }
 
 type Config struct {
 	Attestor                    Attestor
 	Manager                     Manager
+	RateLimiter                 RateLimiter
 	DefaultAllBundlesName       string
 	DefaultBundleName           string
 	DefaultSVIDName             string
@@ -64,16 +74,39 @@ func New(config Config) *Handler {
 	return &Handler{c: config}
 }
 
+func (h *Handler) rateLimit(ctx context.Context, fullMethod string, selectors []*common.Selector) error {
+	if h.c.RateLimiter == nil {
+		return nil
+	}
+	// Exempt the agent's own calls from rate limiting so that an
+	// operator-configured limit can't deny the agent itself (e.g. health
+	// probes) and mark it unhealthy. Mirrors the Workload API handler.
+	if isAgent(ctx) {
+		return nil
+	}
+	return h.c.RateLimiter.RateLimit(fullMethod, selectors)
+}
+
+// isAgent returns true if the caller PID from the provided context is the
+// agent's own PID.
+func isAgent(ctx context.Context) bool {
+	return rpccontext.CallerPID(ctx) == os.Getpid()
+}
+
 func (h *Handler) StreamSecrets(stream secret_v3.SecretDiscoveryService_StreamSecretsServer) error {
 	log := rpccontext.Logger(stream.Context())
 
 	selectors, err := h.c.Attestor.Attest(stream.Context())
 	if err != nil {
 		log.WithError(err).Error("Failed to attest the workload")
+		return workloadAttestationFailedError(stream.Context())
+	}
+
+	if err := h.rateLimit(stream.Context(), MethodStreamSecrets, selectors); err != nil {
 		return err
 	}
 
-	sub, err := h.c.Manager.SubscribeToCacheChanges(stream.Context(), selectors)
+	sub, err := h.c.Manager.SubscribeToX509CacheChanges(stream.Context(), selectors)
 	if err != nil {
 		log.WithError(err).Error("Subscribe to cache changes failed")
 		return err
@@ -99,10 +132,10 @@ func (h *Handler) StreamSecrets(stream secret_v3.SecretDiscoveryService_StreamSe
 	}()
 
 	var versionCounter int64
-	var versionInfo = strconv.FormatInt(versionCounter, 10)
+	versionInfo := strconv.FormatInt(versionCounter, 10)
 	var lastNonce string
 	var lastNode *core_v3.Node
-	var upd *cache.WorkloadUpdate
+	var upd *cache.X509WorkloadUpdate
 	var lastReq *discovery_v3.DiscoveryRequest
 	for {
 		select {
@@ -150,7 +183,7 @@ func (h *Handler) StreamSecrets(stream secret_v3.SecretDiscoveryService_StreamSe
 
 			// We need to send updates if the requested resource list has changed
 			// either explicitly, or implicitly because this is the first request.
-			var sendUpdates = lastReq == nil || subListChanged(lastReq.ResourceNames, newReq.ResourceNames)
+			sendUpdates := lastReq == nil || subListChanged(lastReq.ResourceNames, newReq.ResourceNames)
 
 			// save request so that all future workload updates lead to SDS updates for the last request
 			lastReq = newReq
@@ -172,7 +205,9 @@ func (h *Handler) StreamSecrets(stream secret_v3.SecretDiscoveryService_StreamSe
 				continue
 			}
 		case err := <-errch:
-			log.WithError(err).Error("Received error from stream secrets server")
+			if err != nil {
+				log.WithError(err).Error("Received error from stream secrets server")
+			}
 			return err
 		}
 
@@ -206,7 +241,7 @@ func subListChanged(oldSubs []string, newSubs []string) (b bool) {
 	if len(oldSubs) != len(newSubs) {
 		return true
 	}
-	var subMap = make(map[string]bool)
+	subMap := make(map[string]bool)
 	for _, sub := range oldSubs {
 		subMap[sub] = true
 	}
@@ -222,12 +257,23 @@ func (h *Handler) DeltaSecrets(secret_v3.SecretDiscoveryService_DeltaSecretsServ
 	return status.Error(codes.Unimplemented, "Method is not implemented")
 }
 
+func workloadAttestationFailedError(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return status.Error(codes.Unavailable, "workload attestation failed")
+}
+
 func (h *Handler) FetchSecrets(ctx context.Context, req *discovery_v3.DiscoveryRequest) (*discovery_v3.DiscoveryResponse, error) {
 	log := rpccontext.Logger(ctx).WithField(telemetry.ResourceNames, req.ResourceNames)
 
 	selectors, err := h.c.Attestor.Attest(ctx)
 	if err != nil {
 		log.WithError(err).Error("Failed to attest the workload")
+		return nil, workloadAttestationFailedError(ctx)
+	}
+
+	if err := h.rateLimit(ctx, MethodFetchSecrets, selectors); err != nil {
 		return nil, err
 	}
 
@@ -246,7 +292,7 @@ func (h *Handler) FetchSecrets(ctx context.Context, req *discovery_v3.DiscoveryR
 	return resp, nil
 }
 
-func (h *Handler) buildResponse(versionInfo string, req *discovery_v3.DiscoveryRequest, upd *cache.WorkloadUpdate) (resp *discovery_v3.DiscoveryResponse, err error) {
+func (h *Handler) buildResponse(versionInfo string, req *discovery_v3.DiscoveryRequest, upd *cache.X509WorkloadUpdate) (resp *discovery_v3.DiscoveryResponse, err error) {
 	resp = &discovery_v3.DiscoveryResponse{
 		TypeUrl:     req.TypeUrl,
 		VersionInfo: versionInfo,
@@ -353,11 +399,9 @@ type validationContextBuilder interface {
 	buildAll(resourceName string) (*anypb.Any, error)
 }
 
-func (h *Handler) getValidationContextBuilder(req *discovery_v3.DiscoveryRequest, upd *cache.WorkloadUpdate) (validationContextBuilder, error) {
+func (h *Handler) getValidationContextBuilder(req *discovery_v3.DiscoveryRequest, upd *cache.X509WorkloadUpdate) (validationContextBuilder, error) {
 	federatedBundles := make(map[spiffeid.TrustDomain]*spiffebundle.Bundle)
-	for td, federatedBundle := range upd.FederatedBundles {
-		federatedBundles[td] = federatedBundle
-	}
+	maps.Copy(federatedBundles, upd.FederatedBundles)
 	if !h.isSPIFFECertValidationDisabled(req) && supportsSPIFFEAuthExtension(req) {
 		return newSpiffeBuilder(upd.Bundle, federatedBundles)
 	}
@@ -422,9 +466,7 @@ func newSpiffeBuilder(tdBundle *spiffebundle.Bundle, federatedBundles map[spiffe
 	}
 
 	// Add all federated bundles
-	for td, bundle := range federatedBundles {
-		bundles[td] = bundle
-	}
+	maps.Copy(bundles, federatedBundles)
 
 	return &spiffeBuilder{
 		bundles: bundles,
@@ -514,7 +556,7 @@ func (b *spiffeBuilder) buildAll(resourceName string) (*anypb.Any, error) {
 }
 
 func supportsSPIFFEAuthExtension(req *discovery_v3.DiscoveryRequest) bool {
-	if buildVersion := req.Node.GetUserAgentBuildVersion(); buildVersion != nil {
+	if buildVersion := req.Node.GetUserAgentBuildVersion(); buildVersion != nil && buildVersion.Version != nil {
 		version := buildVersion.Version
 		return (version.MajorNumber == 1 && version.MinorNumber > 17) || version.MajorNumber > 1
 	}
@@ -546,7 +588,7 @@ func parseBool(v *structpb.Value) (bool, error) {
 	return false, fmt.Errorf("unsupported value type %T", v)
 }
 
-func buildTLSCertificate(identity cache.Identity, defaultSVIDName string) (*anypb.Any, error) {
+func buildTLSCertificate(identity cache.X509Identity, defaultSVIDName string) (*anypb.Any, error) {
 	name := identity.Entry.SpiffeId
 	if defaultSVIDName != "" {
 		name = defaultSVIDName
@@ -582,7 +624,7 @@ func nextNonce() (string, error) {
 	b := make([]byte, 4)
 	_, err := rand.Read(b)
 	if err != nil {
-		return "", errs.Wrap(err)
+		return "", err
 	}
 	return hex.EncodeToString(b), nil
 }

@@ -44,7 +44,10 @@ func TestCreate(t *testing.T) {
 					DnsNames:      []string{"unu1000", "ung1000"},
 					Downstream:    true,
 					StoreSvid:     true,
-					CreatedAt:     1547583197,
+					AdditionalAttributes: &types.Entry_AdditionalAttributes{
+						DisableX509SvidPrefetch: true,
+					},
+					CreatedAt: 1547583197,
 				},
 				Status: &types.Status{
 					Code:    int32(codes.OK),
@@ -54,7 +57,7 @@ func TestCreate(t *testing.T) {
 		},
 	}
 
-	fakeRespOKFromCmd2 := &entryv1.BatchCreateEntryResponse{
+	fakeRespOKFromCmdWithoutJwtTtl := &entryv1.BatchCreateEntryResponse{
 		Results: []*entryv1.BatchCreateEntryResponse_Result{
 			{
 				Entry: &types.Entry{
@@ -93,7 +96,10 @@ func TestCreate(t *testing.T) {
 					X509SvidTtl: 200,
 					JwtSvidTtl:  30,
 					Admin:       true,
-					CreatedAt:   1547583197,
+					AdditionalAttributes: &types.Entry_AdditionalAttributes{
+						DisableX509SvidPrefetch: false,
+					},
+					CreatedAt: 1547583197,
 				},
 				Status: &types.Status{
 					Code:    int32(codes.OK),
@@ -109,7 +115,10 @@ func TestCreate(t *testing.T) {
 					X509SvidTtl: 200,
 					JwtSvidTtl:  30,
 					Hint:        "internal",
-					CreatedAt:   1547583197,
+					AdditionalAttributes: &types.Entry_AdditionalAttributes{
+						DisableX509SvidPrefetch: false,
+					},
+					CreatedAt: 1547583197,
 				},
 				Status: &types.Status{
 					Code:    int32(codes.OK),
@@ -128,7 +137,29 @@ func TestCreate(t *testing.T) {
 					StoreSvid:   true,
 					X509SvidTtl: 200,
 					JwtSvidTtl:  30,
-					CreatedAt:   1547583197,
+					AdditionalAttributes: &types.Entry_AdditionalAttributes{
+						DisableX509SvidPrefetch: false,
+					},
+					CreatedAt: 1547583197,
+				},
+				Status: &types.Status{
+					Code:    int32(codes.OK),
+					Message: "OK",
+				},
+			},
+			{
+				Entry: &types.Entry{
+					Id:          "entry-id-4",
+					SpiffeId:    &types.SPIFFEID{TrustDomain: "example.org", Path: "/additionalattr"},
+					ParentId:    &types.SPIFFEID{TrustDomain: "example.org", Path: "/spire/agent/join_token/TokenBlog"},
+					Selectors:   []*types.Selector{{Type: "unix", Value: "uid:1111"}},
+					X509SvidTtl: 200,
+					JwtSvidTtl:  30,
+					Admin:       true,
+					AdditionalAttributes: &types.Entry_AdditionalAttributes{
+						DisableX509SvidPrefetch: true,
+					},
+					CreatedAt: 1547583197,
 				},
 				Status: &types.Status{
 					Code:    int32(codes.OK),
@@ -186,28 +217,16 @@ func TestCreate(t *testing.T) {
 			expErrJSON:   "Error: selector \"unix\" must be formatted as type:value\n",
 		},
 		{
-			name:         "Negative TTL",
-			args:         []string{"-selector", "unix", "-parentID", "spiffe://example.org/parent", "-spiffeID", "spiffe://example.org/workload", "-ttl", "-10"},
-			expErrPretty: "Error: a positive TTL is required\n",
-			expErrJSON:   "Error: a positive TTL is required\n",
+			name:         "Negative X509SvidTtl",
+			args:         []string{"-selector", "unix", "-parentID", "spiffe://example.org/parent", "-spiffeID", "spiffe://example.org/workload", "-x509SVIDTTL", "-10"},
+			expErrPretty: "Error: a positive x509-SVID TTL is required\n",
+			expErrJSON:   "Error: a positive x509-SVID TTL is required\n",
 		},
 		{
-			name:         "Invalid TTL and X509SvidTtl",
-			args:         []string{"-selector", "unix", "-parentID", "spiffe://example.org/parent", "-spiffeID", "spiffe://example.org/workload", "-ttl", "10", "-x509SVIDTTL", "20"},
-			expErrPretty: "Error: use x509SVIDTTL and jwtSVIDTTL flags or the deprecated ttl flag\n",
-			expErrJSON:   "Error: use x509SVIDTTL and jwtSVIDTTL flags or the deprecated ttl flag\n",
-		},
-		{
-			name:         "Invalid TTL and JwtSvidTtl",
-			args:         []string{"-selector", "unix", "-parentID", "spiffe://example.org/parent", "-spiffeID", "spiffe://example.org/workload", "-ttl", "10", "-jwtSVIDTTL", "20"},
-			expErrPretty: "Error: use x509SVIDTTL and jwtSVIDTTL flags or the deprecated ttl flag\n",
-			expErrJSON:   "Error: use x509SVIDTTL and jwtSVIDTTL flags or the deprecated ttl flag\n",
-		},
-		{
-			name:         "Invalid TTL and both X509SvidTtl and JwtSvidTtl",
-			args:         []string{"-selector", "unix", "-parentID", "spiffe://example.org/parent", "-spiffeID", "spiffe://example.org/workload", "-ttl", "10", "-x509SVIDTTL", "20", "-jwtSVIDTTL", "30"},
-			expErrPretty: "Error: use x509SVIDTTL and jwtSVIDTTL flags or the deprecated ttl flag\n",
-			expErrJSON:   "Error: use x509SVIDTTL and jwtSVIDTTL flags or the deprecated ttl flag\n",
+			name:         "Negative jwtSVIDTTL",
+			args:         []string{"-selector", "unix", "-parentID", "spiffe://example.org/parent", "-spiffeID", "spiffe://example.org/workload", "-jwtSVIDTTL", "-10"},
+			expErrPretty: "Error: a positive JWT-SVID TTL is required\n",
+			expErrJSON:   "Error: a positive JWT-SVID TTL is required\n",
 		},
 		{
 			name:         "Federated node entries",
@@ -247,6 +266,7 @@ func TestCreate(t *testing.T) {
 				"-downstream",
 				"-storeSVID",
 				"-hint", "internal",
+				"-disableX509SVIDPrefetch",
 			},
 			expReq: &entryv1.BatchCreateEntryRequest{
 				Entries: []*types.Entry{
@@ -266,27 +286,30 @@ func TestCreate(t *testing.T) {
 						Downstream:    true,
 						StoreSvid:     true,
 						Hint:          "internal",
+						AdditionalAttributes: &types.Entry_AdditionalAttributes{
+							DisableX509SvidPrefetch: true,
+						},
 					},
 				},
 			},
 			fakeResp: fakeRespOKFromCmd,
-			expOutPretty: fmt.Sprintf(`Entry ID         : entry-id
-SPIFFE ID        : spiffe://example.org/workload
-Parent ID        : spiffe://example.org/parent
-Revision         : 0
-Downstream       : true
-X509-SVID TTL    : 60
-JWT-SVID TTL     : 30
-Expiration time  : %s
-Selector         : zebra:zebra:2000
-Selector         : alpha:alpha:2000
-FederatesWith    : spiffe://domaina.test
-FederatesWith    : spiffe://domainb.test
-DNS name         : unu1000
-DNS name         : ung1000
-Admin            : true
-StoreSvid        : true
-
+			expOutPretty: fmt.Sprintf(`Entry ID                : entry-id
+SPIFFE ID               : spiffe://example.org/workload
+Parent ID               : spiffe://example.org/parent
+Revision                : 0
+Downstream              : true
+X509-SVID TTL           : 60
+JWT-SVID TTL            : 30
+Expiration time         : %s
+Selector                : zebra:zebra:2000
+Selector                : alpha:alpha:2000
+FederatesWith           : spiffe://domaina.test
+FederatesWith           : spiffe://domainb.test
+DNS name                : unu1000
+DNS name                : ung1000
+Admin                   : true
+StoreSvid               : true
+DisableX509SvidPrefetch : true
 `, time.Unix(1552410266, 0).UTC()),
 			expOutJSON: `{
   "results": [
@@ -315,6 +338,7 @@ StoreSvid        : true
             "value": "alpha:2000"
           }
         ],
+        "wit_svid_ttl": 0,
         "x509_svid_ttl": 60,
         "federates_with": [
           "spiffe://domaina.test",
@@ -331,7 +355,11 @@ StoreSvid        : true
         ],
         "revision_number": "0",
         "store_svid": true,
-        "jwt_svid_ttl": 30
+        "jwt_svid_ttl": 30,
+        "additional_attributes": {
+          "disable_x509_svid_prefetch": true,
+          "jwt_svid_include_jti": false
+        }
       }
     }
   ]
@@ -346,7 +374,7 @@ StoreSvid        : true
 				"-parentID", "spiffe://example.org/parent",
 				"-selector", "zebra:zebra:2000",
 				"-selector", "alpha:alpha:2000",
-				"-ttl", "60",
+				"-x509SVIDTTL", "60",
 				"-federatesWith", "spiffe://domaina.test",
 				"-federatesWith", "spiffe://domainb.test",
 				"-admin",
@@ -376,23 +404,23 @@ StoreSvid        : true
 					},
 				},
 			},
-			fakeResp: fakeRespOKFromCmd2,
-			expOutPretty: fmt.Sprintf(`Entry ID         : entry-id
-SPIFFE ID        : spiffe://example.org/workload
-Parent ID        : spiffe://example.org/parent
-Revision         : 0
-Downstream       : true
-X509-SVID TTL    : 60
-JWT-SVID TTL     : default
-Expiration time  : %s
-Selector         : zebra:zebra:2000
-Selector         : alpha:alpha:2000
-FederatesWith    : spiffe://domaina.test
-FederatesWith    : spiffe://domainb.test
-DNS name         : unu1000
-DNS name         : ung1000
-Admin            : true
-StoreSvid        : true
+			fakeResp: fakeRespOKFromCmdWithoutJwtTtl,
+			expOutPretty: fmt.Sprintf(`Entry ID                : entry-id
+SPIFFE ID               : spiffe://example.org/workload
+Parent ID               : spiffe://example.org/parent
+Revision                : 0
+Downstream              : true
+X509-SVID TTL           : 60
+JWT-SVID TTL            : default
+Expiration time         : %s
+Selector                : zebra:zebra:2000
+Selector                : alpha:alpha:2000
+FederatesWith           : spiffe://domaina.test
+FederatesWith           : spiffe://domainb.test
+DNS name                : unu1000
+DNS name                : ung1000
+Admin                   : true
+StoreSvid               : true
 
 `, time.Unix(1552410266, 0).UTC()),
 			expOutJSON: `{
@@ -422,110 +450,7 @@ StoreSvid        : true
             "value": "alpha:2000"
           }
         ],
-        "x509_svid_ttl": 60,
-        "federates_with": [
-          "spiffe://domaina.test",
-          "spiffe://domainb.test"
-        ],
-        "hint": "",
-        "admin": true,
-        "created_at": "1547583197",
-        "downstream": true,
-        "expires_at": "1552410266",
-        "dns_names": [
-          "unu1000",
-          "ung1000"
-        ],
-        "revision_number": "0",
-        "store_svid": true,
-        "jwt_svid_ttl": 0
-      }
-    }
-  ]
-}`,
-		},
-		{
-			name: "Create succeeds using deprecated command line arguments",
-			args: []string{
-				"-spiffeID", "spiffe://example.org/workload",
-				"-parentID", "spiffe://example.org/parent",
-				"-selector", "zebra:zebra:2000",
-				"-selector", "alpha:alpha:2000",
-				"-ttl", "60",
-				"-federatesWith", "spiffe://domaina.test",
-				"-federatesWith", "spiffe://domainb.test",
-				"-admin",
-				"-entryExpiry", "1552410266",
-				"-dns", "unu1000",
-				"-dns", "ung1000",
-				"-downstream",
-				"-storeSVID",
-			},
-			expReq: &entryv1.BatchCreateEntryRequest{
-				Entries: []*types.Entry{
-					{
-						SpiffeId: &types.SPIFFEID{TrustDomain: "example.org", Path: "/workload"},
-						ParentId: &types.SPIFFEID{TrustDomain: "example.org", Path: "/parent"},
-						Selectors: []*types.Selector{
-							{Type: "zebra", Value: "zebra:2000"},
-							{Type: "alpha", Value: "alpha:2000"},
-						},
-						X509SvidTtl:   60,
-						FederatesWith: []string{"spiffe://domaina.test", "spiffe://domainb.test"},
-						Admin:         true,
-						ExpiresAt:     1552410266,
-						DnsNames:      []string{"unu1000", "ung1000"},
-						Downstream:    true,
-						StoreSvid:     true,
-					},
-				},
-			},
-			fakeResp: fakeRespOKFromCmd2,
-			expOutPretty: fmt.Sprintf(`Entry ID         : entry-id
-SPIFFE ID        : spiffe://example.org/workload
-Parent ID        : spiffe://example.org/parent
-Revision         : 0
-Downstream       : true
-X509-SVID TTL    : 60
-JWT-SVID TTL     : default
-Expiration time  : %s
-Selector         : zebra:zebra:2000
-Selector         : alpha:alpha:2000
-FederatesWith    : spiffe://domaina.test
-FederatesWith    : spiffe://domainb.test
-DNS name         : unu1000
-DNS name         : ung1000
-Admin            : true
-StoreSvid        : true
-
-`, time.Unix(1552410266, 0).UTC()),
-			expOutJSON: `{
-  "results": [
-    {
-      "status": {
-        "code": 0,
-        "message": "OK"
-      },
-      "entry": {
-        "id": "entry-id",
-        "spiffe_id": {
-          "trust_domain": "example.org",
-          "path": "/workload"
-        },
-        "parent_id": {
-          "trust_domain": "example.org",
-          "path": "/parent"
-        },
-        "selectors": [
-          {
-            "type": "zebra",
-            "value": "zebra:2000"
-          },
-          {
-            "type": "alpha",
-            "value": "alpha:2000"
-          }
-        ],
+        "wit_svid_ttl": 0,
         "x509_svid_ttl": 60,
         "federates_with": [
           "spiffe://domaina.test",
@@ -582,36 +507,57 @@ StoreSvid        : true
 						JwtSvidTtl:  30,
 						StoreSvid:   true,
 					},
+					{
+						SpiffeId:    &types.SPIFFEID{TrustDomain: "example.org", Path: "/additionalattr"},
+						ParentId:    &types.SPIFFEID{TrustDomain: "example.org", Path: "/spire/agent/join_token/TokenBlog"},
+						Selectors:   []*types.Selector{{Type: "unix", Value: "uid:1111"}},
+						X509SvidTtl: 200,
+						JwtSvidTtl:  30,
+						Admin:       true,
+						AdditionalAttributes: &types.Entry_AdditionalAttributes{
+							DisableX509SvidPrefetch: true,
+						},
+					},
 				},
 			},
 			fakeResp: fakeRespOKFromFile,
-			expOutPretty: `Entry ID         : entry-id-1
-SPIFFE ID        : spiffe://example.org/Blog
-Parent ID        : spiffe://example.org/spire/agent/join_token/TokenBlog
-Revision         : 0
-X509-SVID TTL    : 200
-JWT-SVID TTL     : 30
-Selector         : unix:uid:1111
-Admin            : true
+			expOutPretty: `Entry ID                : entry-id-1
+SPIFFE ID               : spiffe://example.org/Blog
+Parent ID               : spiffe://example.org/spire/agent/join_token/TokenBlog
+Revision                : 0
+X509-SVID TTL           : 200
+JWT-SVID TTL            : 30
+Selector                : unix:uid:1111
+Admin                   : true
 
-Entry ID         : entry-id-2
-SPIFFE ID        : spiffe://example.org/Database
-Parent ID        : spiffe://example.org/spire/agent/join_token/TokenDatabase
-Revision         : 0
-X509-SVID TTL    : 200
-JWT-SVID TTL     : 30
-Selector         : unix:uid:1111
-Hint             : internal
+Entry ID                : entry-id-2
+SPIFFE ID               : spiffe://example.org/Database
+Parent ID               : spiffe://example.org/spire/agent/join_token/TokenDatabase
+Revision                : 0
+X509-SVID TTL           : 200
+JWT-SVID TTL            : 30
+Selector                : unix:uid:1111
+Hint                    : internal
 
-Entry ID         : entry-id-3
-SPIFFE ID        : spiffe://example.org/storesvid
-Parent ID        : spiffe://example.org/spire/agent/join_token/TokenDatabase
-Revision         : 0
-X509-SVID TTL    : 200
-JWT-SVID TTL     : 30
-Selector         : type:key1:value
-Selector         : type:key2:value
-StoreSvid        : true
+Entry ID                : entry-id-3
+SPIFFE ID               : spiffe://example.org/storesvid
+Parent ID               : spiffe://example.org/spire/agent/join_token/TokenDatabase
+Revision                : 0
+X509-SVID TTL           : 200
+JWT-SVID TTL            : 30
+Selector                : type:key1:value
+Selector                : type:key2:value
+StoreSvid               : true
+
+Entry ID                : entry-id-4
+SPIFFE ID               : spiffe://example.org/additionalattr
+Parent ID               : spiffe://example.org/spire/agent/join_token/TokenBlog
+Revision                : 0
+X509-SVID TTL           : 200
+JWT-SVID TTL            : 30
+Selector                : unix:uid:1111
+Admin                   : true
+DisableX509SvidPrefetch : true
 
 `,
 			expOutJSON: `{
@@ -637,6 +583,7 @@ StoreSvid        : true
             "value": "uid:1111"
           }
         ],
+        "wit_svid_ttl": 0,
         "x509_svid_ttl": 200,
         "federates_with": [],
         "hint": "",
@@ -647,7 +594,11 @@ StoreSvid        : true
         "dns_names": [],
         "revision_number": "0",
         "store_svid": false,
-        "jwt_svid_ttl": 30
+        "jwt_svid_ttl": 30,
+        "additional_attributes": {
+          "disable_x509_svid_prefetch": false,
+          "jwt_svid_include_jti": false
+        }
       }
     },
     {
@@ -671,6 +622,7 @@ StoreSvid        : true
             "value": "uid:1111"
           }
         ],
+        "wit_svid_ttl": 0,
         "x509_svid_ttl": 200,
         "federates_with": [],
         "hint": "internal",
@@ -681,7 +633,11 @@ StoreSvid        : true
         "dns_names": [],
         "revision_number": "0",
         "store_svid": false,
-        "jwt_svid_ttl": 30
+        "jwt_svid_ttl": 30,
+        "additional_attributes": {
+          "disable_x509_svid_prefetch": false,
+          "jwt_svid_include_jti": false
+        }
       }
     },
     {
@@ -709,6 +665,7 @@ StoreSvid        : true
             "value": "key2:value"
           }
         ],
+        "wit_svid_ttl": 0,
         "x509_svid_ttl": 200,
         "federates_with": [],
         "hint": "",
@@ -719,7 +676,50 @@ StoreSvid        : true
         "dns_names": [],
         "revision_number": "0",
         "store_svid": true,
-        "jwt_svid_ttl": 30
+        "jwt_svid_ttl": 30,
+        "additional_attributes": {
+          "disable_x509_svid_prefetch": false,
+          "jwt_svid_include_jti": false
+        }
+      }
+    },
+    {
+      "status": {
+        "code": 0,
+        "message": "OK"
+      },
+      "entry": {
+        "id": "entry-id-4",
+        "spiffe_id": {
+          "trust_domain": "example.org",
+          "path": "/additionalattr"
+        },
+        "parent_id": {
+          "trust_domain": "example.org",
+          "path": "/spire/agent/join_token/TokenBlog"
+        },
+        "selectors": [
+          {
+            "type": "unix",
+            "value": "uid:1111"
+          }
+        ],
+        "wit_svid_ttl": 0,
+        "x509_svid_ttl": 200,
+        "federates_with": [],
+        "hint": "",
+        "admin": true,
+        "created_at": "1547583197",
+        "downstream": false,
+        "expires_at": "0",
+        "dns_names": [],
+        "revision_number": "0",
+        "store_svid": false,
+        "jwt_svid_ttl": 30,
+        "additional_attributes": {
+          "disable_x509_svid_prefetch": true,
+          "jwt_svid_include_jti": false
+        }
       }
     }
   ]
@@ -737,13 +737,13 @@ StoreSvid        : true
 			}},
 			fakeResp: fakeRespErr,
 			expErrPretty: `Failed to create the following entry (code: AlreadyExists, msg: "similar entry already exists"):
-Entry ID         : (none)
-SPIFFE ID        : spiffe://example.org/already-exist
-Parent ID        : spiffe://example.org/spire/server
-Revision         : 0
-X509-SVID TTL    : default
-JWT-SVID TTL     : default
-Selector         : unix:uid:1
+Entry ID                : (none)
+SPIFFE ID               : spiffe://example.org/already-exist
+Parent ID               : spiffe://example.org/spire/server
+Revision                : 0
+X509-SVID TTL           : default
+JWT-SVID TTL            : default
+Selector                : unix:uid:1
 
 Error: failed to create one or more entries
 `,
@@ -770,6 +770,7 @@ Error: failed to create one or more entries
             "value": "uid:1"
           }
         ],
+        "wit_svid_ttl": 0,
         "x509_svid_ttl": 0,
         "federates_with": [],
         "hint": "",

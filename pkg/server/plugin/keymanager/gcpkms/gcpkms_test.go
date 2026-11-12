@@ -71,7 +71,6 @@ var (
 	cryptoKeyName1 = path.Join(validKeyRing, "cryptoKeys", fmt.Sprintf("test-crypto-key/spire-key-%s-spireKeyID-1", validServerID))
 	cryptoKeyName2 = path.Join(validKeyRing, "cryptoKeys", fmt.Sprintf("test-crypto-key/spire-key-%s-spireKeyID-2", validServerID))
 	fakeTime       = timestamppb.Now()
-	unixEpoch      = time.Unix(0, 0)
 
 	pubKey = &kmspb.PublicKey{
 		Pem:       pemCert,
@@ -92,7 +91,6 @@ func setupTest(t *testing.T) *pluginTest {
 	log.Level = logrus.DebugLevel
 
 	c := clock.NewMock(t)
-	c.Set(unixEpoch)
 	fakeKMSClient := newKMSClientFake(t, c)
 	p := newPlugin(
 		func(ctx context.Context, opts ...option.ClientOption) (cloudKeyManagementService, error) {
@@ -132,8 +130,8 @@ func TestConfigure(t *testing.T) {
 		{
 			name: "pass with keys",
 			config: &Config{
-				KeyMetadataFile: createKeyIdentifierFile(t, validServerID),
-				KeyRing:         validKeyRing,
+				KeyIdentifierFile: createKeyIdentifierFile(t, validServerID),
+				KeyRing:           validKeyRing,
 			},
 			fakeCryptoKeys: []*fakeCryptoKey{
 				{
@@ -209,8 +207,8 @@ func TestConfigure(t *testing.T) {
 		{
 			name: "pass without keys",
 			config: &Config{
-				KeyMetadataFile: createKeyIdentifierFile(t, validServerID),
-				KeyRing:         validKeyRing,
+				KeyIdentifierFile: createKeyIdentifierFile(t, validServerID),
+				KeyRing:           validKeyRing,
 			},
 		},
 		{
@@ -230,58 +228,69 @@ func TestConfigure(t *testing.T) {
 		{
 			name: "pass without keys - using a service account file",
 			config: &Config{
-				KeyMetadataFile:    createKeyIdentifierFile(t, validServerID),
+				KeyIdentifierFile:  createKeyIdentifierFile(t, validServerID),
 				KeyRing:            validKeyRing,
 				ServiceAccountFile: "service-account-file",
 			},
-			expectOpts: []option.ClientOption{option.WithCredentialsFile("service-account-file")},
+			expectOpts: []option.ClientOption{option.WithAuthCredentialsFile(option.ServiceAccount, "service-account-file")},
 		},
 		{
 			name: "missing key ring",
 			config: &Config{
-				KeyMetadataFile: createKeyIdentifierFile(t, validServerID),
+				KeyIdentifierFile: createKeyIdentifierFile(t, validServerID),
 			},
 			expectMsg:  "configuration is missing the key ring",
 			expectCode: codes.InvalidArgument,
 		},
 		{
-			name: "missing key metadata file",
+			name: "missing key identifier file and key identifier value",
 			config: &Config{
 				KeyRing: validKeyRing,
 			},
-			expectMsg:  "configuration requires server id or server id file path",
+			expectMsg:  "configuration requires a key identifier file or a key identifier value",
 			expectCode: codes.InvalidArgument,
 		},
 		{
-			name:             "key identifier file and key identifier value",
+			name:             "both key identifier file and key identifier value",
 			configureRequest: configureRequestWithString(fmt.Sprintf(`{"access_key_id":"access_key_id","secret_access_key":"secret_access_key","region":"region","key_identifier_file":"key_identifier_file","key_identifier_value":"key_identifier_value","key_policy_file":"","key_ring":"%s"}`, validKeyRing)),
-			expectMsg:        "configuration must not contain both server id and server id file path",
+			expectMsg:        "configuration can't have a key identifier file and a key identifier value at the same time",
 			expectCode:       codes.InvalidArgument,
 		},
 		{
-			name:             "key metadata file and key identifier file",
-			configureRequest: configureRequestWithString(fmt.Sprintf(`{"access_key_id":"access_key_id","secret_access_key":"secret_access_key","region":"region","key_metadata_file":"key_metadata_file","key_identifier_file":"key_identifier_file","key_policy_file":"","key_ring":"%s"}`, validKeyRing)),
-			expectMsg:        "configuration must not contain both 'key_identifier_file' and deprecated 'key_metadata_file'",
-			expectCode:       codes.InvalidArgument,
-		},
-		{
-			name:             "key metadata value invalid character",
+			name:             "key identifier value invalid character",
 			configureRequest: configureRequestWithString(fmt.Sprintf(`{"access_key_id":"access_key_id","secret_access_key":"secret_access_key","region":"region","key_identifier_value":"key identifier value","key_policy_file":"","key_ring":"%s"}`, validKeyRing)),
 			expectMsg:        "Key identifier must contain only letters, numbers, underscores (_), and dashes (-)",
 			expectCode:       codes.InvalidArgument,
 		},
 		{
-			name:             "key metadata value too long",
+			name:             "key identifier value too long",
 			configureRequest: configureRequestWithString(fmt.Sprintf(`{"access_key_id":"access_key_id","secret_access_key":"secret_access_key","region":"region","key_identifier_value":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","key_policy_file":"","key_ring":"%s"}`, validKeyRing)),
-			expectMsg:        "Key identifier must not be longer than 63 characters",
+			expectMsg:        "Key identifier must not be longer than 40 characters",
 			expectCode:       codes.InvalidArgument,
+		},
+		{
+			// A 41-character identifier would push the generated CryptoKey ID
+			// (spire-key-<serverID>-<spireKeyID>) past Cloud KMS's 63-character
+			// limit, so it must be rejected.
+			name:             "key identifier value one over limit",
+			configureRequest: configureRequestWithString(fmt.Sprintf(`{"access_key_id":"access_key_id","secret_access_key":"secret_access_key","region":"region","key_identifier_value":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","key_policy_file":"","key_ring":"%s"}`, validKeyRing)),
+			expectMsg:        "Key identifier must not be longer than 40 characters",
+			expectCode:       codes.InvalidArgument,
+		},
+		{
+			// A 40-character identifier is the longest that still fits.
+			name: "key identifier value at limit",
+			config: &Config{
+				KeyIdentifierValue: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				KeyRing:            validKeyRing,
+			},
 		},
 		{
 			name: "custom policy file does not exist",
 			config: &Config{
-				KeyMetadataFile: createKeyIdentifierFile(t, validServerID),
-				KeyPolicyFile:   "non-existent-file.json",
-				KeyRing:         validKeyRing,
+				KeyIdentifierFile: createKeyIdentifierFile(t, validServerID),
+				KeyPolicyFile:     "non-existent-file.json",
+				KeyRing:           validKeyRing,
 			},
 			expectMsg:  fmt.Sprintf("could not parse policy file: failed to read file: open non-existent-file.json: %s", spiretest.FileNotFound()),
 			expectCode: codes.Internal,
@@ -289,32 +298,32 @@ func TestConfigure(t *testing.T) {
 		{
 			name: "use custom policy file",
 			config: &Config{
-				KeyMetadataFile: createKeyIdentifierFile(t, validServerID),
-				KeyPolicyFile:   getCustomPolicyFile(t),
-				KeyRing:         validKeyRing,
+				KeyIdentifierFile: createKeyIdentifierFile(t, validServerID),
+				KeyPolicyFile:     getCustomPolicyFile(t),
+				KeyRing:           validKeyRing,
 			},
 		},
 		{
-			name: "empty key metadata file",
+			name: "empty key identifier file",
 			config: &Config{
-				KeyMetadataFile: createKeyIdentifierFile(t, ""),
-				KeyRing:         validKeyRing,
+				KeyIdentifierFile: createKeyIdentifierFile(t, ""),
+				KeyRing:           validKeyRing,
 			},
 		},
 		{
-			name: "invalid server ID in metadata file",
+			name: "invalid server ID in key identifier file",
 			config: &Config{
-				KeyMetadataFile: createKeyIdentifierFile(t, "invalid-id"),
-				KeyRing:         validKeyRing,
+				KeyIdentifierFile: createKeyIdentifierFile(t, "invalid-id"),
+				KeyRing:           validKeyRing,
 			},
-			expectMsg:  "failed to parse server ID from path: uuid: incorrect UUID length 10 in string \"invalid-id\"",
+			expectMsg:  "failed to parse server ID from path: uuid: incorrect UUID length",
 			expectCode: codes.Internal,
 		},
 		{
-			name: "invalid metadata file path",
+			name: "invalid key identifier file path",
 			config: &Config{
-				KeyMetadataFile: "/",
-				KeyRing:         validKeyRing,
+				KeyIdentifierFile: "/",
+				KeyRing:           validKeyRing,
 			},
 			expectMsg:  "failed to read server ID from path: read /:",
 			expectCode: codes.Internal,
@@ -328,8 +337,8 @@ func TestConfigure(t *testing.T) {
 		{
 			name: "ListCryptoKeys error",
 			config: &Config{
-				KeyMetadataFile: createKeyIdentifierFile(t, validServerID),
-				KeyRing:         validKeyRing,
+				KeyIdentifierFile: createKeyIdentifierFile(t, validServerID),
+				KeyRing:           validKeyRing,
 			},
 			expectMsg:         "failed to list SPIRE Server keys in Cloud KMS: error listing CryptoKeys",
 			expectCode:        codes.Internal,
@@ -340,8 +349,8 @@ func TestConfigure(t *testing.T) {
 			expectMsg:  "failed to fetch entries: unsupported CryptoKeyVersionAlgorithm: GOOGLE_SYMMETRIC_ENCRYPTION",
 			expectCode: codes.Internal,
 			config: &Config{
-				KeyMetadataFile: createKeyIdentifierFile(t, validServerID),
-				KeyRing:         validKeyRing,
+				KeyIdentifierFile: createKeyIdentifierFile(t, validServerID),
+				KeyRing:           validKeyRing,
 			},
 			fakeCryptoKeys: []*fakeCryptoKey{
 				{
@@ -368,8 +377,8 @@ func TestConfigure(t *testing.T) {
 			expectMsg:  "failed to fetch entries: error getting public key: get public key error",
 			expectCode: codes.Internal,
 			config: &Config{
-				KeyMetadataFile: createKeyIdentifierFile(t, validServerID),
-				KeyRing:         validKeyRing,
+				KeyIdentifierFile: createKeyIdentifierFile(t, validServerID),
+				KeyRing:           validKeyRing,
 			},
 			fakeCryptoKeys: []*fakeCryptoKey{
 				{
@@ -394,7 +403,6 @@ func TestConfigure(t *testing.T) {
 			getPublicKeyErrCount: getPublicKeyMaxAttempts + 1,
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			ts := setupTest(t)
 			ts.fakeKMSClient.putFakeCryptoKeys(tt.fakeCryptoKeys)
@@ -410,6 +418,21 @@ func TestConfigure(t *testing.T) {
 				require.Nil(t, tt.config, "The test case must define a configuration or a configuration request, not both.")
 				configureRequest = tt.configureRequest
 			}
+			// The retry loop blocks on the mock clock's Sleep. Advance the
+			// clock from a background goroutine by exactly the slept duration
+			// each time a sleep begins, until the call under test completes.
+			done := make(chan struct{})
+			defer close(done)
+			go func() {
+				for {
+					select {
+					case <-done:
+						return
+					case d := <-ts.clockHook.SleepCh():
+						ts.clockHook.Add(d)
+					}
+				}
+			}()
 			_, err := ts.plugin.Configure(ctx, configureRequest)
 
 			spiretest.RequireGRPCStatusContains(t, err, tt.expectCode, tt.expectMsg)
@@ -424,7 +447,7 @@ func TestConfigure(t *testing.T) {
 			// Assert that the keys have been loaded
 			storedFakeCryptoKeys := ts.fakeKMSClient.store.fetchFakeCryptoKeys()
 			for _, expectedFakeCryptoKey := range storedFakeCryptoKeys {
-				spireKeyID, ok := getSPIREKeyIDFromCryptoKeyName(expectedFakeCryptoKey.Name)
+				spireKeyID, ok := getSPIREKeyIDFromCryptoKeyName(expectedFakeCryptoKey.Name, ts.plugin.pd.serverID)
 				require.True(t, ok)
 
 				entry, ok := ts.plugin.entries[spireKeyID]
@@ -437,13 +460,73 @@ func TestConfigure(t *testing.T) {
 	}
 }
 
+func TestGetSPIREKeyIDFromCryptoKeyName(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		cryptoKeyName string
+		serverID      string
+		expectKeyID   string
+		expectOK      bool
+	}{
+		{
+			name:          "uuid server id (key_identifier_file)",
+			cryptoKeyName: path.Join(validKeyRing, "cryptoKeys", fmt.Sprintf("spire-key-%s-x509-CA-A", validServerID)),
+			serverID:      validServerID,
+			expectKeyID:   "x509-CA-A",
+			expectOK:      true,
+		},
+		{
+			name:          "short custom server id (key_identifier_value)",
+			cryptoKeyName: path.Join(validKeyRing, "cryptoKeys", "spire-key-dpt-gcp-38d0-x509-CA-A"),
+			serverID:      "dpt-gcp-38d0",
+			expectKeyID:   "x509-CA-A",
+			expectOK:      true,
+		},
+		{
+			name:          "server id containing dashes (key_identifier_value)",
+			cryptoKeyName: path.Join(validKeyRing, "cryptoKeys", "spire-key-my-server-JWT-B"),
+			serverID:      "my-server",
+			expectKeyID:   "JWT-B",
+			expectOK:      true,
+		},
+		{
+			name:          "prefix does not match server id",
+			cryptoKeyName: path.Join(validKeyRing, "cryptoKeys", "spire-key-other-server-x509-CA-A"),
+			serverID:      "dpt-gcp-38d0",
+			expectOK:      false,
+		},
+		{
+			name:          "no spire key id after server id",
+			cryptoKeyName: path.Join(validKeyRing, "cryptoKeys", "spire-key-dpt-gcp-38d0"),
+			serverID:      "dpt-gcp-38d0",
+			expectOK:      false,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			spireKeyID, ok := getSPIREKeyIDFromCryptoKeyName(tt.cryptoKeyName, tt.serverID)
+			require.Equal(t, tt.expectOK, ok)
+			require.Equal(t, tt.expectKeyID, spireKeyID)
+		})
+	}
+}
+
 func TestDisposeStaleCryptoKeys(t *testing.T) {
 	configureRequest := configureRequestWithDefaults(t)
+	ts := setupTest(t)
+	now := ts.clockHook.Now()
+	// The CryptoKeys carry a last-update timestamp older than maxStaleDuration,
+	// so they are already stale. Combined with the single-period clock advances
+	// below, this makes stale detection independent of the exact mock-clock
+	// value observed at each ticker tick.
+	staleLastUpdate := fmt.Sprintf("%d", now.Add(-maxStaleDuration-time.Hour).Unix())
 	fakeCryptoKeys := []*fakeCryptoKey{
 		{
 			CryptoKey: &kmspb.CryptoKey{
-				Name:            cryptoKeyName1,
-				Labels:          map[string]string{labelNameActive: "true"},
+				Name: cryptoKeyName1,
+				Labels: map[string]string{
+					labelNameActive:     "true",
+					labelNameLastUpdate: staleLastUpdate,
+				},
 				VersionTemplate: &kmspb.CryptoKeyVersionTemplate{Algorithm: kmspb.CryptoKeyVersion_EC_SIGN_P256_SHA256},
 			},
 			fakeCryptoKeyVersions: map[string]*fakeCryptoKeyVersion{
@@ -453,13 +536,17 @@ func TestDisposeStaleCryptoKeys(t *testing.T) {
 						Algorithm: kmspb.CryptoKeyVersion_EC_SIGN_P256_SHA256,
 						Name:      fmt.Sprintf("%s/cryptoKeyVersions/1", cryptoKeyName1),
 						State:     kmspb.CryptoKeyVersion_ENABLED,
-					}},
+					},
+				},
 			},
 		},
 		{
 			CryptoKey: &kmspb.CryptoKey{
-				Name:            cryptoKeyName2,
-				Labels:          map[string]string{labelNameActive: "true"},
+				Name: cryptoKeyName2,
+				Labels: map[string]string{
+					labelNameActive:     "true",
+					labelNameLastUpdate: staleLastUpdate,
+				},
 				VersionTemplate: &kmspb.CryptoKeyVersionTemplate{Algorithm: kmspb.CryptoKeyVersion_EC_SIGN_P256_SHA256},
 			},
 			fakeCryptoKeyVersions: map[string]*fakeCryptoKeyVersion{
@@ -469,29 +556,38 @@ func TestDisposeStaleCryptoKeys(t *testing.T) {
 						Algorithm: kmspb.CryptoKeyVersion_EC_SIGN_P256_SHA256,
 						Name:      fmt.Sprintf("%s/cryptoKeyVersions/1", cryptoKeyName2),
 						State:     kmspb.CryptoKeyVersion_ENABLED,
-					}},
+					},
+				},
 			},
 		},
 	}
 
-	ts := setupTest(t)
 	ts.fakeKMSClient.putFakeCryptoKeys(fakeCryptoKeys)
 
 	ts.plugin.hooks.disposeCryptoKeysSignal = make(chan error)
 	ts.plugin.hooks.scheduleDestroySignal = make(chan error)
 	ts.plugin.hooks.setInactiveSignal = make(chan error)
+	// Set up an unbuffered channel for the keepActiveCryptoKeys task so that it gets blocked, and we can simulate a key getting stale.
+	ts.plugin.hooks.keepActiveCryptoKeysSignal = make(chan error)
 
 	_, err := ts.plugin.Configure(ctx, configureRequest)
 	require.NoError(t, err)
 
-	// Move the clock to start disposeCryptoKeysTask.
+	// Wait for disposeCryptoKeysTask to be initialized before advancing the
+	// clock. The task creates its ticker and only then emits this
+	// notification, so draining it here guarantees the ticker exists and the
+	// advances below deterministically fire it. Advancing before the ticker is
+	// created shifts the ticker's baseline, which makes the runs below depend
+	// on goroutine scheduling.
+	err = waitForSignal(t, ts.plugin.hooks.disposeCryptoKeysSignal)
+	require.NoError(t, err)
+
+	// Advance one ticker period to run disposeCryptoKeys. The CryptoKeys are
+	// already stale, so this run schedules their CryptoKeyVersions for
+	// destruction. Advancing exactly one period fires the ticker once with the
+	// clock at the advanced time, avoiding the intermediate clock values that a
+	// multi-period advance would expose to the running task.
 	ts.clockHook.Add(disposeCryptoKeysFrequency)
-
-	// Wait for dispose disposeCryptoKeysTask to be initialized.
-	_ = waitForSignal(t, ts.plugin.hooks.disposeCryptoKeysSignal)
-
-	// Move the clock to make sure that we have stale CryptoKeys.
-	ts.clockHook.Add(maxStaleDuration)
 
 	// Wait for destroy notification of all the CryptoKeyVersions.
 	storedFakeCryptoKeys := ts.fakeKMSClient.store.fetchFakeCryptoKeys()
@@ -513,11 +609,14 @@ func TestDisposeStaleCryptoKeys(t *testing.T) {
 		}
 	}
 
-	// Move the clock to start disposeCryptoKeysTask again.
+	// Advance another ticker period to run disposeCryptoKeys again. The task
+	// blocks on the unbuffered notification channel after each run, so drain
+	// the previous run's notification to let this run proceed. Since the
+	// CryptoKeys no longer have enabled CryptoKeyVersions, this run marks them
+	// inactive.
 	ts.clockHook.Add(disposeCryptoKeysFrequency)
-
-	// Wait for dispose disposeCryptoKeysTask to be initialized.
-	_ = waitForSignal(t, ts.plugin.hooks.disposeCryptoKeysSignal)
+	err = waitForSignal(t, ts.plugin.hooks.disposeCryptoKeysSignal)
+	require.NoError(t, err)
 
 	// Since the CryptoKey doesn't have any enabled CryptoKeyVersions at
 	// this point, it should be set as inactive.
@@ -539,11 +638,16 @@ func TestDisposeStaleCryptoKeys(t *testing.T) {
 
 func TestDisposeActiveCryptoKeys(t *testing.T) {
 	configureRequest := configureRequestWithDefaults(t)
+	ts := setupTest(t)
+	now := ts.clockHook.Now()
 	fakeCryptoKeys := []*fakeCryptoKey{
 		{
 			CryptoKey: &kmspb.CryptoKey{
-				Name:            cryptoKeyName1,
-				Labels:          map[string]string{labelNameActive: "true"},
+				Name: cryptoKeyName1,
+				Labels: map[string]string{
+					labelNameActive:     "true",
+					labelNameLastUpdate: fmt.Sprintf("%d", now.Unix()),
+				},
 				VersionTemplate: &kmspb.CryptoKeyVersionTemplate{Algorithm: kmspb.CryptoKeyVersion_EC_SIGN_P256_SHA256},
 			},
 			fakeCryptoKeyVersions: map[string]*fakeCryptoKeyVersion{
@@ -553,13 +657,17 @@ func TestDisposeActiveCryptoKeys(t *testing.T) {
 						Algorithm: kmspb.CryptoKeyVersion_EC_SIGN_P256_SHA256,
 						Name:      fmt.Sprintf("%s/cryptoKeyVersions/1", cryptoKeyName1),
 						State:     kmspb.CryptoKeyVersion_ENABLED,
-					}},
+					},
+				},
 			},
 		},
 		{
 			CryptoKey: &kmspb.CryptoKey{
-				Name:            cryptoKeyName2,
-				Labels:          map[string]string{labelNameActive: "true"},
+				Name: cryptoKeyName2,
+				Labels: map[string]string{
+					labelNameActive:     "true",
+					labelNameLastUpdate: fmt.Sprintf("%d", now.Unix()),
+				},
 				VersionTemplate: &kmspb.CryptoKeyVersionTemplate{Algorithm: kmspb.CryptoKeyVersion_EC_SIGN_P256_SHA256},
 			},
 			fakeCryptoKeyVersions: map[string]*fakeCryptoKeyVersion{
@@ -569,26 +677,40 @@ func TestDisposeActiveCryptoKeys(t *testing.T) {
 						Algorithm: kmspb.CryptoKeyVersion_EC_SIGN_P256_SHA256,
 						Name:      fmt.Sprintf("%s/cryptoKeyVersions/1", cryptoKeyName2),
 						State:     kmspb.CryptoKeyVersion_ENABLED,
-					}},
+					},
+				},
 			},
 		},
 	}
 
-	ts := setupTest(t)
 	ts.fakeKMSClient.putFakeCryptoKeys(fakeCryptoKeys)
 
 	ts.plugin.hooks.disposeCryptoKeysSignal = make(chan error)
 	scheduleDestroySignal := make(chan error)
 	ts.plugin.hooks.scheduleDestroySignal = scheduleDestroySignal
+	enqueueDestructionSignal := make(chan error, 1)
+	ts.plugin.hooks.enqueueDestructionSignal = enqueueDestructionSignal
 
 	_, err := ts.plugin.Configure(ctx, configureRequest)
+	require.NoError(t, err)
+
+	// Wait for disposeCryptoKeysTask to be initialized.
+	err = waitForSignal(t, ts.plugin.hooks.disposeCryptoKeysSignal)
 	require.NoError(t, err)
 
 	// Move the clock to start disposeCryptoKeysTask.
 	ts.clockHook.Add(disposeCryptoKeysFrequency)
 
-	// Wait for dispose disposeCryptoKeysTask to be initialized.
-	_ = waitForSignal(t, ts.plugin.hooks.disposeCryptoKeysSignal)
+	// Wait for disposeCryptoKeysTask to complete.
+	err = waitForSignal(t, ts.plugin.hooks.disposeCryptoKeysSignal)
+	require.NoError(t, err)
+
+	// Verify that no active keys have been queued for destruction.
+	select {
+	case <-enqueueDestructionSignal:
+		require.Fail(t, "Active key should not be queued for destruction")
+	default:
+	}
 
 	// The CryptoKeys are not stale yet. Assert that they are active and the
 	// CryptoKeyVersions enabled.
@@ -600,73 +722,6 @@ func TestDisposeActiveCryptoKeys(t *testing.T) {
 			require.Equal(t, kmspb.CryptoKeyVersion_ENABLED, fakeKeyVersion.GetState(), fakeKeyVersion.GetName())
 		}
 	}
-}
-
-func TestEnqueueDestructionFailure(t *testing.T) {
-	configureRequest := configureRequestWithDefaults(t)
-	fakeCryptoKeys := []*fakeCryptoKey{
-		{
-			CryptoKey: &kmspb.CryptoKey{
-				Name:            cryptoKeyName1,
-				Labels:          map[string]string{labelNameActive: "true"},
-				VersionTemplate: &kmspb.CryptoKeyVersionTemplate{Algorithm: kmspb.CryptoKeyVersion_EC_SIGN_P256_SHA256},
-			},
-			fakeCryptoKeyVersions: map[string]*fakeCryptoKeyVersion{
-				"1": {
-					publicKey: pubKey,
-					CryptoKeyVersion: &kmspb.CryptoKeyVersion{
-						Algorithm: kmspb.CryptoKeyVersion_EC_SIGN_P256_SHA256,
-						Name:      fmt.Sprintf("%s/cryptoKeyVersions/1", cryptoKeyName1),
-						State:     kmspb.CryptoKeyVersion_ENABLED,
-					}},
-			},
-		},
-		{
-			CryptoKey: &kmspb.CryptoKey{
-				Name:            cryptoKeyName2,
-				Labels:          map[string]string{labelNameActive: "true"},
-				VersionTemplate: &kmspb.CryptoKeyVersionTemplate{Algorithm: kmspb.CryptoKeyVersion_EC_SIGN_P256_SHA256},
-			},
-			fakeCryptoKeyVersions: map[string]*fakeCryptoKeyVersion{
-				"1": {
-					publicKey: pubKey,
-					CryptoKeyVersion: &kmspb.CryptoKeyVersion{
-						Algorithm: kmspb.CryptoKeyVersion_EC_SIGN_P256_SHA256,
-						Name:      fmt.Sprintf("%s/cryptoKeyVersions/1", cryptoKeyName2),
-						State:     kmspb.CryptoKeyVersion_ENABLED,
-					}},
-			},
-		},
-	}
-
-	ts := setupTest(t)
-	// Change the scheduleDestroy channel to be unbuffered.
-	ts.plugin.scheduleDestroy = make(chan string)
-
-	ts.fakeKMSClient.putFakeCryptoKeys(fakeCryptoKeys)
-
-	ts.plugin.hooks.disposeCryptoKeysSignal = make(chan error, 1)
-	ts.plugin.hooks.enqueueDestructionSignal = make(chan error, 1)
-
-	_, err := ts.plugin.Configure(ctx, configureRequest)
-	require.NoError(t, err)
-
-	// Move the clock to start disposeCryptoKeysTask.
-	ts.clockHook.Add(disposeCryptoKeysFrequency)
-
-	// Wait for dispose disposeCryptoKeysTask to be initialized.
-	_ = waitForSignal(t, ts.plugin.hooks.disposeCryptoKeysSignal)
-
-	// Move the clock to make sure that we have stale CryptoKeys.
-	ts.clockHook.Add(maxStaleDuration)
-
-	// Enqueuing the first CryptoKeyVersion for destruction should succeed.
-	err = waitForSignal(t, ts.plugin.hooks.enqueueDestructionSignal)
-	require.NoError(t, err)
-
-	// Enqueuing the second CryptoKeyVersion for destruction should fail.
-	err = waitForSignal(t, ts.plugin.hooks.enqueueDestructionSignal)
-	require.ErrorContains(t, err, "could not enqueue CryptoKeyVersion")
 }
 
 func TestGenerateKey(t *testing.T) {
@@ -721,7 +776,7 @@ func TestGenerateKey(t *testing.T) {
 				KeyId:   spireKeyID1,
 				KeyType: keymanagerv1.KeyType_EC_P256,
 			},
-			configureReq: configureRequestWithVars(KeyMetadataFile, createKeyIdentifierFile(t, ""), "", validKeyRing, "service_account_file"),
+			configureReq: configureRequestWithVars(KeyIdentifierFile, createKeyIdentifierFile(t, ""), "", validKeyRing, "service_account_file"),
 		},
 		{
 			name: "success: non existing key with custom policy",
@@ -729,7 +784,7 @@ func TestGenerateKey(t *testing.T) {
 				KeyId:   spireKeyID1,
 				KeyType: keymanagerv1.KeyType_EC_P256,
 			},
-			configureReq: configureRequestWithVars(KeyMetadataFile, createKeyIdentifierFile(t, ""), getCustomPolicyFile(t), validKeyRing, "service_account_file"),
+			configureReq: configureRequestWithVars(KeyIdentifierFile, createKeyIdentifierFile(t, ""), getCustomPolicyFile(t), validKeyRing, "service_account_file"),
 		},
 		{
 			name: "success: replace old key",
@@ -751,7 +806,8 @@ func TestGenerateKey(t *testing.T) {
 								Algorithm: kmspb.CryptoKeyVersion_EC_SIGN_P256_SHA256,
 								Name:      fmt.Sprintf("%s/cryptoKeyVersions/1", cryptoKeyName1),
 								State:     kmspb.CryptoKeyVersion_ENABLED,
-							}},
+							},
+						},
 					},
 				},
 			},
@@ -1005,7 +1061,6 @@ func TestGenerateKey(t *testing.T) {
 			getTokenInfoErr: errors.New("error getting token info"),
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			ts := setupTest(t)
 			ts.fakeKMSClient.setDestroyTime(fakeTime)
@@ -1041,6 +1096,21 @@ func TestGenerateKey(t *testing.T) {
 
 			ts.fakeKMSClient.setGetPublicKeySequentialErrs(tt.getPublicKeyErr, tt.getPublicKeyErrCount)
 
+			// The retry loop blocks on the mock clock's Sleep. Advance the
+			// clock from a background goroutine by exactly the slept duration
+			// each time a sleep begins, until the call under test completes.
+			done := make(chan struct{})
+			defer close(done)
+			go func() {
+				for {
+					select {
+					case <-done:
+						return
+					case d := <-ts.clockHook.SleepCh():
+						ts.clockHook.Add(d)
+					}
+				}
+			}()
 			resp, err := ts.plugin.GenerateKey(ctx, tt.generateKeyReq)
 			if tt.expectMsg != "" {
 				spiretest.RequireGRPCStatusContains(t, err, tt.expectCode, tt.expectMsg)
@@ -1101,7 +1171,8 @@ func TestKeepActiveCryptoKeys(t *testing.T) {
 								Algorithm: kmspb.CryptoKeyVersion_EC_SIGN_P256_SHA256,
 								Name:      fmt.Sprintf("%s/cryptoKeyVersions/1", cryptoKeyName1),
 								State:     kmspb.CryptoKeyVersion_ENABLED,
-							}},
+							},
+						},
 					},
 				},
 			},
@@ -1123,7 +1194,8 @@ func TestKeepActiveCryptoKeys(t *testing.T) {
 								Algorithm: kmspb.CryptoKeyVersion_EC_SIGN_P256_SHA256,
 								Name:      fmt.Sprintf("%s/cryptoKeyVersions/1", cryptoKeyName1),
 								State:     kmspb.CryptoKeyVersion_ENABLED,
-							}},
+							},
+						},
 					},
 				},
 				{
@@ -1139,13 +1211,13 @@ func TestKeepActiveCryptoKeys(t *testing.T) {
 								Algorithm: kmspb.CryptoKeyVersion_EC_SIGN_P256_SHA256,
 								Name:      fmt.Sprintf("%s/cryptoKeyVersions/1", cryptoKeyName2),
 								State:     kmspb.CryptoKeyVersion_ENABLED,
-							}},
+							},
+						},
 					},
 				},
 			},
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			ts := setupTest(t)
 			ts.fakeKMSClient.putFakeCryptoKeys(tt.fakeCryptoKeys)
@@ -1159,7 +1231,7 @@ func TestKeepActiveCryptoKeys(t *testing.T) {
 			_ = waitForSignal(t, ts.plugin.hooks.keepActiveCryptoKeysSignal)
 
 			// Move the clock forward so the task is run.
-			currentTime := unixEpoch.Add(6 * time.Hour)
+			currentTime := ts.clockHook.Now().Add(6 * time.Hour)
 			ts.clockHook.Set(currentTime)
 
 			// Wait for keepActiveCryptoKeys to be run.
@@ -1202,7 +1274,8 @@ func TestGetPublicKeys(t *testing.T) {
 								Algorithm: kmspb.CryptoKeyVersion_EC_SIGN_P256_SHA256,
 								Name:      fmt.Sprintf("%s/cryptoKeyVersions/1", cryptoKeyName1),
 								State:     kmspb.CryptoKeyVersion_ENABLED,
-							}},
+							},
+						},
 					},
 				},
 			},
@@ -1223,7 +1296,8 @@ func TestGetPublicKeys(t *testing.T) {
 								Algorithm: kmspb.CryptoKeyVersion_EC_SIGN_P256_SHA256,
 								Name:      fmt.Sprintf("%s/cryptoKeyVersions/1", cryptoKeyName1),
 								State:     kmspb.CryptoKeyVersion_ENABLED,
-							}},
+							},
+						},
 					},
 				},
 				{
@@ -1239,7 +1313,8 @@ func TestGetPublicKeys(t *testing.T) {
 								Algorithm: kmspb.CryptoKeyVersion_EC_SIGN_P256_SHA256,
 								Name:      fmt.Sprintf("%s/cryptoKeyVersions/1", cryptoKeyName2),
 								State:     kmspb.CryptoKeyVersion_ENABLED,
-							}},
+							},
+						},
 					},
 				},
 			},
@@ -1248,7 +1323,6 @@ func TestGetPublicKeys(t *testing.T) {
 			name: "non existing keys",
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			ts := setupTest(t)
 			ts.fakeKMSClient.putFakeCryptoKeys(tt.fakeCryptoKeys)
@@ -1269,7 +1343,7 @@ func TestGetPublicKeys(t *testing.T) {
 			for _, fakeKey := range storedFakeCryptoKeys {
 				storedFakeCryptoKeyVersions := fakeKey.fetchFakeCryptoKeyVersions()
 				for _, fakeKeyVersion := range storedFakeCryptoKeyVersions {
-					pubKey, err := getPublicKeyFromCryptoKeyVersion(ctx, ts.plugin.log, ts.fakeKMSClient, fakeKeyVersion.CryptoKeyVersion.Name)
+					pubKey, err := getPublicKeyFromCryptoKeyVersion(ctx, ts.plugin.log, ts.fakeKMSClient, fakeKeyVersion.CryptoKeyVersion.Name, ts.plugin.hooks.clk)
 					require.NoError(t, err)
 					require.Equal(t, pubKey, resp.PublicKeys[0].PkixData)
 				}
@@ -1305,7 +1379,8 @@ func TestGetPublicKey(t *testing.T) {
 								Algorithm: kmspb.CryptoKeyVersion_EC_SIGN_P256_SHA256,
 								Name:      fmt.Sprintf("%s/cryptoKeyVersions/1", cryptoKeyName1),
 								State:     kmspb.CryptoKeyVersion_ENABLED,
-							}},
+							},
+						},
 					},
 				},
 			},
@@ -1329,7 +1404,8 @@ func TestGetPublicKey(t *testing.T) {
 								Algorithm: kmspb.CryptoKeyVersion_EC_SIGN_P256_SHA256,
 								Name:      fmt.Sprintf("%s/cryptoKeyVersions/1", cryptoKeyName1),
 								State:     kmspb.CryptoKeyVersion_ENABLED,
-							}},
+							},
+						},
 					},
 				},
 			},
@@ -1348,7 +1424,6 @@ func TestGetPublicKey(t *testing.T) {
 			expectCodeGetPublicKey: codes.InvalidArgument,
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			ts := setupTest(t)
 			ts.fakeKMSClient.setPEMCrc32C(tt.pemCrc32C)
@@ -1387,11 +1462,15 @@ func TestKeyManagerContract(t *testing.T) {
 			},
 		)
 		km := new(keymanager.V1)
-		keyMetadataFile := filepath.ToSlash(filepath.Join(dir, "metadata.json"))
-		plugintest.Load(t, builtin(p), km, plugintest.Configuref(`
-        key_metadata_file = %q
+		keyIdentifierFile := filepath.ToSlash(filepath.Join(dir, "key_identifier.json"))
+		plugintest.Load(t, builtin(p), km,
+			plugintest.CoreConfig(catalog.CoreConfig{
+				TrustDomain: spiffeid.RequireTrustDomainFromString("test.example.org"),
+			}),
+			plugintest.Configuref(`
+        key_identifier_file = %q
         key_ring = "projects/project-id/locations/location/keyRings/keyring"
-		`, keyMetadataFile))
+		`, keyIdentifierFile))
 		return km
 	}
 
@@ -1440,7 +1519,6 @@ func TestSetIAMPolicy(t *testing.T) {
 			useCustomPolicy: true,
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			ts := setupTest(t)
 			ts.fakeKMSClient.fakeIAMHandle.setPolicyError(tt.policyErr)
@@ -1450,7 +1528,7 @@ func TestSetIAMPolicy(t *testing.T) {
 			if tt.useCustomPolicy {
 				customPolicyFile := getCustomPolicyFile(t)
 				configureReq = configureRequestFromConfig(&Config{
-					KeyMetadataFile:    createKeyIdentifierFile(t, validServerID),
+					KeyIdentifierFile:  createKeyIdentifierFile(t, validServerID),
 					KeyPolicyFile:      customPolicyFile,
 					KeyRing:            validKeyRing,
 					ServiceAccountFile: "service_account_file",
@@ -1677,7 +1755,6 @@ func TestSignData(t *testing.T) {
 			signatureCrc32C: &wrapperspb.Int64Value{Value: 1},
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			ts := setupTest(t)
 			ts.fakeKMSClient.setAsymmetricSignErr(tt.asymmetricSignErr)
@@ -1702,16 +1779,11 @@ func TestSignData(t *testing.T) {
 type KeyIdentifierConfigName string
 
 const (
-	KeyMetadataFile    KeyIdentifierConfigName = "key_metadata_file"
 	KeyIdentifierFile  KeyIdentifierConfigName = "key_identifier_file"
 	KeyIdentifierValue KeyIdentifierConfigName = "key_identifier_value"
 )
 
 func configureRequestFromConfig(c *Config) *configv1.ConfigureRequest {
-	keyMetadataFileHcl := fmt.Sprintf(`"key_metadata_file":"%s",`, c.KeyMetadataFile)
-	if c.KeyMetadataFile == "" {
-		keyMetadataFileHcl = ""
-	}
 	keyIdentifierFileHcl := fmt.Sprintf(`"key_identifier_file":"%s",`, c.KeyIdentifierFile)
 	if c.KeyIdentifierFile == "" {
 		keyIdentifierFileHcl = ""
@@ -1724,12 +1796,10 @@ func configureRequestFromConfig(c *Config) *configv1.ConfigureRequest {
 		HclConfiguration: fmt.Sprintf(`{
 			%s
 			%s
-			%s
 			"key_policy_file":"%s",
 			"key_ring":"%s",
 			"service_account_file":"%s"
 			}`,
-			keyMetadataFileHcl,
 			keyIdentifierFileHcl,
 			keyIdentifierValueHcl,
 			c.KeyPolicyFile,
@@ -1741,7 +1811,7 @@ func configureRequestFromConfig(c *Config) *configv1.ConfigureRequest {
 
 func configureRequestWithDefaults(t *testing.T) *configv1.ConfigureRequest {
 	return &configv1.ConfigureRequest{
-		HclConfiguration:  serializedConfiguration(KeyMetadataFile, createKeyIdentifierFile(t, validServerID), validKeyRing),
+		HclConfiguration:  serializedConfiguration(KeyIdentifierFile, createKeyIdentifierFile(t, validServerID), validKeyRing),
 		CoreConfiguration: &configv1.CoreConfiguration{TrustDomain: "test.example.org"},
 	}
 }
@@ -1775,7 +1845,7 @@ func createKeyIdentifierFile(t *testing.T, content string) string {
 	tempFilePath := filepath.ToSlash(filepath.Join(tempDir, validServerIDFile))
 
 	if content != "" {
-		err := os.WriteFile(tempFilePath, []byte(content), 0600)
+		err := os.WriteFile(tempFilePath, []byte(content), 0o600)
 		if err != nil {
 			t.Error(err)
 		}
@@ -1786,7 +1856,7 @@ func createKeyIdentifierFile(t *testing.T, content string) string {
 func getCustomPolicyFile(t *testing.T) string {
 	tempDir := t.TempDir()
 	tempFilePath := filepath.ToSlash(filepath.Join(tempDir, validPolicyFile))
-	err := os.WriteFile(tempFilePath, []byte(customPolicy), 0600)
+	err := os.WriteFile(tempFilePath, []byte(customPolicy), 0o600)
 	if err != nil {
 		t.Error(err)
 	}

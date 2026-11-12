@@ -47,6 +47,7 @@ func newTest(t *testing.T, opts ...func(*ssh.Certificate)) *testParams {
 	err = certificate.SignCert(rand.Reader, signer)
 	require.NoError(t, err)
 	certChecker := &ssh.CertChecker{
+		SupportedCriticalOptions: []string{sourceAddressCriticalOption},
 		IsHostAuthority: func(auth ssh.PublicKey, _ string) bool {
 			return reflect.DeepEqual(auth, signer.PublicKey())
 		},
@@ -78,7 +79,7 @@ func TestHandshake(t *testing.T) {
 	attestation, err := client.AttestationData()
 	require.NoError(t, err)
 
-	err = server.VerifyAttestationData(attestation)
+	err = server.VerifyAttestationData(attestation, "")
 	require.NoError(t, err)
 
 	challengeReq, err := server.IssueChallenge()
@@ -129,7 +130,7 @@ func TestAttestationDataVerifies(t *testing.T) {
 	c, s := newTestHandshake(t)
 	attestationData, err := c.AttestationData()
 	require.NoError(t, err)
-	require.NoError(t, s.VerifyAttestationData(attestationData))
+	require.NoError(t, s.VerifyAttestationData(attestationData, ""))
 }
 
 func TestVerifyAttestationData(t *testing.T) {
@@ -211,12 +212,11 @@ func TestVerifyAttestationData(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.desc, func(t *testing.T) {
 			s.state = stateServerInit
 			s.s.canonicalDomain = tt.serverCanonicalDomain
 
-			err := s.VerifyAttestationData(tt.attestationData)
+			err := s.VerifyAttestationData(tt.attestationData, "")
 			spiretest.RequireGRPCStatusContains(t, err, tt.expectCode, tt.expectMsg)
 			if tt.expectCode == codes.OK {
 				if tt.expectHostname != "" {
@@ -235,10 +235,127 @@ func marshalAttestationData(t *testing.T, cert []byte) []byte {
 	return b
 }
 
+func sourceAddress(addrs string) func(*ssh.Certificate) {
+	return func(cert *ssh.Certificate) {
+		if cert.CriticalOptions == nil {
+			cert.CriticalOptions = make(map[string]string)
+		}
+		cert.CriticalOptions[sourceAddressCriticalOption] = addrs
+	}
+}
+
+func TestVerifyClientIPAgainstSourceAddress(t *testing.T) {
+	tests := []struct {
+		desc           string
+		verifyClientIP bool
+		sourceAddress  string
+		clientIP       string
+		expectCode     codes.Code
+		expectMsg      string
+	}{
+		{
+			desc:           "flag off ignores source-address",
+			verifyClientIP: false,
+			sourceAddress:  "10.0.0.5",
+			clientIP:       "192.168.1.1",
+			expectCode:     codes.OK,
+		},
+		{
+			desc:           "flag on rejects a certificate without source-address",
+			verifyClientIP: true,
+			clientIP:       "10.0.0.5",
+			expectCode:     codes.PermissionDenied,
+			expectMsg:      `certificate has no "source-address" critical option`,
+		},
+		{
+			desc:           "flag on with source-address requires client IP",
+			verifyClientIP: true,
+			sourceAddress:  "10.0.0.5",
+			clientIP:       "",
+			expectCode:     codes.Internal,
+			expectMsg:      "client IP not available for verification",
+		},
+		{
+			desc:           "flag on rejects invalid client IP",
+			verifyClientIP: true,
+			sourceAddress:  "10.0.0.5",
+			clientIP:       "not-an-ip",
+			expectCode:     codes.Internal,
+			expectMsg:      "invalid client IP",
+		},
+		{
+			desc:           "exact IP match",
+			verifyClientIP: true,
+			sourceAddress:  "10.0.0.5",
+			clientIP:       "10.0.0.5",
+			expectCode:     codes.OK,
+		},
+		{
+			desc:           "exact IP mismatch",
+			verifyClientIP: true,
+			sourceAddress:  "10.0.0.5",
+			clientIP:       "10.0.0.6",
+			expectCode:     codes.PermissionDenied,
+			expectMsg:      "client IP verification failed",
+		},
+		{
+			desc:           "CIDR match",
+			verifyClientIP: true,
+			sourceAddress:  "10.0.0.0/24",
+			clientIP:       "10.0.0.42",
+			expectCode:     codes.OK,
+		},
+		{
+			desc:           "CIDR mismatch",
+			verifyClientIP: true,
+			sourceAddress:  "10.0.0.0/24",
+			clientIP:       "10.0.1.42",
+			expectCode:     codes.PermissionDenied,
+			expectMsg:      "client IP verification failed",
+		},
+		{
+			desc:           "comma-separated list match on second entry",
+			verifyClientIP: true,
+			sourceAddress:  "10.0.0.0/24,192.168.1.5",
+			clientIP:       "192.168.1.5",
+			expectCode:     codes.OK,
+		},
+		{
+			desc:           "malformed source-address entry",
+			verifyClientIP: true,
+			sourceAddress:  "not-a-cidr",
+			clientIP:       "10.0.0.1",
+			expectCode:     codes.PermissionDenied,
+			expectMsg:      "error parsing source-address restriction",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.desc, func(t *testing.T) {
+			var opts []func(*ssh.Certificate)
+			opts = append(opts, principal("node.example.org"))
+			if tt.sourceAddress != "" {
+				opts = append(opts, sourceAddress(tt.sourceAddress))
+			}
+			tp := newTest(t, opts...)
+			s := &Server{
+				certChecker:       tp.CertChecker,
+				agentPathTemplate: DefaultAgentPathTemplate,
+				trustDomain:       spiffeid.RequireTrustDomainFromString("foo.local"),
+				verifyClientIP:    tt.verifyClientIP,
+			}
+			handshaker := s.NewHandshake()
+			attestation := marshalAttestationData(t, tp.Certificate.Marshal())
+			err := handshaker.VerifyAttestationData(attestation, tt.clientIP)
+			spiretest.RequireGRPCStatusContains(t, err, tt.expectCode, tt.expectMsg)
+		})
+	}
+}
+
 func TestIssueChallengeUniqueness(t *testing.T) {
 	_, s := newTestHandshake(t)
 	challenges := make(map[string]struct{})
-	for i := 0; i < 10000; i++ {
+	for range 10000 {
 		s.state = stateAttestationDataVerified
 		challenge, err := s.IssueChallenge()
 		require.NoError(t, err)
@@ -278,7 +395,6 @@ func TestRespondToChallenge(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.desc, func(t *testing.T) {
 			c.state = stateProvidedAttestationData
 			_, err := c.RespondToChallenge(tt.challengeReq)
@@ -339,7 +455,6 @@ func TestVerifyChallengeResponse(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.desc, func(t *testing.T) {
 			s.state = stateAttestationDataVerified
 			s.cert = c.c.cert
@@ -393,7 +508,6 @@ func TestDecanonicalizeHostname(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.desc, func(t *testing.T) {
 			hostname, err := decanonicalizeHostname(tt.fqdn, tt.domain)
 			if tt.expectErr != "" {

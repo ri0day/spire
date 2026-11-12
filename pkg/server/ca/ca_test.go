@@ -3,12 +3,14 @@ package ca
 import (
 	"context"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"math/big"
 	"testing"
 	"time"
 
+	"github.com/go-jose/go-jose/v4"
 	"github.com/sirupsen/logrus/hooks/test"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/spire/pkg/common/health"
@@ -71,6 +73,7 @@ func (s *CATestSuite) SetupTest() {
 		TrustDomain:   trustDomainExample,
 		Clock:         s.clock,
 		X509CASubject: pkix.Name{CommonName: "TESTCA"},
+		X509CATTL:     10 * time.Minute,
 		X509SVIDTTL:   time.Minute,
 	})
 	s.Require().NoError(err)
@@ -93,6 +96,29 @@ func (s *CATestSuite) SetupTest() {
 	})
 	s.setX509CA(true)
 	s.setJWTKey()
+	s.setWITKey()
+}
+
+func (s *CATestSuite) TestDisableJWTSVIDs() {
+	s.False(s.ca.IsJWTSVIDsDisabled(), "DisableJWTSVIDs should be false by default")
+
+	ca := NewCA(Config{
+		TrustDomain:     trustDomainExample,
+		HealthChecker:   s.healthChecker,
+		DisableJWTSVIDs: true,
+	})
+	s.True(ca.IsJWTSVIDsDisabled(), "DisableJWTSVIDs not changed to true")
+}
+
+func (s *CATestSuite) TestDisableWITSVIDs() {
+	s.False(s.ca.IsWITSVIDsDisabled(), "DisableWITSVIDs should be false by default")
+
+	ca := NewCA(Config{
+		TrustDomain:     trustDomainExample,
+		HealthChecker:   s.healthChecker,
+		DisableWITSVIDs: true,
+	})
+	s.True(ca.IsWITSVIDsDisabled(), "DisableWITSVIDs not changed to true")
 }
 
 func (s *CATestSuite) TestSignServerX509SVIDNoCASet() {
@@ -280,6 +306,18 @@ func (s *CATestSuite) TestSignWorkloadX509SVID() {
 	s.Equal("O=SPIRE,C=US", svid.Subject.String())
 }
 
+func (s *CATestSuite) TestSignWorkloadX509SVIDUsesEffectiveCAExpiry() {
+	effectiveNotAfter := s.clock.Now().Add(30 * time.Second)
+	x509CA := s.ca.X509CA()
+	x509CA.NotAfter = effectiveNotAfter
+	s.ca.SetX509CA(x509CA)
+
+	svidChain, err := s.ca.SignWorkloadX509SVID(ctx, s.createWorkloadX509SVIDParams())
+	s.Require().NoError(err)
+	s.Require().NotEmpty(svidChain)
+	s.Equal(effectiveNotAfter, svidChain[0].NotAfter)
+}
+
 func (s *CATestSuite) TestSignWorkloadX509SVIDCannotSignTrustDomainID() {
 	params := WorkloadX509SVIDParams{
 		SPIFFEID:  spiffeid.RequireFromString("spiffe://example.org"),
@@ -366,7 +404,6 @@ func (s *CATestSuite) TestSignWorkloadX509SVIDWithSubject() {
 	}
 
 	for _, testCase := range testCases {
-		testCase := testCase
 		s.T().Run(testCase.name, func(t *testing.T) {
 			params := s.createWorkloadX509SVIDParams()
 			params.Subject = testCase.subject
@@ -435,6 +472,23 @@ func (s *CATestSuite) TestNoJWTKeySet() {
 	s.Require().EqualError(err, "JWT key is not available for signing")
 }
 
+func (s *CATestSuite) TestTaintedAuthoritiesArePropagated() {
+	authorities := []*x509.Certificate{
+		{Raw: []byte("foh")},
+		{Raw: []byte("bar")},
+	}
+	s.ca.NotifyTaintedX509Authorities(authorities)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	select {
+	case got := <-s.ca.TaintedAuthorities():
+		s.Require().Equal(authorities, got)
+	case <-ctx.Done():
+		s.Fail("no notification received")
+	}
+}
+
 func (s *CATestSuite) TestSignWorkloadJWTSVIDUsesDefaultTTLIfTTLUnspecified() {
 	token, err := s.ca.SignWorkloadJWTSVID(ctx, s.createJWTSVIDParams(trustDomainExample, 0))
 	s.Require().NoError(err)
@@ -480,6 +534,56 @@ func (s *CATestSuite) TestSignDownstreamX509CANoCASet() {
 	s.Require().EqualError(err, "X509 CA is not available for signing")
 }
 
+func (s *CATestSuite) TestNoWITKeySet() {
+	s.ca.SetWITKey(nil)
+	_, err := s.ca.SignWorkloadWITSVID(ctx, s.createWITSVIDParams(trustDomainExample, 0))
+	s.Require().EqualError(err, "WIT key is not available for signing")
+}
+
+func (s *CATestSuite) TestSignWorkloadWITSVIDUsesDefaultTTLIfTTLUnspecified() {
+	token, err := s.ca.SignWorkloadWITSVID(ctx, s.createWITSVIDParams(trustDomainExample, 0))
+	s.Require().NoError(err)
+	issuedAt, expiresAt, err := jwtsvid.GetTokenExpiry(token)
+	s.Require().NoError(err)
+	s.Require().Equal(s.clock.Now(), issuedAt)
+	s.Require().Equal(s.clock.Now().Add(credtemplate.DefaultWITSVIDTTL), expiresAt)
+}
+
+func (s *CATestSuite) TestSignWorkloadWITSVIDUsesTTLIfSpecified() {
+	token, err := s.ca.SignWorkloadWITSVID(ctx, s.createWITSVIDParams(trustDomainExample, time.Minute+time.Second))
+	s.Require().NoError(err)
+	issuedAt, expiresAt, err := jwtsvid.GetTokenExpiry(token)
+	s.Require().NoError(err)
+	s.Require().Equal(s.clock.Now(), issuedAt)
+	s.Require().Equal(s.clock.Now().Add(time.Minute+time.Second), expiresAt)
+}
+
+func (s *CATestSuite) TestSignWorkloadWITSVIDCapsTTLToKeyExpiry() {
+	token, err := s.ca.SignWorkloadWITSVID(ctx, s.createWITSVIDParams(trustDomainExample, 48*time.Hour))
+	s.Require().NoError(err)
+	issuedAt, expiresAt, err := jwtsvid.GetTokenExpiry(token)
+	s.Require().NoError(err)
+	s.Require().Equal(s.clock.Now(), issuedAt)
+	s.Require().Equal(s.clock.Now().Add(24*time.Hour), expiresAt)
+}
+
+func (s *CATestSuite) TestSignWorkloadWITSVIDValidation() {
+	// spiffe id for wrong trust domain
+	_, err := s.ca.SignWorkloadWITSVID(ctx, s.createWITSVIDParams(trustDomainFoo, 0))
+	s.Require().EqualError(err, `invalid WIT-SVID ID: "spiffe://foo.com/workload" is not a member of trust domain "example.org"`)
+
+	// Validate key algorithm
+	params := s.createWITSVIDParams(trustDomainExample, 0)
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 1024) //nolint:gosec
+	s.Require().NoError(err)
+
+	params.PublicKey = jose.JSONWebKey{
+		Key: &rsaKey.PublicKey,
+	}
+	_, err = s.ca.SignWorkloadWITSVID(ctx, params)
+	s.Require().EqualError(err, "public key must have algorithm set")
+}
+
 func (s *CATestSuite) TestSignDownstreamX509CA() {
 	svidChain, err := s.ca.SignDownstreamX509CA(ctx, s.createDownstreamX509CAParams())
 	s.Require().NoError(err)
@@ -506,11 +610,23 @@ func (s *CATestSuite) TestSignDownstreamX509CA() {
 }
 
 func (s *CATestSuite) TestSignDownstreamX509CAUsesDefaultTTLIfTTLUnspecified() {
-	svid, err := s.ca.SignDownstreamX509CA(ctx, s.createDownstreamX509CAParams())
+	downstreamCA, err := s.ca.SignDownstreamX509CA(ctx, s.createDownstreamX509CAParams())
 	s.Require().NoError(err)
-	s.Require().Len(svid, 1)
-	s.Require().Equal(s.clock.Now().Add(-backdate), svid[0].NotBefore)
-	s.Require().Equal(s.clock.Now().Add(time.Minute), svid[0].NotAfter)
+	s.Require().Len(downstreamCA, 1)
+	s.Require().Equal(s.clock.Now().Add(-backdate), downstreamCA[0].NotBefore)
+	s.Require().Equal(s.clock.Now().Add(10*time.Minute), downstreamCA[0].NotAfter)
+}
+
+func (s *CATestSuite) TestSignDownstreamX509CAUsesEffectiveCAExpiry() {
+	effectiveNotAfter := s.clock.Now().Add(30 * time.Second)
+	x509CA := s.ca.X509CA()
+	x509CA.NotAfter = effectiveNotAfter
+	s.ca.SetX509CA(x509CA)
+
+	downstreamCA, err := s.ca.SignDownstreamX509CA(ctx, s.createDownstreamX509CAParams())
+	s.Require().NoError(err)
+	s.Require().NotEmpty(downstreamCA)
+	s.Equal(effectiveNotAfter, downstreamCA[0].NotAfter)
 }
 
 func (s *CATestSuite) TestHealthChecks() {
@@ -549,6 +665,7 @@ func (s *CATestSuite) setX509CA(selfSigned bool) {
 		Signer:        testSigner,
 		Certificate:   s.caCert,
 		UpstreamChain: upstreamChain,
+		NotAfter:      s.caCert.NotAfter,
 	})
 }
 
@@ -557,6 +674,14 @@ func (s *CATestSuite) setJWTKey() {
 		Signer:   testSigner,
 		Kid:      "KID",
 		NotAfter: s.clock.Now().Add(10 * time.Minute),
+	})
+}
+
+func (s *CATestSuite) setWITKey() {
+	s.ca.SetWITKey(&WITKey{
+		Signer:   testSigner,
+		Kid:      "KID",
+		NotAfter: s.clock.Now().Add(24 * time.Hour),
 	})
 }
 
@@ -599,6 +724,17 @@ func (s *CATestSuite) createJWTSVIDParams(trustDomain spiffeid.TrustDomain, ttl 
 		SPIFFEID: spiffeid.RequireFromPath(trustDomain, "/workload"),
 		Audience: []string{"AUDIENCE"},
 		TTL:      ttl,
+	}
+}
+
+func (s *CATestSuite) createWITSVIDParams(trustDomain spiffeid.TrustDomain, ttl time.Duration) WorkloadWITSVIDParams {
+	return WorkloadWITSVIDParams{
+		SPIFFEID: spiffeid.RequireFromPath(trustDomain, "/workload"),
+		TTL:      ttl,
+		PublicKey: jose.JSONWebKey{
+			Key:       testSigner.Public(),
+			Algorithm: "ES256",
+		},
 	}
 }
 

@@ -47,7 +47,7 @@ type showCommand struct {
 	// List of SPIFFE IDs of trust domains the registration entry is federated with
 	federatesWith StringsFlag
 
-	// Whether or not the entry is for a downstream SPIRE server
+	// whether the entry is for a downstream SPIRE server
 	downstream bool
 
 	// Match used when filtering by federates with
@@ -174,6 +174,8 @@ func (c *showCommand) fetchEntries(ctx context.Context, client entryv1.EntryClie
 	if c.hint != "" {
 		filter.ByHint = wrapperspb.String(c.hint)
 	}
+
+	filter.ByDownstream = wrapperspb.Bool(c.downstream)
 
 	pageToken := ""
 

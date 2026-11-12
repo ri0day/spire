@@ -5,12 +5,14 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"time"
 
 	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
 	"github.com/spiffe/spire/pkg/server/cache/entrycache"
+	"github.com/spiffe/spire/pkg/server/cache/nodecache"
 	"github.com/spiffe/spire/pkg/server/endpoints/bundle"
 	"golang.org/x/net/http2"
 	"google.golang.org/grpc"
@@ -19,18 +21,21 @@ import (
 	"google.golang.org/grpc/keepalive"
 
 	"github.com/andres-erbsen/clock"
+	proxyproto "github.com/pires/go-proxyproto"
 	"github.com/sirupsen/logrus"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	agentv1 "github.com/spiffe/spire-api-sdk/proto/spire/api/server/agent/v1"
 	bundlev1 "github.com/spiffe/spire-api-sdk/proto/spire/api/server/bundle/v1"
 	debugv1_pb "github.com/spiffe/spire-api-sdk/proto/spire/api/server/debug/v1"
 	entryv1 "github.com/spiffe/spire-api-sdk/proto/spire/api/server/entry/v1"
+	localauthorityv1 "github.com/spiffe/spire-api-sdk/proto/spire/api/server/localauthority/v1"
 	loggerv1 "github.com/spiffe/spire-api-sdk/proto/spire/api/server/logger/v1"
 	svidv1 "github.com/spiffe/spire-api-sdk/proto/spire/api/server/svid/v1"
 	trustdomainv1 "github.com/spiffe/spire-api-sdk/proto/spire/api/server/trustdomain/v1"
 	"github.com/spiffe/spire/pkg/common/auth"
 	"github.com/spiffe/spire/pkg/common/peertracker"
 	"github.com/spiffe/spire/pkg/common/telemetry"
+	"github.com/spiffe/spire/pkg/common/tlspolicy"
 	"github.com/spiffe/spire/pkg/common/util"
 	"github.com/spiffe/spire/pkg/server/api"
 	"github.com/spiffe/spire/pkg/server/api/middleware"
@@ -49,8 +54,19 @@ const (
 	// entry cache.
 	defaultCacheReloadInterval = 5 * time.Second
 
-	// This is the default amoount of time events live before they are pruned
+	// This is the default amount of time between full refreshes of the in-memory
+	// entry cache.
+	defaultFullCacheReloadInterval = 24 * time.Hour
+
+	// This is the default amount of time events live before they are pruned
 	defaultPruneEventsOlderThan = 12 * time.Hour
+
+	// This is the default amount of time to wait for an event before giving up
+	defaultEventTimeout = 15 * time.Minute
+
+	// This is the time to wait for graceful termination of the gRPC server
+	// before forcefully terminating.
+	gracefulStopTimeout = 10 * time.Second
 )
 
 // Server manages gRPC and HTTP endpoint lifecycle
@@ -60,6 +76,9 @@ type Server interface {
 	// canceled, the function returns nil. Otherwise, the error from the failed
 	// server is returned.
 	ListenAndServe(ctx context.Context) error
+
+	// WaitForListening blocks until the server starts listening.
+	WaitForListening()
 }
 
 type Endpoints struct {
@@ -74,22 +93,35 @@ type Endpoints struct {
 	Log                          logrus.FieldLogger
 	Metrics                      telemetry.Metrics
 	RateLimit                    RateLimitConfig
+	NodeCacheRebuildTask         func(context.Context) error
 	EntryFetcherCacheRebuildTask func(context.Context) error
 	EntryFetcherPruneEventsTask  func(context.Context) error
+	CertificateReloadTask        func(context.Context) error
 	AuditLogEnabled              bool
+	AuditLogExcludeAgentSync     bool
+	ProxyProtocolTrustedCIDRs    []string
 	AuthPolicyEngine             *authpolicy.Engine
 	AdminIDs                     []spiffeid.ID
+	TLSPolicy                    tlspolicy.Policy
+	MaxAttestedNodeInfoStaleness time.Duration
+	nodeCache                    api.AttestedNodeCache
+
+	hooks struct {
+		// test hook used to indicate that is listening
+		listening chan struct{}
+	}
 }
 
 type APIServers struct {
-	AgentServer       agentv1.AgentServer
-	BundleServer      bundlev1.BundleServer
-	DebugServer       debugv1_pb.DebugServer
-	EntryServer       entryv1.EntryServer
-	HealthServer      grpc_health_v1.HealthServer
-	LoggerServer      loggerv1.LoggerServer
-	SVIDServer        svidv1.SVIDServer
-	TrustDomainServer trustdomainv1.TrustDomainServer
+	AgentServer          agentv1.AgentServer
+	BundleServer         bundlev1.BundleServer
+	DebugServer          debugv1_pb.DebugServer
+	EntryServer          entryv1.EntryServer
+	HealthServer         grpc_health_v1.HealthServer
+	LoggerServer         loggerv1.LoggerServer
+	SVIDServer           svidv1.SVIDServer
+	TrustDomainServer    trustdomainv1.TrustDomainServer
+	LocalAUthorityServer localauthorityv1.LocalAuthorityServer
 }
 
 // RateLimitConfig holds rate limiting configurations.
@@ -114,27 +146,56 @@ func New(ctx context.Context, c Config) (*Endpoints, error) {
 	if c.CacheReloadInterval == 0 {
 		c.CacheReloadInterval = defaultCacheReloadInterval
 	}
+
+	if c.FullCacheReloadInterval == 0 {
+		c.FullCacheReloadInterval = defaultFullCacheReloadInterval
+	}
+
+	if c.FullCacheReloadInterval <= c.CacheReloadInterval {
+		return nil, errors.New("full cache reload interval must be greater than cache reload interval")
+	}
+
 	if c.PruneEventsOlderThan == 0 {
 		c.PruneEventsOlderThan = defaultPruneEventsOlderThan
 	}
 
+	if c.EventTimeout == 0 {
+		c.EventTimeout = defaultEventTimeout
+	}
+
 	ds := c.Catalog.GetDataStore()
 
+	nodeCache, err := nodecache.New(ctx, c.Log, ds, c.Clock, true, c.MaxAttestedNodeInfoStaleness != 0)
+	if err != nil {
+		return nil, err
+	}
+
 	var ef api.AuthorizedEntryFetcher
-	var cacheRebuildTask, pruneEventsTask func(context.Context) error
+	var cacheRebuildTask, nodeCacheRebuildTask, pruneEventsTask func(context.Context) error
 	if c.EventsBasedCache {
-		efEventsBasedCache, err := NewAuthorizedEntryFetcherWithEventsBasedCache(ctx, c.Log, c.Clock, ds, c.CacheReloadInterval, c.PruneEventsOlderThan)
+		efEventsBasedCache, err := NewAuthorizedEntryFetcherEvents(ctx, c.TrustDomain.String(), AuthorizedEntryFetcherEventsConfig{
+			log:                     c.Log,
+			metrics:                 c.Metrics,
+			clk:                     c.Clock,
+			ds:                      ds,
+			nodeCache:               nodeCache,
+			cacheReloadInterval:     c.CacheReloadInterval,
+			fullCacheReloadInterval: c.FullCacheReloadInterval,
+			pruneEventsOlderThan:    c.PruneEventsOlderThan,
+			eventTimeout:            c.EventTimeout,
+		})
 		if err != nil {
 			return nil, err
 		}
 		cacheRebuildTask = efEventsBasedCache.RunUpdateCacheTask
 		pruneEventsTask = efEventsBasedCache.PruneEventsTask
+		nodeCacheRebuildTask = nodeCache.PeriodicRebuild
 		ef = efEventsBasedCache
 	} else {
 		buildCacheFn := func(ctx context.Context) (_ entrycache.Cache, err error) {
 			call := telemetry.StartCall(c.Metrics, telemetry.Entry, telemetry.Cache, telemetry.Reload)
 			defer call.Done(&err)
-			return entrycache.BuildFromDataStore(ctx, c.Catalog.GetDataStore())
+			return entrycache.BuildFromDataStore(ctx, c.TrustDomain.String(), c.Catalog.GetDataStore())
 		}
 
 		efFullCache, err := NewAuthorizedEntryFetcherWithFullCache(ctx, buildCacheFn, c.Log, c.Clock, ds, c.CacheReloadInterval, c.PruneEventsOlderThan)
@@ -143,8 +204,12 @@ func New(ctx context.Context, c Config) (*Endpoints, error) {
 		}
 		cacheRebuildTask = efFullCache.RunRebuildCacheTask
 		pruneEventsTask = efFullCache.PruneEventsTask
+		// cacheRebuildTask will take care of rebuilding the node cache
+		nodeCacheRebuildTask = func(ctx context.Context) error { return nil }
 		ef = efFullCache
 	}
+
+	bundleEndpointServer, certificateReloadTask := c.maybeMakeBundleEndpointServer()
 
 	return &Endpoints{
 		TCPAddr:                      c.TCPAddr,
@@ -154,15 +219,28 @@ func New(ctx context.Context, c Config) (*Endpoints, error) {
 		DataStore:                    ds,
 		BundleCache:                  bundle.NewCache(ds, c.Clock),
 		APIServers:                   c.makeAPIServers(ef),
-		BundleEndpointServer:         c.maybeMakeBundleEndpointServer(),
+		BundleEndpointServer:         bundleEndpointServer,
 		Log:                          c.Log,
 		Metrics:                      c.Metrics,
 		RateLimit:                    c.RateLimit,
+		NodeCacheRebuildTask:         nodeCacheRebuildTask,
 		EntryFetcherCacheRebuildTask: cacheRebuildTask,
 		EntryFetcherPruneEventsTask:  pruneEventsTask,
+		CertificateReloadTask:        certificateReloadTask,
 		AuditLogEnabled:              c.AuditLogEnabled,
+		AuditLogExcludeAgentSync:     c.AuditLogExcludeAgentSync,
+		ProxyProtocolTrustedCIDRs:    c.ProxyProtocolTrustedCIDRs,
 		AuthPolicyEngine:             c.AuthPolicyEngine,
 		AdminIDs:                     c.AdminIDs,
+		TLSPolicy:                    c.TLSPolicy,
+		MaxAttestedNodeInfoStaleness: c.MaxAttestedNodeInfoStaleness,
+		nodeCache:                    nodeCache,
+
+		hooks: struct {
+			listening chan struct{}
+		}{
+			listening: make(chan struct{}),
+		},
 	}, nil
 }
 
@@ -188,6 +266,8 @@ func (e *Endpoints) ListenAndServe(ctx context.Context) error {
 	svidv1.RegisterSVIDServer(udsServer, e.APIServers.SVIDServer)
 	trustdomainv1.RegisterTrustDomainServer(tcpServer, e.APIServers.TrustDomainServer)
 	trustdomainv1.RegisterTrustDomainServer(udsServer, e.APIServers.TrustDomainServer)
+	localauthorityv1.RegisterLocalAuthorityServer(tcpServer, e.APIServers.LocalAUthorityServer)
+	localauthorityv1.RegisterLocalAuthorityServer(udsServer, e.APIServers.LocalAUthorityServer)
 
 	// UDS only
 	loggerv1.RegisterLoggerServer(udsServer, e.APIServers.LoggerServer)
@@ -202,6 +282,7 @@ func (e *Endpoints) ListenAndServe(ctx context.Context) error {
 			return e.runLocalAccess(ctx, udsServer)
 		},
 		e.EntryFetcherCacheRebuildTask,
+		e.NodeCacheRebuildTask,
 	}
 
 	if e.BundleEndpointServer != nil {
@@ -212,6 +293,10 @@ func (e *Endpoints) ListenAndServe(ctx context.Context) error {
 		tasks = append(tasks, e.EntryFetcherPruneEventsTask)
 	}
 
+	if e.CertificateReloadTask != nil {
+		tasks = append(tasks, e.CertificateReloadTask)
+	}
+
 	err := util.RunTasks(ctx, tasks...)
 	if errors.Is(err, context.Canceled) {
 		err = nil
@@ -220,8 +305,12 @@ func (e *Endpoints) ListenAndServe(ctx context.Context) error {
 }
 
 func (e *Endpoints) createTCPServer(ctx context.Context, unaryInterceptor grpc.UnaryServerInterceptor, streamInterceptor grpc.StreamServerInterceptor) *grpc.Server {
-	tlsConfig := &tls.Config{ //nolint: gosec // False positive, getTLSConfig is setting MinVersion
+	tlsConfig := &tls.Config{
 		GetConfigForClient: e.getTLSConfig(ctx),
+		// Disable session ticket resumption so that VerifyPeerCertificate is
+		// called on every connection, ensuring the peer certificate chain is
+		// always validated against the current trust bundle.
+		SessionTicketsDisabled: true,
 	}
 
 	return grpc.NewServer(
@@ -249,13 +338,22 @@ func (e *Endpoints) createUDSServer(unaryInterceptor grpc.UnaryServerInterceptor
 	return grpc.NewServer(options...)
 }
 
-// runTCPServer will start the server and block until it exits or we are dying.
+// runTCPServer will start the server and block until it exits, or we are dying.
 func (e *Endpoints) runTCPServer(ctx context.Context, server *grpc.Server) error {
 	l, err := net.Listen(e.TCPAddr.Network(), e.TCPAddr.String())
 	if err != nil {
 		return err
 	}
 	defer l.Close()
+
+	if len(e.ProxyProtocolTrustedCIDRs) > 0 {
+		var err error
+		l, err = wrapListenerWithProxyProtocol(l, e.ProxyProtocolTrustedCIDRs)
+		if err != nil {
+			return fmt.Errorf("invalid proxy_protocol_trusted_cidrs: %w", err)
+		}
+		e.Log.WithField("trusted_cidrs", e.ProxyProtocolTrustedCIDRs).Info("PROXY protocol enabled on TCP listener")
+	}
 	log := e.Log.WithFields(logrus.Fields{
 		telemetry.Network: l.Addr().Network(),
 		telemetry.Address: l.Addr().String(),
@@ -271,16 +369,49 @@ func (e *Endpoints) runTCPServer(ctx context.Context, server *grpc.Server) error
 		log.WithError(err).Error("Server APIs stopped prematurely")
 		return err
 	case <-ctx.Done():
-		log.Info("Stopping Server APIs")
-		server.Stop()
-		<-errChan
-		log.Info("Server APIs have stopped")
+		e.handleShutdown(server, errChan, log)
 		return nil
 	}
 }
 
+// wrapListenerWithProxyProtocol wraps a net.Listener with PROXY protocol
+// support, restricting header acceptance to the given trusted CIDRs.
+func wrapListenerWithProxyProtocol(l net.Listener, trustedCIDRs []string) (net.Listener, error) {
+	policy, err := proxyproto.PolicyFromRanges(trustedCIDRs, proxyproto.USE, proxyproto.REJECT)
+	if err != nil {
+		return nil, err
+	}
+	return &proxyproto.Listener{
+		Listener:       l,
+		ConnPolicy:     policy,
+		ValidateHeader: validateProxyHeader,
+	}, nil
+}
+
+// validateProxyHeader ensures a PROXY protocol header can only replace the
+// connection's source address with a TCP address.
+func validateProxyHeader(h *proxyproto.Header) error {
+	if h.Command.IsLocal() {
+		// LOCAL headers carry no addresses; the real peer address is used.
+		return nil
+	}
+
+	switch h.TransportProtocol {
+	case proxyproto.TCPv4, proxyproto.TCPv6, proxyproto.UNSPEC:
+	default:
+		return fmt.Errorf("unsupported PROXY protocol transport protocol %#x", byte(h.TransportProtocol))
+	}
+
+	if h.SourceAddr != nil {
+		if _, ok := h.SourceAddr.(*net.TCPAddr); !ok {
+			return fmt.Errorf("unsupported PROXY protocol source address type %T", h.SourceAddr)
+		}
+	}
+	return nil
+}
+
 // runLocalAccess will start a grpc server to be accessed locally
-// and block until it exits or we are dying.
+// and block until it exits, or we are dying.
 func (e *Endpoints) runLocalAccess(ctx context.Context, server *grpc.Server) error {
 	os.Remove(e.LocalAddr.String())
 	var l net.Listener
@@ -307,6 +438,7 @@ func (e *Endpoints) runLocalAccess(ctx context.Context, server *grpc.Server) err
 
 	// Skip use of tomb here so we don't pollute a clean shutdown with errors
 	log.Info("Starting Server APIs")
+	e.triggerListeningHook()
 	errChan := make(chan error)
 	go func() { errChan <- server.Serve(l) }()
 
@@ -315,12 +447,34 @@ func (e *Endpoints) runLocalAccess(ctx context.Context, server *grpc.Server) err
 		log.WithError(err).Error("Server APIs stopped prematurely")
 		return err
 	case <-ctx.Done():
-		log.Info("Stopping Server APIs")
-		server.Stop()
-		<-errChan
-		log.Info("Server APIs have stopped")
+		e.handleShutdown(server, errChan, log)
 		return nil
 	}
+}
+
+// handleShutdown is a helper function for gracefully terminating the grpc server.
+// if the server does not terminate within the GratefulStopWait deadline, the server
+// will be forcibly stopped.
+func (e *Endpoints) handleShutdown(server *grpc.Server, errChan <-chan error, log *logrus.Entry) {
+	log.Info("Stopping Server APIs")
+
+	stopComplete := make(chan struct{})
+	go func() {
+		log.Info("Attempting graceful stop")
+		server.GracefulStop()
+		close(stopComplete)
+	}()
+
+	shutdownDeadline := time.After(gracefulStopTimeout)
+	select {
+	case <-shutdownDeadline:
+		log.Infof("Graceful stop unsuccessful, forced stop after %v", gracefulStopTimeout)
+		server.Stop()
+	case <-stopComplete:
+		log.Info("Graceful stop successful")
+	}
+	<-errChan
+	log.Info("Server APIs have stopped")
 }
 
 // getTLSConfig returns a TLS Config hook for the gRPC server
@@ -339,6 +493,12 @@ func (e *Endpoints) getTLSConfig(ctx context.Context) func(*tls.ClientHelloInfo)
 		spiffeTLSConfig.MinVersion = tls.VersionTLS12
 		spiffeTLSConfig.NextProtos = []string{http2.NextProtoTLS}
 		spiffeTLSConfig.VerifyPeerCertificate = e.serverSpiffeVerificationFunc(bundleSrc)
+		spiffeTLSConfig.SessionTicketsDisabled = true
+
+		err := tlspolicy.ApplyPolicy(spiffeTLSConfig, e.TLSPolicy, tlspolicy.WithServerTLSConfig())
+		if err != nil {
+			return nil, err
+		}
 
 		return spiffeTLSConfig, nil
 	}
@@ -347,5 +507,20 @@ func (e *Endpoints) getTLSConfig(ctx context.Context) func(*tls.ClientHelloInfo)
 func (e *Endpoints) makeInterceptors() (grpc.UnaryServerInterceptor, grpc.StreamServerInterceptor) {
 	log := e.Log.WithField(telemetry.SubsystemName, "api")
 
-	return middleware.Interceptors(Middleware(log, e.Metrics, e.DataStore, clock.New(), e.RateLimit, e.AuthPolicyEngine, e.AuditLogEnabled, e.AdminIDs))
+	return middleware.Interceptors(Middleware(log, e.Metrics, e.DataStore, e.nodeCache, e.MaxAttestedNodeInfoStaleness, clock.New(), e.RateLimit, e.AuthPolicyEngine, e.AuditLogEnabled, e.AuditLogExcludeAgentSync, e.AdminIDs))
+}
+
+func (e *Endpoints) triggerListeningHook() {
+	if e.hooks.listening != nil {
+		e.hooks.listening <- struct{}{}
+	}
+}
+
+func (e *Endpoints) WaitForListening() {
+	if e.hooks.listening == nil {
+		e.Log.Warn("Listening hook not initialized, cannot wait for listening")
+		return
+	}
+
+	<-e.hooks.listening
 }

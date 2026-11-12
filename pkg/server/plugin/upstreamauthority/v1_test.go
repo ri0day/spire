@@ -17,6 +17,7 @@ import (
 	"github.com/spiffe/spire-plugin-sdk/proto/spire/plugin/types"
 	"github.com/spiffe/spire/pkg/common/catalog"
 	"github.com/spiffe/spire/pkg/common/coretypes/jwtkey"
+	"github.com/spiffe/spire/pkg/common/coretypes/witkey"
 	"github.com/spiffe/spire/pkg/common/coretypes/x509certificate"
 	"github.com/spiffe/spire/pkg/server/plugin/upstreamauthority"
 	"github.com/spiffe/spire/proto/spire/common"
@@ -38,6 +39,8 @@ const (
 var (
 	jwtKeyPKIX, _ = x509.MarshalPKIXPublicKey(testkey.MustEC256().Public())
 	jwtKey        = &common.PublicKey{Kid: "KEYID", PkixBytes: jwtKeyPKIX, NotAfter: 12345}
+	witKeyPKIX, _ = x509.MarshalPKIXPublicKey(testkey.MustEC256().Public())
+	witKey        = &common.PublicKey{Kid: "WITKEYID", PkixBytes: witKeyPKIX, NotAfter: 12345}
 )
 
 func TestV1MintX509CA(t *testing.T) {
@@ -45,13 +48,23 @@ func TestV1MintX509CA(t *testing.T) {
 	x509CA := upstreamCA.ChildCA()
 
 	expectedX509CAChain := x509CA.X509Authorities()
-	expectedUpstreamX509Roots := upstreamCA.X509Authorities()
+	var expectedUpstreamX509Roots []*x509certificate.X509Authority
+	for _, eachCert := range upstreamCA.X509Authorities() {
+		expectedUpstreamX509Roots = append(expectedUpstreamX509Roots, &x509certificate.X509Authority{
+			Certificate: eachCert,
+		})
+	}
+	taintedUpstreamX509Roots := []*x509certificate.X509Authority{
+		{
+			Certificate: expectedUpstreamX509Roots[0].Certificate,
+			Tainted:     true,
+		},
+	}
 
-	validX509CAChain := x509certificate.RequireToPluginProtos(expectedX509CAChain)
+	validX509CAChain := x509certificate.RequireToPluginFromCertificates(expectedX509CAChain)
 	validUpstreamX509Roots := x509certificate.RequireToPluginProtos(expectedUpstreamX509Roots)
 	malformedX509CAChain := []*types.X509Certificate{{Asn1: []byte("OHNO")}}
 	malformedUpstreamX509Roots := []*types.X509Certificate{{Asn1: []byte("OHNO")}}
-
 	withoutX509CAChain := &upstreamauthorityv1.MintX509CAResponse{
 		X509CaChain:       nil,
 		UpstreamX509Roots: validUpstreamX509Roots,
@@ -72,18 +85,28 @@ func TestV1MintX509CA(t *testing.T) {
 		X509CaChain:       validX509CAChain,
 		UpstreamX509Roots: validUpstreamX509Roots,
 	}
+	withTaintedUpstreamX509Roots := &upstreamauthorityv1.MintX509CAResponse{
+		X509CaChain: validX509CAChain,
+		UpstreamX509Roots: []*types.X509Certificate{
+			{
+				Asn1:    validUpstreamX509Roots[0].Asn1,
+				Tainted: true,
+			},
+		},
+	}
 
 	builder := BuildV1()
 
 	for _, tt := range []struct {
-		test                string
-		builder             *V1Builder
-		expectCode          codes.Code
-		expectMessage       string
-		expectStreamUpdates bool
-		expectStreamCode    codes.Code
-		expectStreamMessage string
-		expectLogs          []spiretest.LogEntry
+		test                            string
+		builder                         *V1Builder
+		expectCode                      codes.Code
+		expectMessage                   string
+		expectStreamUpdates             bool
+		expectStreamCode                codes.Code
+		expectStreamMessage             string
+		expectLogs                      []spiretest.LogEntry
+		expectUpstreamX509RootsResponse []*x509certificate.X509Authority
 	}{
 		{
 			test:          "plugin returns before sending first response",
@@ -139,6 +162,15 @@ func TestV1MintX509CA(t *testing.T) {
 			expectStreamMessage: "",
 		},
 		{
+			test: "success with tainted authority",
+			builder: builder.
+				WithMintX509CAResponse(withTaintedUpstreamX509Roots),
+			expectCode:                      codes.OK,
+			expectMessage:                   "",
+			expectStreamUpdates:             false,
+			expectUpstreamX509RootsResponse: taintedUpstreamX509Roots,
+		},
+		{
 			test: "second plugin response is bad (contains X.509 CA)",
 			builder: builder.
 				WithMintX509CAResponse(withX509CAChainAndUpstreamX509Roots).
@@ -170,7 +202,6 @@ func TestV1MintX509CA(t *testing.T) {
 			expectStreamMessage: "upstreamauthority(test): ohno",
 		},
 	} {
-		tt := tt
 		t.Run(tt.test, func(t *testing.T) {
 			log, logHook := test.NewNullLogger()
 
@@ -182,8 +213,12 @@ func TestV1MintX509CA(t *testing.T) {
 			}
 			require.NotNil(t, upstreamX509RootsStream, "stream should have been returned")
 			defer upstreamX509RootsStream.Close()
+			expectUpstreamX509Roots := expectedUpstreamX509Roots
+			if tt.expectUpstreamX509RootsResponse != nil {
+				expectUpstreamX509Roots = tt.expectUpstreamX509RootsResponse
+			}
 			assert.Equal(t, expectedX509CAChain, x509CA)
-			assert.Equal(t, expectedUpstreamX509Roots, upstreamX509Roots)
+			assert.Equal(t, expectUpstreamX509Roots, upstreamX509Roots)
 
 			switch {
 			case !tt.expectStreamUpdates:
@@ -193,7 +228,11 @@ func TestV1MintX509CA(t *testing.T) {
 			case tt.expectStreamCode == codes.OK:
 				upstreamX509Roots, err = upstreamX509RootsStream.RecvUpstreamX509Authorities()
 				assert.NoError(t, err, "stream should have returned update")
-				assert.Equal(t, expectedUpstreamX509Roots, upstreamX509Roots)
+				expected := expectUpstreamX509Roots
+				if tt.expectUpstreamX509RootsResponse != nil {
+					expected = tt.expectUpstreamX509RootsResponse
+				}
+				assert.Equal(t, expected, upstreamX509Roots)
 			default:
 				upstreamX509Roots, err = upstreamX509RootsStream.RecvUpstreamX509Authorities()
 				spiretest.RequireGRPCStatusHasPrefix(t, err, tt.expectStreamCode, tt.expectStreamMessage)
@@ -327,7 +366,6 @@ func TestV1PublishJWTKey(t *testing.T) {
 			expectStreamMessage: "upstreamauthority(test): ohno",
 		},
 	} {
-		tt := tt
 		t.Run(tt.test, func(t *testing.T) {
 			log, logHook := test.NewNullLogger()
 
@@ -354,6 +392,338 @@ func TestV1PublishJWTKey(t *testing.T) {
 				upstreamJWTKeys, err = upstreamJWTKeysStream.RecvUpstreamJWTAuthorities()
 				spiretest.RequireGRPCStatusHasPrefix(t, err, tt.expectStreamCode, tt.expectStreamMessage)
 				assert.Nil(t, upstreamJWTKeys)
+			}
+
+			spiretest.AssertLogs(t, logHook.AllEntries(), tt.expectLogs)
+		})
+	}
+}
+
+func TestV1PublishWITKey(t *testing.T) {
+	key := testkey.NewEC256(t)
+	pkixBytes, err := x509.MarshalPKIXPublicKey(key.Public())
+	require.NoError(t, err)
+
+	expectedUpstreamWITKeys := []*common.PublicKey{
+		{
+			Kid:       "UPSTREAM KEY",
+			PkixBytes: pkixBytes,
+		},
+	}
+
+	withoutID := &upstreamauthorityv1.PublishWITKeyResponse{
+		UpstreamWitKeys: []*types.WITKey{
+			{PublicKey: pkixBytes},
+		},
+	}
+	withoutPKIXData := &upstreamauthorityv1.PublishWITKeyResponse{
+		UpstreamWitKeys: []*types.WITKey{
+			{KeyId: "UPSTREAM KEY"},
+		},
+	}
+	withMalformedPKIXData := &upstreamauthorityv1.PublishWITKeyResponse{
+		UpstreamWitKeys: []*types.WITKey{
+			{KeyId: "UPSTREAM KEY", PublicKey: []byte("JUNK")},
+		},
+	}
+	withIDAndPKIXData := &upstreamauthorityv1.PublishWITKeyResponse{
+		UpstreamWitKeys: witkey.RequireToPluginFromCommonProtos(expectedUpstreamWITKeys),
+	}
+
+	builder := BuildV1()
+
+	for _, tt := range []struct {
+		test                string
+		builder             *V1Builder
+		expectCode          codes.Code
+		expectMessage       string
+		expectStreamUpdates bool
+		expectStreamCode    codes.Code
+		expectStreamMessage string
+		expectLogs          []spiretest.LogEntry
+	}{
+		{
+			test:          "plugin does not implement RPC",
+			builder:       builder.WithoutPublishWITKey(),
+			expectCode:    codes.Unimplemented,
+			expectMessage: "upstreamauthority(test): method PublishWITKeyAndSubscribe not implemented",
+		},
+		{
+			test:          "plugin returns before sending first response",
+			builder:       builder.WithPreSendError(nil),
+			expectCode:    codes.Internal,
+			expectMessage: "upstreamauthority(test): plugin closed stream unexpectedly",
+		},
+		{
+			test:          "plugin fails before sending first response",
+			builder:       builder.WithPreSendError(errors.New("ohno")),
+			expectCode:    codes.Unknown,
+			expectMessage: "upstreamauthority(test): ohno",
+		},
+		{
+			test:          "plugin response missing WIT key ID",
+			builder:       builder.WithPublishWITKeyResponse(withoutID),
+			expectCode:    codes.Internal,
+			expectMessage: "upstreamauthority(test): invalid plugin response: missing key ID for WIT key",
+		},
+		{
+			test:          "plugin response missing PKIX data",
+			builder:       builder.WithPublishWITKeyResponse(withoutPKIXData),
+			expectCode:    codes.Internal,
+			expectMessage: `upstreamauthority(test): invalid plugin response: missing public key for WIT key "UPSTREAM KEY"`,
+		},
+		{
+			test:          "plugin response has malformed PKIX data",
+			builder:       builder.WithPublishWITKeyResponse(withMalformedPKIXData),
+			expectCode:    codes.Internal,
+			expectMessage: `upstreamauthority(test): invalid plugin response: failed to unmarshal public key for WIT key "UPSTREAM KEY"`,
+		},
+		{
+			test:    "success but plugin does not support streaming updates",
+			builder: builder.WithPublishWITKeyResponse(withIDAndPKIXData),
+		},
+		{
+			test: "success and plugin supports streaming updates",
+			builder: builder.
+				WithPublishWITKeyResponse(withIDAndPKIXData).
+				WithPublishWITKeyResponse(withIDAndPKIXData),
+			expectStreamUpdates: true,
+		},
+		{
+			test: "second plugin response is bad (missing ID)",
+			builder: builder.
+				WithPublishWITKeyResponse(withIDAndPKIXData).
+				WithPublishWITKeyResponse(withoutID),
+			expectStreamUpdates: false, // because the second response is bad and ignored
+			expectLogs: []spiretest.LogEntry{
+				{
+					Level:   logrus.WarnLevel,
+					Message: "Failed to parse a WIT key update from the upstream authority plugin. Please report this bug.",
+					Data: logrus.Fields{
+						logrus.ErrorKey: "rpc error: code = Internal desc = upstreamauthority(test): invalid plugin response: missing key ID for WIT key",
+					},
+				},
+			},
+		},
+		{
+			test: "plugin fails to stream updates",
+			builder: builder.
+				WithPublishWITKeyResponse(withIDAndPKIXData).
+				WithPostSendError(errors.New("ohno")),
+			expectStreamUpdates: true,
+			expectStreamCode:    codes.Unknown,
+			expectStreamMessage: "upstreamauthority(test): ohno",
+		},
+	} {
+		t.Run(tt.test, func(t *testing.T) {
+			log, logHook := test.NewNullLogger()
+
+			ua := tt.builder.WithLog(log).Load(t)
+			upstreamWITKeys, upstreamWITKeysStream, err := ua.PublishWITKey(context.Background(), witKey)
+			spiretest.RequireGRPCStatusHasPrefix(t, err, tt.expectCode, tt.expectMessage)
+			if tt.expectCode != codes.OK {
+				return
+			}
+			require.NotNil(t, upstreamWITKeysStream, "stream should have been returned")
+			defer upstreamWITKeysStream.Close()
+			spiretest.AssertProtoListEqual(t, expectedUpstreamWITKeys, upstreamWITKeys)
+
+			switch {
+			case !tt.expectStreamUpdates:
+				upstreamWITKeys, err := upstreamWITKeysStream.RecvUpstreamWITAuthorities()
+				assert.Equal(t, io.EOF, err, "stream should have returned EOF")
+				assert.Nil(t, upstreamWITKeys, "no WIT keys should be received")
+			case tt.expectStreamCode == codes.OK:
+				upstreamWITKeys, err := upstreamWITKeysStream.RecvUpstreamWITAuthorities()
+				assert.NoError(t, err, "stream should have returned update")
+				spiretest.AssertProtoListEqual(t, expectedUpstreamWITKeys, upstreamWITKeys)
+			default:
+				upstreamWITKeys, err = upstreamWITKeysStream.RecvUpstreamWITAuthorities()
+				spiretest.RequireGRPCStatusHasPrefix(t, err, tt.expectStreamCode, tt.expectStreamMessage)
+				assert.Nil(t, upstreamWITKeys)
+			}
+
+			spiretest.AssertLogs(t, logHook.AllEntries(), tt.expectLogs)
+		})
+	}
+}
+
+func TestV1SubscribeToLocalBundle(t *testing.T) {
+	upstreamCA := testca.New(t, spiffeid.RequireTrustDomainFromString("example.org"))
+
+	var expectedUpstreamX509Roots []*x509certificate.X509Authority
+	for _, eachCert := range upstreamCA.X509Authorities() {
+		expectedUpstreamX509Roots = append(expectedUpstreamX509Roots, &x509certificate.X509Authority{
+			Certificate: eachCert,
+		})
+	}
+	validUpstreamX509Roots := x509certificate.RequireToPluginProtos(expectedUpstreamX509Roots)
+
+	key := testkey.NewEC256(t)
+	pkixBytes, err := x509.MarshalPKIXPublicKey(key.Public())
+	require.NoError(t, err)
+
+	expectedUpstreamJWTKeys := []*common.PublicKey{
+		{
+			Kid:       "UPSTREAM KEY",
+			PkixBytes: pkixBytes,
+		},
+	}
+	expectedUpstreamWITKeys := []*common.PublicKey{
+		{
+			Kid:       "UPSTREAM WIT KEY",
+			PkixBytes: pkixBytes,
+		},
+	}
+	noJwtAuthorities := &upstreamauthorityv1.SubscribeToLocalBundleResponse{
+		UpstreamX509Roots: validUpstreamX509Roots,
+	}
+
+	fullResponse := &upstreamauthorityv1.SubscribeToLocalBundleResponse{
+		UpstreamX509Roots: validUpstreamX509Roots,
+		UpstreamJwtKeys:   jwtkey.RequireToPluginFromCommonProtos(expectedUpstreamJWTKeys),
+		UpstreamWitKeys:   witkey.RequireToPluginFromCommonProtos(expectedUpstreamWITKeys),
+	}
+
+	malformedWITKeys := &upstreamauthorityv1.SubscribeToLocalBundleResponse{
+		UpstreamX509Roots: validUpstreamX509Roots,
+		UpstreamJwtKeys:   jwtkey.RequireToPluginFromCommonProtos(expectedUpstreamJWTKeys),
+		UpstreamWitKeys: []*types.WITKey{
+			{PublicKey: pkixBytes},
+		},
+	}
+
+	builder := BuildV1()
+	for _, tt := range []struct {
+		test                            string
+		builder                         *V1Builder
+		expectCode                      codes.Code
+		expectMessage                   string
+		expectStreamUpdates             bool
+		expectStreamCode                codes.Code
+		expectStreamMessage             string
+		expectLogs                      []spiretest.LogEntry
+		expectUpstreamX509RootsResponse []*x509certificate.X509Authority
+		expectNoUpstreamWITKeys         bool
+	}{
+		{
+			test:          "plugin returns before sending first response",
+			builder:       builder.WithPreSendError(nil),
+			expectCode:    codes.Internal,
+			expectMessage: "upstreamauthority(test): plugin closed stream unexpectedly",
+		},
+		{
+			test:          "plugin fails before sending first response",
+			builder:       builder.WithPreSendError(errors.New("ohno")),
+			expectCode:    codes.Unknown,
+			expectMessage: "upstreamauthority(test): ohno",
+		},
+		{
+			test:          "plugin response has malformed WIT key",
+			builder:       builder.WithSubscribeToLocalBundleResponse(malformedWITKeys),
+			expectCode:    codes.Internal,
+			expectMessage: "upstreamauthority(test): invalid plugin response: missing key ID for WIT key",
+		},
+		{
+			test: "second plugin response has malformed WIT key",
+			builder: builder.
+				WithSubscribeToLocalBundleResponse(fullResponse).
+				WithSubscribeToLocalBundleResponse(malformedWITKeys),
+			expectCode:              codes.OK,
+			expectStreamUpdates:     true, // X.509 roots and JWT keys are still delivered
+			expectStreamCode:        codes.OK,
+			expectNoUpstreamWITKeys: true,
+			expectLogs: []spiretest.LogEntry{
+				{
+					Level:   logrus.WarnLevel,
+					Message: "Failed to parse a WIT key update from the upstream authority plugin. Please report this bug.",
+					Data: logrus.Fields{
+						logrus.ErrorKey: "rpc error: code = Internal desc = upstreamauthority(test): invalid plugin response: missing key ID for WIT key",
+					},
+				},
+			},
+		},
+		{
+			test:                "success with empty JWT authorities",
+			builder:             builder.WithSubscribeToLocalBundleResponse(noJwtAuthorities),
+			expectCode:          codes.OK,
+			expectMessage:       "",
+			expectStreamUpdates: false,
+		},
+		{
+			test:                "success but plugin does not support streaming updates",
+			builder:             builder.WithSubscribeToLocalBundleResponse(fullResponse),
+			expectCode:          codes.OK,
+			expectMessage:       "",
+			expectStreamUpdates: false,
+		},
+		{
+			test: "success and plugin supports streaming updates",
+			builder: builder.
+				WithSubscribeToLocalBundleResponse(noJwtAuthorities).
+				WithSubscribeToLocalBundleResponse(fullResponse),
+			expectCode:                      codes.OK,
+			expectMessage:                   "",
+			expectStreamUpdates:             true,
+			expectStreamCode:                codes.OK,
+			expectStreamMessage:             "",
+			expectUpstreamX509RootsResponse: expectedUpstreamX509Roots,
+		},
+		{
+			test: "plugin fails to stream updates",
+			builder: builder.
+				WithSubscribeToLocalBundleResponse(fullResponse).
+				WithPostSendError(errors.New("ohno")),
+			expectCode:          codes.OK,
+			expectMessage:       "",
+			expectStreamUpdates: true,
+			expectStreamCode:    codes.Unknown,
+			expectStreamMessage: "upstreamauthority(test): ohno",
+		},
+	} {
+		t.Run(tt.test, func(t *testing.T) {
+			log, logHook := test.NewNullLogger()
+
+			ua := tt.builder.WithLog(log).Load(t)
+
+			_, _, _, stream, err := ua.SubscribeToLocalBundle(t.Context())
+			spiretest.RequireGRPCStatusHasPrefix(t, err, tt.expectCode, tt.expectMessage)
+			if tt.expectCode != codes.OK {
+				return
+			}
+			require.NotNil(t, stream, "valid stream should have been returned")
+			defer stream.Close()
+
+			expectUpstreamX509Roots := expectedUpstreamX509Roots
+			if tt.expectUpstreamX509RootsResponse != nil {
+				expectUpstreamX509Roots = tt.expectUpstreamX509RootsResponse
+			}
+
+			upstreamX509Roots, upstreamJWTKeys, upstreamWITKeys, err := stream.RecvLocalBundleUpdate()
+			switch {
+			case !tt.expectStreamUpdates:
+				assert.Equal(t, io.EOF, err, "stream should have returned EOF")
+				assert.Nil(t, upstreamX509Roots, "no roots should be received")
+				assert.Nil(t, upstreamJWTKeys, "no keys should be received")
+				assert.Nil(t, upstreamWITKeys, "no keys should be received")
+			case tt.expectStreamCode == codes.OK:
+				assert.NoError(t, err, "stream should have returned update")
+				expected := expectUpstreamX509Roots
+				if tt.expectUpstreamX509RootsResponse != nil {
+					expected = tt.expectUpstreamX509RootsResponse
+				}
+				assert.Equal(t, expected, upstreamX509Roots)
+				spiretest.AssertProtoListEqual(t, expectedUpstreamJWTKeys, upstreamJWTKeys)
+				if tt.expectNoUpstreamWITKeys {
+					assert.Nil(t, upstreamWITKeys)
+				} else {
+					spiretest.AssertProtoListEqual(t, expectedUpstreamWITKeys, upstreamWITKeys)
+				}
+			default:
+				spiretest.RequireGRPCStatusHasPrefix(t, err, tt.expectStreamCode, tt.expectStreamMessage)
+				assert.Nil(t, upstreamX509Roots)
+				assert.Nil(t, upstreamJWTKeys)
+				assert.Nil(t, upstreamWITKeys)
 			}
 
 			spiretest.AssertLogs(t, logHook.AllEntries(), tt.expectLogs)
@@ -400,6 +770,24 @@ func (b *V1Builder) WithPublishJWTKeyResponse(response *upstreamauthorityv1.Publ
 	return b
 }
 
+func (b *V1Builder) WithPublishWITKeyResponse(response *upstreamauthorityv1.PublishWITKeyResponse) *V1Builder {
+	b = b.clone()
+	b.p.publishWITKeyResponses = append(b.p.publishWITKeyResponses, response)
+	return b
+}
+
+func (b *V1Builder) WithoutPublishWITKey() *V1Builder {
+	b = b.clone()
+	b.p.publishWITKeyUnimplemented = true
+	return b
+}
+
+func (b *V1Builder) WithSubscribeToLocalBundleResponse(response *upstreamauthorityv1.SubscribeToLocalBundleResponse) *V1Builder {
+	b = b.clone()
+	b.p.subscribeToLocalBundleResponses = append(b.p.subscribeToLocalBundleResponses, response)
+	return b
+}
+
 func (b *V1Builder) clone() *V1Builder {
 	return &V1Builder{
 		p:   b.p.clone(),
@@ -423,10 +811,13 @@ func (b *V1Builder) Load(t *testing.T) upstreamauthority.UpstreamAuthority {
 type v1Plugin struct {
 	upstreamauthorityv1.UnimplementedUpstreamAuthorityServer
 
-	preSendErr             *error
-	postSendErr            error
-	mintX509CAResponses    []*upstreamauthorityv1.MintX509CAResponse
-	publishJWTKeyResponses []*upstreamauthorityv1.PublishJWTKeyResponse
+	preSendErr                      *error
+	postSendErr                     error
+	mintX509CAResponses             []*upstreamauthorityv1.MintX509CAResponse
+	publishJWTKeyResponses          []*upstreamauthorityv1.PublishJWTKeyResponse
+	publishWITKeyResponses          []*upstreamauthorityv1.PublishWITKeyResponse
+	publishWITKeyUnimplemented      bool
+	subscribeToLocalBundleResponses []*upstreamauthorityv1.SubscribeToLocalBundleResponse
 }
 
 func (v1 *v1Plugin) MintX509CAAndSubscribe(req *upstreamauthorityv1.MintX509CARequest, stream upstreamauthorityv1.UpstreamAuthority_MintX509CAAndSubscribeServer) error {
@@ -460,6 +851,42 @@ func (v1 *v1Plugin) PublishJWTKeyAndSubscribe(req *upstreamauthorityv1.PublishJW
 	}
 
 	for _, response := range v1.publishJWTKeyResponses {
+		if err := stream.Send(response); err != nil {
+			return err
+		}
+	}
+
+	return v1.postSendErr
+}
+
+func (v1 *v1Plugin) PublishWITKeyAndSubscribe(req *upstreamauthorityv1.PublishWITKeyRequest, stream upstreamauthorityv1.UpstreamAuthority_PublishWITKeyAndSubscribeServer) error {
+	if v1.publishWITKeyUnimplemented {
+		return v1.UnimplementedUpstreamAuthorityServer.PublishWITKeyAndSubscribe(req, stream)
+	}
+
+	if diff := cmp.Diff(witkey.RequireToPluginFromCommonProto(witKey), req.WitKey, protocmp.Transform()); diff != "" {
+		return fmt.Errorf("unexpected public key: %s", diff)
+	}
+
+	if v1.preSendErr != nil {
+		return *v1.preSendErr
+	}
+
+	for _, response := range v1.publishWITKeyResponses {
+		if err := stream.Send(response); err != nil {
+			return err
+		}
+	}
+
+	return v1.postSendErr
+}
+
+func (v1 *v1Plugin) SubscribeToLocalBundle(req *upstreamauthorityv1.SubscribeToLocalBundleRequest, stream upstreamauthorityv1.UpstreamAuthority_SubscribeToLocalBundleServer) error {
+	if v1.preSendErr != nil {
+		return *v1.preSendErr
+	}
+
+	for _, response := range v1.subscribeToLocalBundleResponses {
 		if err := stream.Send(response); err != nil {
 			return err
 		}

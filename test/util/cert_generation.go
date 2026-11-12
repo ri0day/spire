@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"github.com/spiffe/spire/pkg/common/x509util"
 	"github.com/spiffe/spire/test/clock"
 )
 
@@ -52,32 +53,6 @@ func NewSVIDTemplate(clk clock.Clock, spiffeID string) (*x509.Certificate, error
 	return cert, err
 }
 
-func NewSVIDTemplateFromCSR(clk clock.Clock, csr []byte, ca *x509.Certificate, ttl int) (*x509.Certificate, error) {
-	cr, err := x509.ParseCertificateRequest(csr)
-	if err != nil {
-		return nil, err
-	}
-
-	now := clk.Now()
-	cert := &x509.Certificate{
-		Subject:            cr.Subject,
-		Issuer:             ca.Subject,
-		PublicKey:          cr.PublicKey,
-		PublicKeyAlgorithm: cr.PublicKeyAlgorithm,
-		Signature:          cr.Signature,
-		SignatureAlgorithm: cr.SignatureAlgorithm,
-		NotBefore:          now,
-		NotAfter:           now.Add(time.Duration(ttl) * time.Second),
-		KeyUsage: x509.KeyUsageKeyEncipherment |
-			x509.KeyUsageKeyAgreement |
-			x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
-		BasicConstraintsValid: true,
-		ExtraExtensions:       cr.Extensions,
-	}
-	return cert, nil
-}
-
 // NewCATemplate returns a default CA template with the specified trust domain. Must
 // be signed before it's valid.
 func NewCATemplate(clk clock.Clock, trustDomain spiffeid.TrustDomain) (*x509.Certificate, error) {
@@ -105,6 +80,11 @@ func Sign(req, parent *x509.Certificate, signerPrivateKey any) (*x509.Certificat
 			return nil, nil, err
 		}
 		publicKey = key.Public()
+		skID, err := x509util.GetSubjectKeyID(publicKey)
+		if err != nil {
+			return nil, nil, err
+		}
+		req.SubjectKeyId = skID
 	}
 
 	if signerPrivateKey == nil {

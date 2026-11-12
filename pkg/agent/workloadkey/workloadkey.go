@@ -16,8 +16,10 @@ func KeyTypeFromString(s string) (KeyType, error) {
 		return RSA2048, nil
 	case "ec-p256":
 		return ECP256, nil
+	case "ec-p384":
+		return ECP384, nil
 	default:
-		return KeyTypeUnset, fmt.Errorf("key type %q is unknown; must be one of [rsa-2048, ec-p256]", s)
+		return KeyTypeUnset, fmt.Errorf("key type %q is unknown; must be one of [rsa-2048, ec-p256, ec-p384]", s)
 	}
 }
 
@@ -28,6 +30,7 @@ const (
 	KeyTypeUnset KeyType = iota
 	ECP256
 	RSA2048
+	ECP384
 )
 
 // GenerateSigner generates a new key for the given key type
@@ -35,10 +38,27 @@ func (keyType KeyType) GenerateSigner() (crypto.Signer, error) {
 	switch keyType {
 	case ECP256:
 		return ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	case ECP384:
+		return ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
 	case RSA2048:
 		return rsa.GenerateKey(rand.Reader, 2048)
 	default:
 		return nil, fmt.Errorf("unknown key type %q", keyType)
+	}
+}
+
+// SigningAlgorithm returns the JOSE signing algorithm to be used with keys of
+// this type.
+func (keyType KeyType) SigningAlgorithm() (string, error) {
+	switch keyType {
+	case ECP256:
+		return "ES256", nil
+	case ECP384:
+		return "ES384", nil
+	case RSA2048:
+		return "RS256", nil
+	default:
+		return "", fmt.Errorf("unknown key type %q", keyType.String())
 	}
 }
 
@@ -49,6 +69,8 @@ func (keyType KeyType) String() string {
 		return "UNSET"
 	case ECP256:
 		return "ec-p256"
+	case ECP384:
+		return "ec-p384"
 	case RSA2048:
 		return "rsa-2048"
 	default:

@@ -11,7 +11,6 @@ import (
 	"github.com/spiffe/spire/pkg/common/health"
 	"github.com/spiffe/spire/pkg/common/util"
 	"github.com/spiffe/spire/pkg/server/ca/manager"
-	"github.com/zeebo/errs"
 )
 
 const (
@@ -22,14 +21,14 @@ const (
 
 type CAManager interface {
 	NotifyBundleLoaded(ctx context.Context) error
-	NotifyOnBundleUpdate(ctx context.Context)
+	ProcessBundleUpdates(ctx context.Context)
 
 	GetCurrentX509CASlot() manager.Slot
 	GetNextX509CASlot() manager.Slot
 
 	PrepareX509CA(ctx context.Context) error
 	ActivateX509CA(ctx context.Context)
-	RotateX509CA(ctx context.Context)
+	RotateX509CA(ctx context.Context) error
 
 	GetCurrentJWTKeySlot() manager.Slot
 	GetNextJWTKeySlot() manager.Slot
@@ -37,6 +36,15 @@ type CAManager interface {
 	PrepareJWTKey(ctx context.Context) error
 	ActivateJWTKey(ctx context.Context)
 	RotateJWTKey(ctx context.Context)
+
+	GetCurrentWITKeySlot() manager.Slot
+	GetNextWITKeySlot() manager.Slot
+
+	PrepareWITKey(ctx context.Context) error
+	ActivateWITKey(ctx context.Context)
+	RotateWITKey(ctx context.Context)
+
+	SubscribeToLocalBundle(ctx context.Context) error
 
 	PruneBundle(ctx context.Context) error
 	PruneCAJournals(ctx context.Context) error
@@ -50,9 +58,13 @@ type Config struct {
 }
 
 type Rotator struct {
-	c Config
+	c                       Config
+	x509CARenewalFor        time.Time
+	x509CARenewalRetryDelay time.Duration
+	x509CARenewalRetryAt    time.Time
 
-	// For keeping track of number of failed rotations.
+	// For keeping track of number of failed rotations since the last fully
+	// successful rotation cycle.
 	failedRotationNum uint64
 }
 
@@ -78,9 +90,13 @@ func (r *Rotator) Run(ctx context.Context) error {
 	if err := r.c.Manager.NotifyBundleLoaded(ctx); err != nil {
 		return err
 	}
+
 	err := util.RunTasks(ctx,
 		func(ctx context.Context) error {
 			return r.rotateEvery(ctx, rotateInterval)
+		},
+		func(ctx context.Context) error {
+			return r.c.Manager.SubscribeToLocalBundle(ctx)
 		},
 		func(ctx context.Context) error {
 			return r.pruneBundleEvery(ctx, pruneBundleInterval)
@@ -91,7 +107,7 @@ func (r *Rotator) Run(ctx context.Context) error {
 		func(ctx context.Context) error {
 			// notifyOnBundleUpdate does not fail but rather logs any errors
 			// encountered while notifying
-			r.c.Manager.NotifyOnBundleUpdate(ctx)
+			r.c.Manager.ProcessBundleUpdates(ctx)
 			return nil
 		},
 	)
@@ -124,6 +140,12 @@ func (r *Rotator) rotate(ctx context.Context) error {
 	if x509CAErr != nil {
 		atomic.AddUint64(&r.failedRotationNum, 1)
 		r.c.Log.WithError(x509CAErr).Error("Unable to rotate X509 CA")
+		if r.c.Manager.GetCurrentX509CASlot().IsEmpty() {
+			// Preparation of the X509 CA failed, and there is no active X509
+			// authority. We will be unable to store the JWT authority, so we
+			// don't try to rotate the JWT key in this case.
+			return x509CAErr
+		}
 	}
 
 	jwtKeyErr := r.rotateJWTKey(ctx)
@@ -132,7 +154,20 @@ func (r *Rotator) rotate(ctx context.Context) error {
 		r.c.Log.WithError(jwtKeyErr).Error("Unable to rotate JWT key")
 	}
 
-	return errs.Combine(x509CAErr, jwtKeyErr)
+	witKeyErr := r.rotateWITKey(ctx)
+	if witKeyErr != nil {
+		atomic.AddUint64(&r.failedRotationNum, 1)
+		r.c.Log.WithError(witKeyErr).Error("Unable to rotate WIT key")
+	}
+
+	err := errors.Join(x509CAErr, jwtKeyErr, witKeyErr)
+	if err == nil {
+		// All keys are rotated at this time, so we can reset any failed
+		// rotation count.
+		atomic.StoreUint64(&r.failedRotationNum, 0)
+	}
+
+	return err
 }
 
 func (r *Rotator) rotateJWTKey(ctx context.Context) error {
@@ -162,6 +197,33 @@ func (r *Rotator) rotateJWTKey(ctx context.Context) error {
 	return nil
 }
 
+func (r *Rotator) rotateWITKey(ctx context.Context) error {
+	now := r.c.Clock.Now()
+
+	currentWITKey := r.c.Manager.GetCurrentWITKeySlot()
+	// if there is no current keypair set, generate one
+	if currentWITKey.IsEmpty() {
+		if err := r.c.Manager.PrepareWITKey(ctx); err != nil {
+			return err
+		}
+		r.c.Manager.ActivateWITKey(ctx)
+	}
+
+	// if there is no next keypair set and the current is within the
+	// preparation threshold, generate one.
+	if r.c.Manager.GetNextWITKeySlot().IsEmpty() && currentWITKey.ShouldPrepareNext(now) {
+		if err := r.c.Manager.PrepareWITKey(ctx); err != nil {
+			return err
+		}
+	}
+
+	if currentWITKey.ShouldActivateNext(now) {
+		r.c.Manager.RotateWITKey(ctx)
+	}
+
+	return nil
+}
+
 func (r *Rotator) rotateX509CA(ctx context.Context) error {
 	now := r.c.Clock.Now()
 
@@ -173,6 +235,11 @@ func (r *Rotator) rotateX509CA(ctx context.Context) error {
 		}
 		r.c.Manager.ActivateX509CA(ctx)
 	}
+	if !r.x509CARenewalFor.Equal(currentX509CA.NotAfter()) {
+		r.x509CARenewalFor = currentX509CA.NotAfter()
+		r.x509CARenewalRetryDelay = 0
+		r.x509CARenewalRetryAt = time.Time{}
+	}
 
 	// if there is no next keypair set and the current is within the
 	// preparation threshold, generate one.
@@ -183,10 +250,40 @@ func (r *Rotator) rotateX509CA(ctx context.Context) error {
 	}
 
 	if currentX509CA.ShouldActivateNext(now) {
-		r.c.Manager.RotateX509CA(ctx)
+		nextX509CA := r.c.Manager.GetNextX509CASlot()
+		if nextX509CA.NotAfter().After(currentX509CA.NotAfter()) {
+			r.x509CARenewalFor = nextX509CA.NotAfter()
+			r.x509CARenewalRetryDelay = 0
+			r.x509CARenewalRetryAt = time.Time{}
+			return r.c.Manager.RotateX509CA(ctx)
+		}
+
+		if now.Before(r.x509CARenewalRetryAt) {
+			return nil
+		}
+
+		if err := r.c.Manager.PrepareX509CA(ctx); err != nil {
+			return err
+		}
+		nextX509CA = r.c.Manager.GetNextX509CASlot()
+		if nextX509CA.NotAfter().After(currentX509CA.NotAfter()) {
+			r.x509CARenewalFor = nextX509CA.NotAfter()
+			r.x509CARenewalRetryDelay = 0
+			r.x509CARenewalRetryAt = time.Time{}
+			return r.c.Manager.RotateX509CA(ctx)
+		}
+
+		if r.x509CARenewalRetryDelay == 0 {
+			r.x509CARenewalRetryDelay = x509CARenewalRetryDelay(now, currentX509CA.NotAfter())
+		}
+		r.x509CARenewalRetryAt = now.Add(r.x509CARenewalRetryDelay)
 	}
 
 	return nil
+}
+
+func x509CARenewalRetryDelay(now, expiration time.Time) time.Duration {
+	return max(expiration.Sub(now)/2, rotateInterval)
 }
 
 func (r *Rotator) pruneBundleEvery(ctx context.Context, interval time.Duration) error {

@@ -13,15 +13,23 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
+	"github.com/aws/aws-sdk-go-v2/service/autoscaling"
+	autoscalingtypes "github.com/aws/aws-sdk-go-v2/service/autoscaling/types"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/aws-sdk-go-v2/service/eks"
+	ekstypes "github.com/aws/aws-sdk-go-v2/service/eks/types"
 	"github.com/aws/aws-sdk-go-v2/service/iam"
 	iamtypes "github.com/aws/aws-sdk-go-v2/service/iam/types"
+	"github.com/aws/aws-sdk-go-v2/service/organizations"
+	"github.com/aws/aws-sdk-go-v2/service/organizations/types"
 	"github.com/fullsailor/pkcs7"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
@@ -54,6 +62,7 @@ var (
 	testAvailabilityZone = "test-az"
 	testImageID          = "test-image-id"
 	testProfile          = "test-profile"
+	testAccountID        = "123456789"
 	zeroDeviceIndex      = int32(0)
 	nonzeroDeviceIndex   = int32(1)
 	instanceStoreType    = ec2types.DeviceTypeInstanceStore
@@ -67,24 +76,52 @@ func TestAttest(t *testing.T) {
 	otherAWSCACert = generateCertificate(t, testkey.MustRSA2048())
 	defaultAttestationData := buildAttestationDataRSA2048Signature(t)
 	attentionDataWithRSA1024Signature := buildAttestationDataRSA1024Signature(t)
+	orgTestAttestationData := buildAttestationDataRSA2048SignatureWithDoc(t, imds.InstanceIdentityDocument{
+		AccountID:        testAccountID,
+		InstanceID:       testInstance,
+		Region:           testRegion,
+		AvailabilityZone: testAvailabilityZone,
+		ImageID:          testImageID,
+	})
+	orgFileTestAttestationData := buildAttestationDataRSA2048SignatureWithDoc(t, imds.InstanceIdentityDocument{
+		AccountID:        "111111111111",
+		InstanceID:       testInstance,
+		Region:           testRegion,
+		AvailabilityZone: testAvailabilityZone,
+		ImageID:          testImageID,
+	})
+	// Account list file containing "111111111111" but NOT testAccountID (the
+	// account the fake ListAccounts API returns), so a successful attestation
+	// with that account proves the list was sourced from the file rather than
+	// from the AWS Organizations API.
+	orgAccountListFilePath := filepath.ToSlash(filepath.Join(t.TempDir(), "org-accounts.json"))
+	require.NoError(t, os.WriteFile(orgAccountListFilePath, []byte(`["111111111111", "222222222222"]`), 0o600))
 
 	for _, tt := range []struct {
-		name                           string
-		env                            map[string]string
-		skipConfigure                  bool
-		config                         string
-		alreadyAttested                bool
-		mutateDescribeInstancesOutput  func(output *ec2.DescribeInstancesOutput)
-		describeInstancesError         error
-		mutateGetInstanceProfileOutput func(output *iam.GetInstanceProfileOutput)
-		getInstanceProfileError        error
-		overrideAttestationData        func(caws.IIDAttestationData) caws.IIDAttestationData
-		overridePayload                func() []byte
-		expectCode                     codes.Code
-		expectMsgPrefix                string
-		expectID                       string
-		expectSelectors                []*common.Selector
-		overrideCACert                 *x509.Certificate
+		name                                  string
+		env                                   map[string]string
+		skipConfigure                         bool
+		config                                string
+		alreadyAttested                       bool
+		mutateDescribeInstancesOutput         func(output *ec2.DescribeInstancesOutput)
+		describeInstancesError                error
+		mutateGetInstanceProfileOutput        func(output *iam.GetInstanceProfileOutput)
+		getInstanceProfileError               error
+		mutateListAccountOutput               func(output *organizations.ListAccountsOutput)
+		listOrgAccountError                   error
+		mutateDescribeAutoScalingGroupsOutput func(output *autoscaling.DescribeAutoScalingGroupsOutput)
+		describeAutoScalingGroupsError        error
+		mutateListNodegroupsOutput            func(output *eks.ListNodegroupsOutput)
+		listNodegroupsError                   error
+		mutateDescribeNodegroupOutput         func(output *eks.DescribeNodegroupOutput)
+		describeNodegroupError                error
+		overrideAttestationData               func(caws.IIDAttestationData) caws.IIDAttestationData
+		overridePayload                       func() []byte
+		expectCode                            codes.Code
+		expectMsgPrefix                       string
+		expectID                              string
+		expectSelectors                       []*common.Selector
+		overrideCACert                        *x509.Certificate
 	}{
 		{
 			name:            "plugin not configured",
@@ -161,11 +198,30 @@ func TestAttest(t *testing.T) {
 			name:     "success with zero device index",
 			expectID: "spiffe://example.org/spire/agent/aws_iid/test-account/test-region/test-instance",
 			expectSelectors: []*common.Selector{
+				{Type: caws.PluginName, Value: "account_id:test-account"},
 				{Type: caws.PluginName, Value: "az:test-az"},
 				{Type: caws.PluginName, Value: "image:id:test-image-id"},
 				{Type: caws.PluginName, Value: "instance:id:test-instance"},
 				{Type: caws.PluginName, Value: "region:test-region"},
 			},
+		},
+		{
+			name:     "success with the node's partition configured",
+			config:   `partitions = { "aws" = {} }`,
+			expectID: "spiffe://example.org/spire/agent/aws_iid/test-account/test-region/test-instance",
+			expectSelectors: []*common.Selector{
+				{Type: caws.PluginName, Value: "account_id:test-account"},
+				{Type: caws.PluginName, Value: "az:test-az"},
+				{Type: caws.PluginName, Value: "image:id:test-image-id"},
+				{Type: caws.PluginName, Value: "instance:id:test-instance"},
+				{Type: caws.PluginName, Value: "region:test-region"},
+			},
+		},
+		{
+			name:            "node's partition not configured",
+			config:          `partitions = { "aws-us-gov" = {} }`,
+			expectCode:      codes.PermissionDenied,
+			expectMsgPrefix: `nodeattestor(aws_iid): region "test-region" is in partition "aws", which is not configured`,
 		},
 		{
 			name: "success with RSA-1024 signature",
@@ -176,6 +232,7 @@ func TestAttest(t *testing.T) {
 			},
 			expectID: "spiffe://example.org/spire/agent/aws_iid/test-account/test-region/test-instance",
 			expectSelectors: []*common.Selector{
+				{Type: caws.PluginName, Value: "account_id:test-account"},
 				{Type: caws.PluginName, Value: "az:test-az"},
 				{Type: caws.PluginName, Value: "image:id:test-image-id"},
 				{Type: caws.PluginName, Value: "instance:id:test-instance"},
@@ -190,6 +247,7 @@ func TestAttest(t *testing.T) {
 			},
 			expectID: "spiffe://example.org/spire/agent/aws_iid/test-account/test-region/test-instance",
 			expectSelectors: []*common.Selector{
+				{Type: caws.PluginName, Value: "account_id:test-account"},
 				{Type: caws.PluginName, Value: "az:test-az"},
 				{Type: caws.PluginName, Value: "image:id:test-image-id"},
 				{Type: caws.PluginName, Value: "instance:id:test-instance"},
@@ -204,6 +262,7 @@ func TestAttest(t *testing.T) {
 			},
 			expectID: "spiffe://example.org/spire/agent/aws_iid/test-account/test-region/test-instance",
 			expectSelectors: []*common.Selector{
+				{Type: caws.PluginName, Value: "account_id:test-account"},
 				{Type: caws.PluginName, Value: "az:test-az"},
 				{Type: caws.PluginName, Value: "image:id:test-image-id"},
 				{Type: caws.PluginName, Value: "instance:id:test-instance"},
@@ -216,7 +275,29 @@ func TestAttest(t *testing.T) {
 				output.Reservations[0].Instances[0].NetworkInterfaces[0].Attachment.DeviceIndex = &nonzeroDeviceIndex
 			},
 			expectCode:      codes.Internal,
-			expectMsgPrefix: "nodeattestor(aws_iid): failed aws ec2 attestation: the EC2 instance network interface attachment device index must be zero (has 1)",
+			expectMsgPrefix: "nodeattestor(aws_iid): failed aws ec2 attestation: the EC2 instance network interface with device index 0 is inaccessible",
+		},
+		{
+			name: "block device anti-tampering check succeeds when network devices are not ordered by device index",
+			mutateDescribeInstancesOutput: func(output *ec2.DescribeInstancesOutput) {
+				output.Reservations[0].Instances[0].NetworkInterfaces[0].Attachment.DeviceIndex = &nonzeroDeviceIndex
+				output.Reservations[0].Instances[0].NetworkInterfaces = append(
+					output.Reservations[0].Instances[0].NetworkInterfaces,
+					ec2types.InstanceNetworkInterface{
+						Attachment: &ec2types.InstanceNetworkInterfaceAttachment{
+							DeviceIndex: &zeroDeviceIndex,
+						},
+					},
+				)
+			},
+			expectID: "spiffe://example.org/spire/agent/aws_iid/test-account/test-region/test-instance",
+			expectSelectors: []*common.Selector{
+				{Type: caws.PluginName, Value: "account_id:test-account"},
+				{Type: caws.PluginName, Value: "az:test-az"},
+				{Type: caws.PluginName, Value: "image:id:test-image-id"},
+				{Type: caws.PluginName, Value: "instance:id:test-instance"},
+				{Type: caws.PluginName, Value: "region:test-region"},
+			},
 		},
 		{
 			name: "block device anti-tampering check fails to locate root device",
@@ -268,6 +349,7 @@ func TestAttest(t *testing.T) {
 			},
 			expectID: "spiffe://example.org/spire/agent/aws_iid/test-account/test-region/test-instance",
 			expectSelectors: []*common.Selector{
+				{Type: caws.PluginName, Value: "account_id:test-account"},
 				{Type: caws.PluginName, Value: "az:test-az"},
 				{Type: caws.PluginName, Value: "image:id:test-image-id"},
 				{Type: caws.PluginName, Value: "instance:id:test-instance"},
@@ -279,6 +361,7 @@ func TestAttest(t *testing.T) {
 			config:   `agent_path_template = "/{{ .PluginName }}/custom/{{ .AccountID }}/{{ .Region }}/{{ .InstanceID }}"`,
 			expectID: "spiffe://example.org/spire/agent/aws_iid/custom/test-account/test-region/test-instance",
 			expectSelectors: []*common.Selector{
+				{Type: caws.PluginName, Value: "account_id:test-account"},
 				{Type: caws.PluginName, Value: "az:test-az"},
 				{Type: caws.PluginName, Value: "image:id:test-image-id"},
 				{Type: caws.PluginName, Value: "instance:id:test-instance"},
@@ -298,6 +381,7 @@ func TestAttest(t *testing.T) {
 			config:   `agent_path_template = "/{{ .PluginName }}/zone1/{{ .Tags.Hostname }}"`,
 			expectID: "spiffe://example.org/spire/agent/aws_iid/zone1/host1",
 			expectSelectors: []*common.Selector{
+				{Type: caws.PluginName, Value: "account_id:test-account"},
 				{Type: caws.PluginName, Value: "az:test-az"},
 				{Type: caws.PluginName, Value: "image:id:test-image-id"},
 				{Type: caws.PluginName, Value: "instance:id:test-instance"},
@@ -340,6 +424,7 @@ func TestAttest(t *testing.T) {
 			},
 			expectID: "spiffe://example.org/spire/agent/aws_iid/test-account/test-region/test-instance",
 			expectSelectors: []*common.Selector{
+				{Type: caws.PluginName, Value: "account_id:test-account"},
 				{Type: caws.PluginName, Value: "az:test-az"},
 				{Type: caws.PluginName, Value: "iamrole:role1"},
 				{Type: caws.PluginName, Value: "iamrole:role2"},
@@ -381,6 +466,7 @@ func TestAttest(t *testing.T) {
 			},
 			expectID: "spiffe://example.org/spire/agent/aws_iid/test-account/test-region/test-instance",
 			expectSelectors: []*common.Selector{
+				{Type: caws.PluginName, Value: "account_id:test-account"},
 				{Type: caws.PluginName, Value: "az:test-az"},
 				{Type: caws.PluginName, Value: "image:id:test-image-id"},
 				{Type: caws.PluginName, Value: "instance:id:test-instance"},
@@ -388,6 +474,95 @@ func TestAttest(t *testing.T) {
 				{Type: caws.PluginName, Value: "sg:id:TestGroup"},
 				{Type: caws.PluginName, Value: "sg:name:Test Group Name"},
 				{Type: caws.PluginName, Value: "tag:Hostname:host1"},
+			},
+		},
+		{
+			name:            "fail with account id not belonging to organization", // Default attestation data already has different account id
+			config:          `verify_organization = { management_account_id = "12345" assume_org_role = "test-orgrole" management_account_region = "test-region"}`,
+			expectCode:      codes.Internal,
+			expectMsgPrefix: fmt.Sprintf("nodeattestor(aws_iid): failed aws ec2 attestation, nodes account id: %v is not part of configured organization or doesn't have ACTIVE status", testAccount),
+		},
+		{
+			name:                "fail call for organization list account",
+			config:              `verify_organization = { management_account_id = "12345" assume_org_role = "test-orgrole" management_account_region = "test-region"}`,
+			expectCode:          codes.Internal,
+			listOrgAccountError: errors.New("oh no"),
+			expectMsgPrefix:     fmt.Sprintf("nodeattestor(aws_iid): failed aws ec2 attestation, issue while verifying if nodes account id: %v belong to org: %v", testAccount, "issue while getting list of accounts"),
+		},
+		{
+			name:       "fail for account id with not ACTIVE status in organization list",
+			config:     `verify_organization = { management_account_id = "12345" assume_org_role = "test-orgrole" management_account_region = "test-orgregion" }`,
+			expectCode: codes.Internal,
+			mutateListAccountOutput: func(output *organizations.ListAccountsOutput) {
+				output.Accounts = []types.Account{{
+					Id:     &testAccountID,
+					Status: types.AccountStatusSuspended,
+				}}
+			},
+			overrideAttestationData: func(caws.IIDAttestationData) caws.IIDAttestationData {
+				return orgTestAttestationData
+			},
+			expectMsgPrefix: fmt.Sprintf("nodeattestor(aws_iid): failed aws ec2 attestation, nodes account id: %v is not part of configured organization or doesn't have ACTIVE status", testAccountID),
+		},
+		{
+			name:   "success when organization validation feature is turned on",
+			config: `verify_organization = { management_account_id = "12345" assume_org_role = "test-orgrole" management_account_region = "test-orgregion" }`,
+			overrideAttestationData: func(caws.IIDAttestationData) caws.IIDAttestationData {
+				return orgTestAttestationData
+			},
+			expectID: "spiffe://example.org/spire/agent/aws_iid/123456789/test-region/test-instance",
+			expectSelectors: []*common.Selector{
+				{Type: caws.PluginName, Value: "account_id:123456789"},
+				{Type: caws.PluginName, Value: "az:test-az"},
+				{Type: caws.PluginName, Value: "image:id:test-image-id"},
+				{Type: caws.PluginName, Value: "instance:id:test-instance"},
+				{Type: caws.PluginName, Value: "region:test-region"},
+			},
+		},
+		{
+			name:   "success when organization validation is sourced from account_list_file",
+			config: fmt.Sprintf(`verify_organization = { account_list_file = %q }`, orgAccountListFilePath),
+			overrideAttestationData: func(caws.IIDAttestationData) caws.IIDAttestationData {
+				return orgFileTestAttestationData
+			},
+			expectID: "spiffe://example.org/spire/agent/aws_iid/111111111111/test-region/test-instance",
+			expectSelectors: []*common.Selector{
+				{Type: caws.PluginName, Value: "account_id:111111111111"},
+				{Type: caws.PluginName, Value: "az:test-az"},
+				{Type: caws.PluginName, Value: "image:id:test-image-id"},
+				{Type: caws.PluginName, Value: "instance:id:test-instance"},
+				{Type: caws.PluginName, Value: "region:test-region"},
+			},
+		},
+		{
+			name:   "fail when account id is not present in account_list_file",
+			config: fmt.Sprintf(`verify_organization = { account_list_file = %q }`, orgAccountListFilePath),
+			overrideAttestationData: func(caws.IIDAttestationData) caws.IIDAttestationData {
+				return orgTestAttestationData
+			},
+			expectCode:      codes.Internal,
+			expectMsgPrefix: fmt.Sprintf("nodeattestor(aws_iid): failed aws ec2 attestation, nodes account id: %v is not part of configured organization or doesn't have ACTIVE status", testAccountID),
+		},
+		{
+			name:     "success when EKS cluster validation feature is turned on",
+			config:   `validate_eks_cluster_membership = { eks_cluster_names = ["test-cluster"] }`,
+			expectID: "spiffe://example.org/spire/agent/aws_iid/test-account/test-region/test-instance",
+			expectSelectors: []*common.Selector{
+				{Type: caws.PluginName, Value: "account_id:test-account"},
+				{Type: caws.PluginName, Value: "az:test-az"},
+				{Type: caws.PluginName, Value: "image:id:test-image-id"},
+				{Type: caws.PluginName, Value: "instance:id:test-instance"},
+				{Type: caws.PluginName, Value: "region:test-region"},
+			},
+		},
+		{
+			name:            "fail when EKS cluster validation feature is turned on but node is not in cluster",
+			config:          `validate_eks_cluster_membership = { eks_cluster_names = ["test-cluster"] }`,
+			expectCode:      codes.Internal,
+			expectMsgPrefix: "nodeattestor(aws_iid): failed aws eks attestation, nodes id: test-instance is not part of configured EKS cluster",
+			mutateDescribeAutoScalingGroupsOutput: func(output *autoscaling.DescribeAutoScalingGroupsOutput) {
+				// Return empty instances so the node is not found in the cluster
+				output.AutoScalingGroups[0].Instances = []autoscalingtypes.Instance{}
 			},
 		},
 	} {
@@ -400,6 +575,22 @@ func TestAttest(t *testing.T) {
 			client.GetInstanceProfileError = tt.getInstanceProfileError
 			if tt.mutateGetInstanceProfileOutput != nil {
 				tt.mutateGetInstanceProfileOutput(client.GetInstanceProfileOutput)
+			}
+			client.ListAccountError = tt.listOrgAccountError
+			if tt.mutateListAccountOutput != nil {
+				tt.mutateListAccountOutput(client.ListAccountOutput)
+			}
+			client.DescribeAutoScalingGroupsError = tt.describeAutoScalingGroupsError
+			if tt.mutateDescribeAutoScalingGroupsOutput != nil {
+				tt.mutateDescribeAutoScalingGroupsOutput(client.DescribeAutoScalingGroupsOutput)
+			}
+			client.ListNodegroupsError = tt.listNodegroupsError
+			if tt.mutateListNodegroupsOutput != nil {
+				tt.mutateListNodegroupsOutput(client.ListNodegroupsOutput)
+			}
+			client.DescribeNodegroupError = tt.describeNodegroupError
+			if tt.mutateDescribeNodegroupOutput != nil {
+				tt.mutateDescribeNodegroupOutput(client.DescribeNodegroupOutput)
 			}
 
 			agentStore := fakeagentstore.New()
@@ -435,7 +626,7 @@ func TestAttest(t *testing.T) {
 				return testAWSCACert, nil
 			}
 
-			attestor.clients = newClientsCache(func(ctx context.Context, config *SessionConfig, region string, assumeRoleARN string) (Client, error) {
+			attestor.clients = newClientsCache(func(ctx context.Context, config *SessionConfig, region string, assumeRoleARN string, orgRoleArn string) (Client, error) {
 				return client, nil
 			})
 
@@ -461,6 +652,91 @@ func TestAttest(t *testing.T) {
 			spiretest.AssertProtoListEqual(t, tt.expectSelectors, result.Selectors)
 		})
 	}
+}
+
+// TestUnmarshalIdentityDocumentPKCS7ContentBinding verifies that the
+// identity document returned by unmarshalAndValidateIdentityDocument
+// is always derived from the cryptographically verified content, not
+// from the unverified Document field in the attestation payload.
+func TestUnmarshalIdentityDocumentPKCS7ContentBinding(t *testing.T) {
+	testAWSCACert = generateCertificate(t, testAWSCAKey)
+
+	getAWSCACert := func(string, PublicKeyType) (*x509.Certificate, error) {
+		return testAWSCACert, nil
+	}
+
+	realDoc := imds.InstanceIdentityDocument{
+		AccountID:        "real-account",
+		InstanceID:       "real-instance",
+		Region:           testRegion,
+		AvailabilityZone: "real-az",
+		ImageID:          "real-image",
+	}
+	realDocBytes, err := json.Marshal(realDoc)
+	require.NoError(t, err)
+
+	forgedDoc := imds.InstanceIdentityDocument{
+		AccountID:        "forged-account",
+		InstanceID:       "forged-instance",
+		Region:           testRegion,
+		AvailabilityZone: "forged-az",
+		ImageID:          "forged-image",
+	}
+	forgedDocBytes, err := json.Marshal(forgedDoc)
+	require.NoError(t, err)
+
+	t.Run("RSA-2048 accepts matching document and PKCS7 content", func(t *testing.T) {
+		signature := generatePKCS7Signature(t, realDocBytes, testAWSCAKey)
+		attestationData := caws.IIDAttestationData{
+			Document:         string(realDocBytes),
+			SignatureRSA2048: base64.StdEncoding.EncodeToString(signature),
+		}
+		payload, err := json.Marshal(attestationData)
+		require.NoError(t, err)
+
+		doc, err := unmarshalAndValidateIdentityDocument(payload, getAWSCACert)
+		require.NoError(t, err)
+		assert.Equal(t, realDoc.AccountID, doc.AccountID)
+		assert.Equal(t, realDoc.InstanceID, doc.InstanceID)
+		assert.Equal(t, realDoc.Region, doc.Region)
+		assert.Equal(t, realDoc.AvailabilityZone, doc.AvailabilityZone)
+		assert.Equal(t, realDoc.ImageID, doc.ImageID)
+	})
+
+	t.Run("RSA-2048 rejects mismatched document and PKCS7 content", func(t *testing.T) {
+		// Sign the real document with RSA-2048 PKCS7, but put the
+		// forged document in the Document field.
+		signature := generatePKCS7Signature(t, realDocBytes, testAWSCAKey)
+		attestationData := caws.IIDAttestationData{
+			Document:         string(forgedDocBytes),
+			SignatureRSA2048: base64.StdEncoding.EncodeToString(signature),
+		}
+		payload, err := json.Marshal(attestationData)
+		require.NoError(t, err)
+
+		_, err = unmarshalAndValidateIdentityDocument(payload, getAWSCACert)
+		spiretest.RequireGRPCStatusContains(t, err, codes.InvalidArgument, "instance identity document does not match the verified PKCS7 content")
+	})
+
+	t.Run("RSA-1024 rejects mismatched document and signature", func(t *testing.T) {
+		// Sign the real document with RSA-1024, but put the forged
+		// document in the Document field. The RSA-1024 path verifies
+		// the signature directly against the Document field, so the
+		// mismatch causes a verification failure.
+		docHash := sha256.Sum256(realDocBytes)
+		sig, err := rsa.SignPKCS1v15(rand.Reader, testAWSCAKey, crypto.SHA256, docHash[:])
+		require.NoError(t, err)
+
+		attestationData := caws.IIDAttestationData{
+			Document:  string(forgedDocBytes),
+			Signature: base64.StdEncoding.EncodeToString(sig),
+		}
+		payload, err := json.Marshal(attestationData)
+		require.NoError(t, err)
+
+		_, err = unmarshalAndValidateIdentityDocument(payload, getAWSCACert)
+		spiretest.RequireGRPCStatusContains(t, err, codes.InvalidArgument, "failed to verify the cryptographic signature")
+	})
 }
 
 func TestConfigure(t *testing.T) {
@@ -492,7 +768,7 @@ func TestConfigure(t *testing.T) {
 
 	t.Run("missing trust domain", func(t *testing.T) {
 		err := doConfig(t, catalog.CoreConfig{}, ``)
-		spiretest.RequireGRPCStatusContains(t, err, codes.InvalidArgument, "core configuration has invalid trust domain: trust domain is missing")
+		spiretest.RequireGRPCStatusContains(t, err, codes.InvalidArgument, "server core configuration must contain trust_domain")
 	})
 
 	t.Run("fails with access id but no secret", func(t *testing.T) {
@@ -520,7 +796,148 @@ func TestConfigure(t *testing.T) {
 		err := doConfig(t, coreConfig, `
 		partition = "invalid-aws-partition"
 		`)
-		spiretest.RequireGRPCStatusContains(t, err, codes.InvalidArgument, "invalid partition \"invalid-aws-partition\", must be one of: [aws aws-cn aws-us-gov]")
+		spiretest.RequireGRPCStatusContains(t, err, codes.InvalidArgument, "invalid partition \"invalid-aws-partition\", must be one of: [aws aws-cn aws-us-gov aws-eusc]")
+	})
+
+	t.Run("fails with web identity role ARN but no token file", func(t *testing.T) {
+		err := doConfig(t, coreConfig, `
+		web_identity_role_arn = "arn:aws:iam::123456789012:role/spire-server"
+		`)
+		spiretest.RequireGRPCStatusContains(t, err, codes.InvalidArgument, "configuration missing web identity token file, but has web identity role ARN")
+	})
+
+	t.Run("fails with web identity token file but no role ARN", func(t *testing.T) {
+		err := doConfig(t, coreConfig, `
+		web_identity_token_file = "/var/run/secrets/token"
+		`)
+		spiretest.RequireGRPCStatusContains(t, err, codes.InvalidArgument, "configuration missing web identity role ARN, but has web identity token file")
+	})
+
+	t.Run("fails with access key and web identity", func(t *testing.T) {
+		err := doConfig(t, coreConfig, `
+		access_key_id = "ACCESSKEYID"
+		secret_access_key = "SECRETACCESSKEY"
+		web_identity_role_arn = "arn:aws:iam::123456789012:role/spire-server"
+		web_identity_token_file = "/var/run/secrets/token"
+		`)
+		spiretest.RequireGRPCStatusContains(t, err, codes.InvalidArgument, "configuration has both an access key id and a web identity role ARN, only one can be used")
+	})
+
+	t.Run("success with web identity", func(t *testing.T) {
+		err := doConfig(t, coreConfig, `
+		web_identity_role_arn = "arn:aws:iam::123456789012:role/spire-server"
+		web_identity_token_file = "/var/run/secrets/token"
+		`)
+		require.NoError(t, err)
+	})
+
+	t.Run("success with partitions", func(t *testing.T) {
+		err := doConfig(t, coreConfig, `
+		partitions = {
+			"aws" = {
+				assume_role = "spire-server-delegate"
+			}
+			"aws-us-gov" = {
+				web_identity_role_arn = "arn:aws-us-gov:iam::123456789012:role/spire-server"
+				web_identity_token_file = "/var/run/secrets/token"
+				assume_role = "spire-server-delegate"
+			}
+		}
+		`)
+		require.NoError(t, err)
+	})
+
+	t.Run("fails with invalid partition in partitions", func(t *testing.T) {
+		err := doConfig(t, coreConfig, `
+		partitions = {
+			"invalid-aws-partition" = {}
+		}
+		`)
+		spiretest.RequireGRPCStatusContains(t, err, codes.InvalidArgument, "invalid partition \"invalid-aws-partition\" in \"partitions\"")
+	})
+
+	t.Run("fails with partition entry setting a different partition", func(t *testing.T) {
+		err := doConfig(t, coreConfig, `
+		partitions = {
+			"aws" = {
+				partition = "aws-cn"
+			}
+		}
+		`)
+		spiretest.RequireGRPCStatusContains(t, err, codes.InvalidArgument, "partition \"aws\" in \"partitions\" sets a different partition: \"aws-cn\"")
+	})
+
+	t.Run("fails with invalid credentials in partitions", func(t *testing.T) {
+		err := doConfig(t, coreConfig, `
+		partitions = {
+			"aws-cn" = {
+				access_key_id = "ACCESSKEYID"
+			}
+		}
+		`)
+		spiretest.RequireGRPCStatusContains(t, err, codes.InvalidArgument, "partition \"aws-cn\": configuration missing secret access key, but has access key id")
+	})
+
+	t.Run("fails with top-level credentials and partitions", func(t *testing.T) {
+		err := doConfig(t, coreConfig, `
+		assume_role = "spire-server-delegate"
+		partitions = {
+			"aws" = {}
+		}
+		`)
+		spiretest.RequireGRPCStatusContains(t, err, codes.InvalidArgument, "\"assume_role\" cannot be set together with \"partitions\"")
+	})
+
+	t.Run("web identity takes precedence over environment credentials", func(t *testing.T) {
+		env[accessKeyIDVarName] = "ACCESSKEYID"
+		env[secretAccessKeyVarName] = "SECRETACCESSKEY"
+		defer func() {
+			delete(env, accessKeyIDVarName)
+			delete(env, secretAccessKeyVarName)
+		}()
+		err := doConfig(t, coreConfig, `
+		web_identity_role_arn = "arn:aws:iam::123456789012:role/spire-server"
+		web_identity_token_file = "/var/run/secrets/token"
+		`)
+		require.NoError(t, err)
+	})
+
+	t.Run("success with organization region in a configured partition", func(t *testing.T) {
+		err := doConfig(t, coreConfig, `
+		partitions = {
+			"aws-us-gov" = {}
+		}
+		verify_organization = {
+			management_account_id = "12345"
+			assume_org_role = "test-orgrole"
+			management_account_region = "us-gov-west-1"
+		}
+		`)
+		require.NoError(t, err)
+	})
+
+	t.Run("fails with organization region in a partition without an entry", func(t *testing.T) {
+		err := doConfig(t, coreConfig, `
+		partitions = {
+			"aws-us-gov" = {}
+		}
+		verify_organization = {
+			management_account_id = "12345"
+			assume_org_role = "test-orgrole"
+		}
+		`)
+		spiretest.RequireGRPCStatusContains(t, err, codes.InvalidArgument, `"management_account_region" "us-west-2" is in partition "aws", which has no entry in "partitions"`)
+	})
+
+	t.Run("environment credentials are not applied to partitions", func(t *testing.T) {
+		env[accessKeyIDVarName] = "ACCESSKEYID"
+		defer delete(env, accessKeyIDVarName)
+		err := doConfig(t, coreConfig, `
+		partitions = {
+			"aws" = {}
+		}
+		`)
+		require.NoError(t, err)
 	})
 
 	t.Run("success when valid partitions specified ", func(t *testing.T) {
@@ -543,6 +960,108 @@ func TestConfigure(t *testing.T) {
 
 	t.Run("success , no AWS keys", func(t *testing.T) {
 		err := doConfig(t, coreConfig, ``)
+		require.NoError(t, err)
+	})
+
+	orgVerificationFeatureErr := fmt.Errorf("make %v, %v & %v are present inside block : %v for feature node attestation using account id verification", "verify_organization", orgAccountID, orgAccountRole, orgAccRegion)
+	orgVerificationFeatureTTLErr := fmt.Errorf("make %v if configured, should be in hours and is suffix with required `h` for time duration in hour ex. 1h. or remove the : %v, in the block : %v. Default TTL will be : %v,  for feature node attestation using account id verification", orgAccountListTTL, orgAccountListTTL, "verify_organization", orgAccountDefaultListTTL)
+	orgVerificationFeatureMinTTLErr := fmt.Errorf("make %v if configured, should be more than >= %v. or remove the : %v, in the block : %v. Default TTL will be : %v,  for feature node attestation using account id verification", orgAccountListTTL, orgAccountMinListTTL, orgAccountListTTL, "verify_organization", orgAccountDefaultListTTL)
+
+	t.Run("fail, account belongs to org, if params are not specified and feature enabled", func(t *testing.T) {
+		err := doConfig(t, coreConfig, `verify_organization = {}`)
+		require.Error(t, err, orgVerificationFeatureErr)
+	})
+
+	t.Run("fail, account belongs to org, if only account id is specified, roles & region are not specified", func(t *testing.T) {
+		err := doConfig(t, coreConfig, `verify_organization = { management_account_id = "dummy_account" }`)
+		require.Error(t, err, orgVerificationFeatureErr)
+	})
+
+	t.Run("fail, account belongs to org, if ttl is not specified in proper format", func(t *testing.T) {
+		err := doConfig(t, coreConfig, `verify_organization = { management_account_id = "dummy_account" assume_org_role = "dummy_role" org_account_map_ttl = "2" }`)
+		require.Error(t, err, orgVerificationFeatureTTLErr)
+	})
+
+	t.Run("fail, account belongs to org, if ttl is specified and is less than min ttl required", func(t *testing.T) {
+		err := doConfig(t, coreConfig, `verify_organization = { management_account_id = "dummy_account" assume_org_role = "dummy_role" org_account_map_ttl = "30s" }`)
+		require.Error(t, err, orgVerificationFeatureMinTTLErr)
+	})
+
+	t.Run("success, verify_organization featured enabled with required params", func(t *testing.T) {
+		err := doConfig(t, coreConfig, `verify_organization = { management_account_id = "dummy_account" assume_org_role = "dummy_role" }`)
+		require.NoError(t, err)
+	})
+
+	t.Run("success, verify_organization featured enabled with all params", func(t *testing.T) {
+		err := doConfig(t, coreConfig, `verify_organization = { management_account_id = "dummy_account" assume_org_role = "dummy_role" org_account_map_ttl = "1m30s" }`)
+		require.NoError(t, err)
+	})
+
+	t.Run("success, verify_organization with account_list_file", func(t *testing.T) {
+		accountListFile := filepath.Join(t.TempDir(), "org-accounts.json")
+		require.NoError(t, os.WriteFile(accountListFile, []byte(`["111111111111", "222222222222"]`), 0o600))
+		err := doConfig(t, coreConfig, fmt.Sprintf(`verify_organization = { account_list_file = %q }`, filepath.ToSlash(accountListFile)))
+		require.NoError(t, err)
+	})
+
+	t.Run("fail, verify_organization account_list_file is mutually exclusive with management_account_id/assume_org_role", func(t *testing.T) {
+		accountListFile := filepath.Join(t.TempDir(), "org-accounts.json")
+		require.NoError(t, os.WriteFile(accountListFile, []byte(`["111111111111"]`), 0o600))
+		err := doConfig(t, coreConfig, fmt.Sprintf(`verify_organization = { account_list_file = %q management_account_id = "dummy_account" assume_org_role = "dummy_role" }`, filepath.ToSlash(accountListFile)))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "mutually exclusive")
+	})
+
+	t.Run("fail, verify_organization account_list_file does not exist", func(t *testing.T) {
+		missing := filepath.ToSlash(filepath.Join(t.TempDir(), "does-not-exist.json"))
+		err := doConfig(t, coreConfig, fmt.Sprintf(`verify_organization = { account_list_file = %q }`, missing))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "account_list_file")
+	})
+
+	t.Run("fail, verify_organization account_list_file is malformed", func(t *testing.T) {
+		accountListFile := filepath.Join(t.TempDir(), "org-accounts.json")
+		require.NoError(t, os.WriteFile(accountListFile, []byte(`not json`), 0o600))
+		err := doConfig(t, coreConfig, fmt.Sprintf(`verify_organization = { account_list_file = %q }`, filepath.ToSlash(accountListFile)))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "account_list_file")
+	})
+
+	t.Run("fail, account_list_file mutually exclusive even with a single AWS role field", func(t *testing.T) {
+		accountListFile := filepath.Join(t.TempDir(), "org-accounts.json")
+		require.NoError(t, os.WriteFile(accountListFile, []byte(`["111111111111"]`), 0o600))
+		err := doConfig(t, coreConfig, fmt.Sprintf(`verify_organization = { account_list_file = %q management_account_id = "dummy_account" }`, filepath.ToSlash(accountListFile)))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "mutually exclusive")
+	})
+
+	t.Run("success, account_list_file with management_account_region (region ignored)", func(t *testing.T) {
+		accountListFile := filepath.Join(t.TempDir(), "org-accounts.json")
+		require.NoError(t, os.WriteFile(accountListFile, []byte(`["111111111111"]`), 0o600))
+		err := doConfig(t, coreConfig, fmt.Sprintf(`verify_organization = { account_list_file = %q management_account_region = "us-east-1" }`, filepath.ToSlash(accountListFile)))
+		require.NoError(t, err)
+	})
+
+	t.Run("fail, account_list_file with org_account_map_ttl below minimum", func(t *testing.T) {
+		accountListFile := filepath.Join(t.TempDir(), "org-accounts.json")
+		require.NoError(t, os.WriteFile(accountListFile, []byte(`["111111111111"]`), 0o600))
+		err := doConfig(t, coreConfig, fmt.Sprintf(`verify_organization = { account_list_file = %q org_account_map_ttl = "10s" }`, filepath.ToSlash(accountListFile)))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), orgAccountListTTL)
+	})
+
+	t.Run("success, validate_eks_cluster_membership block without eks_cluster_names property set", func(t *testing.T) {
+		err := doConfig(t, coreConfig, `validate_eks_cluster_membership = {}`)
+		require.NoError(t, err)
+	})
+
+	t.Run("success, validate_eks_cluster_membership block with eks_cluster_names property set to empty list", func(t *testing.T) {
+		err := doConfig(t, coreConfig, `validate_eks_cluster_membership = { eks_cluster_names = [] }`)
+		require.NoError(t, err)
+	})
+
+	t.Run("success, validate_eks_cluster_membership block with eks_cluster_names property set to non-empty list", func(t *testing.T) {
+		err := doConfig(t, coreConfig, `validate_eks_cluster_membership = { eks_cluster_names = ["test-cluster-1", "test-cluster-2"] }`)
 		require.NoError(t, err)
 	})
 }
@@ -568,10 +1087,18 @@ func TestInstanceProfileArnParsing(t *testing.T) {
 }
 
 type fakeClient struct {
-	DescribeInstancesOutput  *ec2.DescribeInstancesOutput
-	DescribeInstancesError   error
-	GetInstanceProfileOutput *iam.GetInstanceProfileOutput
-	GetInstanceProfileError  error
+	DescribeInstancesOutput         *ec2.DescribeInstancesOutput
+	DescribeInstancesError          error
+	GetInstanceProfileOutput        *iam.GetInstanceProfileOutput
+	GetInstanceProfileError         error
+	ListAccountOutput               *organizations.ListAccountsOutput
+	ListAccountError                error
+	DescribeAutoScalingGroupsOutput *autoscaling.DescribeAutoScalingGroupsOutput
+	DescribeAutoScalingGroupsError  error
+	ListNodegroupsOutput            *eks.ListNodegroupsOutput
+	ListNodegroupsError             error
+	DescribeNodegroupOutput         *eks.DescribeNodegroupOutput
+	DescribeNodegroupError          error
 }
 
 func newFakeClient() *fakeClient {
@@ -595,6 +1122,35 @@ func newFakeClient() *fakeClient {
 			},
 		},
 		GetInstanceProfileOutput: &iam.GetInstanceProfileOutput{},
+		ListAccountOutput:        &organizations.ListAccountsOutput{},
+		DescribeAutoScalingGroupsOutput: &autoscaling.DescribeAutoScalingGroupsOutput{
+			AutoScalingGroups: []autoscalingtypes.AutoScalingGroup{
+				{
+					AutoScalingGroupName: aws.String("test-asg"),
+					Instances: []autoscalingtypes.Instance{
+						{
+							InstanceId: aws.String(testInstance),
+						},
+					},
+				},
+			},
+		},
+		ListNodegroupsOutput: &eks.ListNodegroupsOutput{
+			Nodegroups: []string{"test-nodegroup"},
+		},
+		DescribeNodegroupOutput: &eks.DescribeNodegroupOutput{
+			Nodegroup: &ekstypes.Nodegroup{
+				NodegroupName: aws.String("test-nodegroup"),
+				ClusterName:   aws.String("test-cluster"),
+				Resources: &ekstypes.NodegroupResources{
+					AutoScalingGroups: []ekstypes.AutoScalingGroup{
+						{
+							Name: aws.String("test-asg"),
+						},
+					},
+				},
+			},
+		},
 	}
 }
 
@@ -619,28 +1175,58 @@ func (c *fakeClient) GetInstanceProfile(_ context.Context, input *iam.GetInstanc
 	return c.GetInstanceProfileOutput, c.GetInstanceProfileError
 }
 
+func (c *fakeClient) ListAccounts(_ context.Context, input *organizations.ListAccountsInput, _ ...func(*organizations.Options)) (*organizations.ListAccountsOutput, error) {
+	// Only modify the output if it's not being mutated in test for : mutateListAccountOutput.
+	if c.ListAccountOutput.Accounts == nil {
+		c.ListAccountOutput = &organizations.ListAccountsOutput{
+			Accounts: []types.Account{{
+				Id:     &testAccountID,
+				Status: types.AccountStatusActive,
+			}},
+		}
+	}
+	if input.NextToken != nil {
+		return nil, errors.New("failing request for pagination")
+	}
+	return c.ListAccountOutput, c.ListAccountError
+}
+
+func (c *fakeClient) DescribeAutoScalingGroups(_ context.Context, input *autoscaling.DescribeAutoScalingGroupsInput, _ ...func(*autoscaling.Options)) (*autoscaling.DescribeAutoScalingGroupsOutput, error) {
+	if c.DescribeAutoScalingGroupsError != nil {
+		return nil, c.DescribeAutoScalingGroupsError
+	}
+	return c.DescribeAutoScalingGroupsOutput, nil
+}
+
+func (c *fakeClient) ListNodegroups(_ context.Context, input *eks.ListNodegroupsInput, _ ...func(*eks.Options)) (*eks.ListNodegroupsOutput, error) {
+	if c.ListNodegroupsError != nil {
+		return nil, c.ListNodegroupsError
+	}
+	return c.ListNodegroupsOutput, nil
+}
+
+func (c *fakeClient) DescribeNodegroup(_ context.Context, input *eks.DescribeNodegroupInput, _ ...func(*eks.Options)) (*eks.DescribeNodegroupOutput, error) {
+	if c.DescribeNodegroupError != nil {
+		return nil, c.DescribeNodegroupError
+	}
+	return c.DescribeNodegroupOutput, nil
+}
+
 func buildAttestationDataRSA2048Signature(t *testing.T) caws.IIDAttestationData {
-	// doc body
-	doc := imds.InstanceIdentityDocument{
+	return buildAttestationDataRSA2048SignatureWithDoc(t, imds.InstanceIdentityDocument{
 		AccountID:        testAccount,
 		InstanceID:       testInstance,
 		Region:           testRegion,
 		AvailabilityZone: testAvailabilityZone,
 		ImageID:          testImageID,
-	}
+	})
+}
+
+func buildAttestationDataRSA2048SignatureWithDoc(t *testing.T, doc imds.InstanceIdentityDocument) caws.IIDAttestationData {
 	docBytes, err := json.Marshal(doc)
 	require.NoError(t, err)
 
-	signedData, err := pkcs7.NewSignedData(docBytes)
-	require.NoError(t, err)
-
-	privateKey := crypto.PrivateKey(testAWSCAKey)
-	err = signedData.AddSigner(testAWSCACert, privateKey, pkcs7.SignerInfoConfig{})
-	require.NoError(t, err)
-
 	signature := generatePKCS7Signature(t, docBytes, testAWSCAKey)
-
-	// base64 encode the signature
 	signatureEncoded := base64.StdEncoding.EncodeToString(signature)
 
 	return caws.IIDAttestationData{

@@ -31,12 +31,34 @@ func TestBundleToProto(t *testing.T) {
 				TrustDomainId:  td.IDString(),
 				RefreshHint:    10,
 				SequenceNumber: 42,
-				RootCas:        []*common.Certificate{{DerBytes: []byte("cert-bytes")}},
+				RootCas: []*common.Certificate{
+					{DerBytes: []byte("cert-bytes")},
+					{DerBytes: []byte("tainted-cert"), TaintedKey: true},
+				},
 				JwtSigningKeys: []*common.PublicKey{
 					{
 						Kid:       "key-id-1",
 						NotAfter:  1590514224,
 						PkixBytes: []byte("pkix key"),
+					},
+					{
+						Kid:        "key-id-2",
+						NotAfter:   1590514224,
+						PkixBytes:  []byte("pkix key"),
+						TaintedKey: true,
+					},
+				},
+				WitSigningKeys: []*common.PublicKey{
+					{
+						Kid:       "wit-key-id-1",
+						NotAfter:  1590514224,
+						PkixBytes: []byte("pkix key"),
+					},
+					{
+						Kid:        "wit-key-id-2",
+						NotAfter:   1590514224,
+						PkixBytes:  []byte("pkix key"),
+						TaintedKey: true,
 					},
 				},
 			},
@@ -48,6 +70,10 @@ func TestBundleToProto(t *testing.T) {
 					{
 						Asn1: []byte("cert-bytes"),
 					},
+					{
+						Asn1:    []byte("tainted-cert"),
+						Tainted: true,
+					},
 				},
 				JwtAuthorities: []*types.JWTKey{
 					{
@@ -55,6 +81,25 @@ func TestBundleToProto(t *testing.T) {
 						PublicKey: []byte("pkix key"),
 						KeyId:     "key-id-1",
 						ExpiresAt: 1590514224,
+					},
+					{
+						PublicKey: []byte("pkix key"),
+						KeyId:     "key-id-2",
+						ExpiresAt: 1590514224,
+						Tainted:   true,
+					},
+				},
+				WitAuthorities: []*types.WITKey{
+					{
+						PublicKey: []byte("pkix key"),
+						KeyId:     "wit-key-id-1",
+						ExpiresAt: 1590514224,
+					},
+					{
+						PublicKey: []byte("pkix key"),
+						KeyId:     "wit-key-id-2",
+						ExpiresAt: 1590514224,
+						Tainted:   true,
 					},
 				},
 			},
@@ -71,7 +116,6 @@ func TestBundleToProto(t *testing.T) {
 			expectError: "invalid trust domain id: trust domain characters are limited to lowercase letters, numbers, dots, dashes, and underscores",
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			bundle, err := api.BundleToProto(tt.bundle)
 
@@ -123,6 +167,13 @@ func TestProtoToBundle(t *testing.T) {
 						ExpiresAt: 1590514224,
 					},
 				},
+				WitAuthorities: []*types.WITKey{
+					{
+						PublicKey: pkixBytes,
+						KeyId:     "wit-key-id-1",
+						ExpiresAt: 1590514224,
+					},
+				},
 			},
 			expectBundle: &common.Bundle{
 				TrustDomainId:  td.IDString(),
@@ -134,6 +185,55 @@ func TestProtoToBundle(t *testing.T) {
 						PkixBytes: pkixBytes,
 						Kid:       "key-id-1",
 						NotAfter:  1590514224,
+					},
+				},
+				WitSigningKeys: []*common.PublicKey{
+					{
+						PkixBytes: pkixBytes,
+						Kid:       "wit-key-id-1",
+						NotAfter:  1590514224,
+					},
+				},
+			},
+		},
+		{
+			name: "tainted flag is not propagated",
+			bundle: &types.Bundle{
+				TrustDomain: td.Name(),
+				X509Authorities: []*types.X509Certificate{
+					{
+						Asn1:    rootCA.Raw,
+						Tainted: true,
+					},
+				},
+				JwtAuthorities: []*types.JWTKey{
+					{
+						PublicKey: pkixBytes,
+						KeyId:     "key-id-1",
+						Tainted:   true,
+					},
+				},
+				WitAuthorities: []*types.WITKey{
+					{
+						PublicKey: pkixBytes,
+						KeyId:     "wit-key-id-1",
+						Tainted:   true,
+					},
+				},
+			},
+			expectBundle: &common.Bundle{
+				TrustDomainId: td.IDString(),
+				RootCas:       []*common.Certificate{{DerBytes: rootCA.Raw}},
+				JwtSigningKeys: []*common.PublicKey{
+					{
+						PkixBytes: pkixBytes,
+						Kid:       "key-id-1",
+					},
+				},
+				WitSigningKeys: []*common.PublicKey{
+					{
+						PkixBytes: pkixBytes,
+						Kid:       "wit-key-id-1",
 					},
 				},
 			},
@@ -184,6 +284,37 @@ func TestProtoToBundle(t *testing.T) {
 			expectError: "unable to parse JWT authority: missing key ID",
 		},
 		{
+			name: "Invalid WIT key bytes",
+			bundle: &types.Bundle{
+				TrustDomain:    td.Name(),
+				RefreshHint:    10,
+				SequenceNumber: 42,
+				WitAuthorities: []*types.WITKey{
+					{
+						PublicKey: []byte("malformed"),
+						KeyId:     "wit-key-id-1",
+						ExpiresAt: 1590514224,
+					},
+				},
+			},
+			expectError: fmt.Sprintf("unable to parse WIT authority: %v", expectedJWTErr),
+		},
+		{
+			name: "Empty WIT key ID",
+			bundle: &types.Bundle{
+				TrustDomain:    td.Name(),
+				RefreshHint:    10,
+				SequenceNumber: 42,
+				WitAuthorities: []*types.WITKey{
+					{
+						PublicKey: pkixBytes,
+						ExpiresAt: 1590514224,
+					},
+				},
+			},
+			expectError: "unable to parse WIT authority: missing key ID",
+		},
+		{
 			name:        "no bundle",
 			expectError: "no bundle provided",
 		},
@@ -195,7 +326,6 @@ func TestProtoToBundle(t *testing.T) {
 			expectError: "invalid trust domain: trust domain characters are limited to lowercase letters, numbers, dots, dashes, and underscores",
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			bundle, err := api.ProtoToBundle(tt.bundle)
 
@@ -245,6 +375,13 @@ func TestFieldsFromBundleProto(t *testing.T) {
 				ExpiresAt: 1590514224,
 			},
 		},
+		WitAuthorities: []*types.WITKey{
+			{
+				PublicKey: pkixBytes,
+				KeyId:     "wit-key-id-1",
+				ExpiresAt: 1590514225,
+			},
+		},
 	}
 
 	for _, tt := range []struct {
@@ -264,7 +401,21 @@ func TestFieldsFromBundleProto(t *testing.T) {
 				telemetry.RefreshHint:               int64(10),
 				telemetry.SequenceNumber:            uint64(42),
 				telemetry.TrustDomainID:             "example.org",
+				"wit_authority_expires_at.0":        int64(1590514225),
+				"wit_authority_key_id.0":            "wit-key-id-1",
+				"wit_authority_public_key_sha256.0": pkixHashed,
 				"x509_authorities_asn1_sha256.0":    rootCAHashed,
+			},
+		},
+		{
+			name:  "WIT authorities mask",
+			proto: bundle,
+			mask:  &types.BundleMask{WitAuthorities: true},
+			expectFields: logrus.Fields{
+				telemetry.TrustDomainID:             "example.org",
+				"wit_authority_expires_at.0":        int64(1590514225),
+				"wit_authority_key_id.0":            "wit-key-id-1",
+				"wit_authority_public_key_sha256.0": pkixHashed,
 			},
 		},
 		{

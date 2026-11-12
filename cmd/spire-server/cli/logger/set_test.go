@@ -12,7 +12,7 @@ import (
 )
 
 func TestSetHelp(t *testing.T) {
-	test := setupCliTest(t, nil, logger.NewSetCommandWithEnv)
+	test := setupCliTest(t, &mockLoggerService{}, logger.NewSetCommandWithEnv)
 	test.client.Help()
 	require.Equal(t, "", test.stdout.String())
 	require.Equal(t, setUsage, test.stderr.String())
@@ -141,6 +141,9 @@ Launch Level : info
 			test := setupCliTest(t, tt.service, logger.NewSetCommandWithEnv)
 			returnCode := test.client.Run(append(test.args, tt.args...))
 			require.Equal(t, tt.expectReturnCode, returnCode)
+			if tt.expectReturnCode == 0 {
+				require.Equal(t, tt.expectedSetValue, *test.server.receivedSetValue)
+			}
 			require.Equal(t, tt.expectStderr, test.stderr.String())
 			require.Equal(t, tt.expectStdout, test.stdout.String())
 		})

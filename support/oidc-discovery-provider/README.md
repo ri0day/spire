@@ -13,6 +13,9 @@ It provides the following endpoints:
 | `GET` | `/ready`                            | Returns http.OK (200) as soon as requests can be served. (disabled by default)                                          |
 | `GET` | `/live`                             | Returns http.OK (200) as soon as a keyset is available, otherwise http.InternalServerError (500). (disabled by default) |
 
+The endpoints can be moved to a different prefix by way of the `server_path_prefix` option. For example, setting server_path_prefix to `/instance/1` will make
+the OIDC discovery document served at `/instance/1/.well-known/openid-configuration` and keys at `/instance/1/keys`
+
 The provider by default relies on ACME to obtain TLS certificates that it uses to
 serve the documents securely.
 
@@ -31,45 +34,66 @@ The provider has the following command line flags:
 The configuration file is **required** by the provider. It contains
 [HCL](https://github.com/hashicorp/hcl) encoded configurables.
 
-| Key                     | Type    | Required?          | Description                                                            | Default  |
-|-------------------------|---------|--------------------|------------------------------------------------------------------------|----------|
-| `acme`                  | section | required[1]        | Provides the ACME configuration.                                       |          |
-| `serving_cert_file`     | section | required\[1\]\[4\] | Provides the serving certificate configuration.                        |          |
-| `allow_insecure_scheme` | string  | optional\[3\]      | Serves OIDC configuration response with HTTP url.                      | `false`  |
-| `domains`               | strings | required           | One or more domains the provider is being served from.                 |          |
-| `experimental`          | section | optional           | The experimental options that are subject to change or removal.        |          |
-| `insecure_addr`         | string  | optional\[3\]      | Exposes the service on http.                                           |          |
-| `set_key_use`           | bool    | optional           | If true, the `use` parameter on JWKs will be set to `sig`.             | `false`  |
-| `listen_socket_path`    | string  | required\[1\]\[3\] | Path on disk to listen with a Unix Domain Socket. Unix platforms only. |          |
-| `log_format`            | string  | optional           | Format of the logs (either `"TEXT"` or `"JSON"`)                       | `""`     |
-| `log_level`             | string  | required           | Log level (one of `"error"`,`"warn"`,`"info"`,`"debug"`)               | `"info"` |
-| `log_path`              | string  | optional           | Path on disk to write the log.                                         |          |
-| `log_requests`          | bool    | optional           | If true, all HTTP requests are logged at the debug level               | `false`  |
-| `server_api`            | section | required\[2\]      | Provides SPIRE Server API details.                                     |          |
-| `workload_api`          | section | required\[2\]      | Provides Workload API details.                                         |          |
-| `health_checks`         | section | optional           | Enable and configure health check endpoints                            |          |
+| Key                     | Type    | Required?          | Description                                                                                    | Default  |
+| ----------------------- | ------- | ------------------ | ---------------------------------------------------------------------------------------------- | -------- |
+| `serving_cert_source`   | section | required\[1\]      | Provides the [serving certificate source](#serving-certificate-source-section) configuration.  |          |
+| `acme`                  | section | required[1]        | Provides the ACME configuration. Deprecated, use `serving_cert_source "acme"` instead.         |          |
+| `serving_cert_file`     | section | required\[1\]\[4\] | Serving certificate configuration. Deprecated, use `serving_cert_source "cert_file"` instead.  |          |
+| `allow_insecure_scheme` | bool    | optional\[3\]      | Serves OIDC configuration response with HTTP url. A warning is logged at startup when enabled. | `false`  |
+| `domains`               | strings | required           | One or more domains the provider is being served from.                                         |          |
+| `experimental`          | section | optional           | The experimental options that are subject to change or removal.                                |          |
+| `insecure_addr`         | string  | optional\[3\]      | Exposes the service on http.                                                                   |          |
+| `set_key_use`           | bool    | optional           | If true, the `use` parameter on JWKs will be set to `sig`.                                     | `false`  |
+| `listen_socket_path`    | string  | required\[1\]\[3\] | Path on disk to listen with a Unix Domain Socket. Unix platforms only.                         |          |
+| `log_format`            | string  | optional           | Format of the logs (either `"TEXT"` or `"JSON"`)                                               | `""`     |
+| `log_level`             | string  | required           | Log level (one of `"error"`,`"warn"`,`"info"`,`"debug"`)                                       | `"info"` |
+| `log_path`              | string  | optional           | Path on disk to write the log.                                                                 |          |
+| `log_file_rotation`     | section | optional           | Rotates `log_path` in process. Requires `log_path`. Disabled unless configured.                |          |
+| `log_requests`          | bool    | optional           | If true, all HTTP requests are logged at the debug level                                       | `false`  |
+| `server_api`            | section | required\[2\]      | Provides SPIRE Server API details.                                                             |          |
+| `workload_api`          | section | required\[2\]      | Provides Workload API details.                                                                 |          |
+| `file`                  | section | required\[2\]      | Provides File details.                                                                         |          |
+| `health_checks`         | section | optional           | Enable and configure health check endpoints                                                    |          |
+| `jwt_issuer`            | string  | optional           | Specifies the issuer for the OIDC provider configuration request                               |          |
+| `jwks_uri`              | string  | optional           | Specifies the JWKS URI returned in the discovery document                                      |          |
+| `server_path_prefix`    | string  | optional           | If specified, all endpoints listened to will be prefixed by this value                         | `"/"`    |
+| `tls_config`            | section | optional           | TLS config for terminating HTTPS listeners (disk certificate, ACME and Workload API modes).    |          |
 
 | experimental             | Type   | Required?          | Description                                          | Default |
 |--------------------------|--------|--------------------|------------------------------------------------------|---------|
 | `listen_named_pipe_name` | string | required\[1\]\[3\] | Pipe name to listen with a named pipe. Windows only. |         |
 
+| log_file_rotation | Type | Required? | Description                                                                                           | Default |
+|-------------------|------|-----------|-------------------------------------------------------------------------------------------------------|---------|
+| `max_size_mb`     | int  | optional  | Size in MiB `log_path` may reach before it is rotated. An explicit `0` disables size based rotation.  | `100`   |
+| `max_files`       | int  | optional  | Rotated files to retain, not counting the active file. An explicit `0` retains every rotated file.    | `7`     |
+
+Rotation moves the accumulated content aside to a timestamped sibling of
+`log_path` (for example `oidc-2026-08-18T22-43-01.123.log`) and continues writing
+to `log_path` itself. Retention is applied when a rotation happens, not on a
+timer.
+
+The provider does not respond to `SIGUSR2`, so an external rotator can move the
+file aside but cannot make the provider start a new one. That makes this section
+the only way to bound growth of `log_path`.
+
 <!-- markdownlint-configure-file { "MD053": false } -->
 
 #### Considerations for Unix platforms
 
-[1]: One of `acme`, `serving_cert_file` or `listen_socket_path` must be defined.
+[1]: One of `serving_cert_source`, `acme`, `serving_cert_file` or `listen_socket_path` must be defined.
 
-[3]: The `allow_insecure_scheme` should only be used in a local development environment for testing purposes. It only works in conjunction with `insecure_addr` or `listen_socket_path`.
+[3]: The `allow_insecure_scheme` should only be enabled when the network path to the provider is trusted end-to-end (for example, when TLS is terminated at a trusted reverse proxy or load balancer on a private network). It only works in conjunction with `insecure_addr` or `listen_socket_path`.
 
 #### Considerations for Windows platforms
 
-[1]: One of `acme`, `serving_cert_file` or `listen_named_pipe_name` must be defined.
+[1]: One of `serving_cert_source`, `acme`, `serving_cert_file` or `listen_named_pipe_name` must be defined.
 
-[3]: The `allow_insecure_scheme` should only be used in a local development environment for testing purposes. It only works in conjunction with `insecure_addr` or `listen_named_pipe_name`.
+[3]: The `allow_insecure_scheme` should only be enabled when the network path to the provider is trusted end-to-end (for example, when TLS is terminated at a trusted reverse proxy or load balancer on a private network). It only works in conjunction with `insecure_addr` or `listen_named_pipe_name`.
 
 #### Considerations for all platforms
 
-[2]: One of `server_api` or `workload_api` must be defined. The provider relies on one of these two APIs to obtain the public key material used to construct the JWKS document.
+[2]: One of `server_api`, `workload_api`, or `file` must be defined. The provider relies on one of these APIs to obtain the public key material used to construct the JWKS document.
 
 The `domains` configurable contains the list of domains the provider is
 expected to be served from. If a request is received from a domain other than
@@ -79,6 +103,41 @@ allowed domains for which certificates will be obtained. The TLS handshake
 will terminate if another domain is requested.
 
 [4]: SPIRE OIDC Discovery provider monitors and reloads the files provided in the `serving_cert_file` configuration at runtime.
+
+#### Serving Certificate Source Section
+
+The `serving_cert_source` section selects where the certificate used to serve
+HTTPS comes from. The section label selects the source and the body holds its
+configuration: `serving_cert_source "acme" {}` takes the options of the
+[ACME Section](#acme-section), `serving_cert_source "cert_file" {}` takes the
+options of the [Serving Certificate Section](#serving-certificate-section), and
+`serving_cert_source "workload_api" {}` serves an X509-SVID obtained from the
+SPIFFE Workload API, kept up to date as it is rotated, with the options below.
+Only one `serving_cert_source` section can be configured, and it cannot be used
+together with the deprecated `acme` and `serving_cert_file` sections. The
+`workload_api` source cannot be combined with `insecure_addr`,
+`listen_socket_path` or `listen_named_pipe_name`; the provider fails to start
+in that case.
+
+Note that clients need the trust domain's X.509 bundle to authenticate an
+X509-SVID, and that they check the certificate's DNS names against the host
+they connect to. An X509-SVID only carries the DNS names set on its
+registration entry (`-dns` on `spire-server entry create`), so the entry of the
+provider must set DNS names matching the configured `domains`; otherwise
+clients such as the Kubernetes API server fail to fetch the JWKS. If the
+Workload API returns more than one X509-SVID, the first one is served.
+
+| Key            | Type    | Required?     | Description                                                               | Default |
+|----------------|---------|---------------|---------------------------------------------------------------------------|---------|
+| `experimental` | section | optional      | The experimental options that are subject to change or removal.           |         |
+| `socket_path`  | string  | required\[5\] | Path on disk to the Workload API Unix Domain socket. Unix platforms only. |         |
+| `addr`         | string  | optional      | Exposes the service on the given address.                                 | `:443`  |
+
+| experimental      | Type   | Required?     | Description                                             | Default |
+|:------------------|--------|---------------|---------------------------------------------------------|---------|
+| `named_pipe_name` | string | required\[5\] | Pipe name of the Workload API named pipe. Windows only. |         |
+
+[5]: Optional when the `workload_api` section is configured, in which case it defaults to the value configured in that section.
 
 #### ACME Section
 
@@ -98,13 +157,26 @@ will terminate if another domain is requested.
 | `file_sync_interval` | duration | optional  | Controls how frequently the service polls the files for changes.   | 1 minute |
 | `addr`               | string   | optional  | Exposes the service on the given address.                          | :443     |
 
+#### TLS Config Section
+
+Applied to **terminating** HTTPS listeners when using `serving_cert_source`, `serving_cert_file` or `acme`.
+Not applied to `insecure_addr`, `listen_socket_path`, named pipe modes, or any
+outbound TLS client connections. Parsed once at startup; invalid values prevent
+the provider from starting.
+
+| Key                | Type   | Required?| Description                                                                                                                                 | Default                      |
+|--------------------|--------|----------|---------------------------------------------------------------------------------------------------------------------------------------------|------------------------------|
+| `min_tls_version`  | string | optional | Minimum TLS version (e.g. `VersionTLS12`, `VersionTLS13`). Values below `VersionTLS12` are rejected. When omitted, defaults to TLS 1.2.     | TLS 1.2 when block is present|
+| `cipher_suites`    | strings| optional | Allowed TLS 1.2 cipher suites. Ignored when `min_tls_version` is `VersionTLS13` or higher. Insecure suite names are filtered with a warning.| Go defaults if all filtered  |
+| `curve_preferences`| strings| optional | Preferred key exchange curves. When minimum TLS is 1.2, at least one classical curve is required.                                           |                              |
+
 #### Server API Section
 
-| Key             | Type     | Required? | Description                                                                                                                                                    | Default |
-|-----------------|----------|-----------|----------------------------------------------------------------------------------------------------------------------------------------------------------------|---------|
+| Key             | Type     | Required? | Description                                                                                                                                                      | Default |
+|-----------------|----------|-----------|------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------|
 | `address`       | string   | required  | SPIRE Server API gRPC target address. Only the unix name system is supported. See <https://github.com/grpc/grpc/blob/master/doc/naming.md>. Unix platforms only. |         |
-| `experimental`  | section  | optional  | The experimental options that are subject to change or removal.                                                                                                |         |
-| `poll_interval` | duration | optional  | How often to poll for changes to the public key material.                                                                                                      | `"10s"` |
+| `experimental`  | section  | optional  | The experimental options that are subject to change or removal.                                                                                                  |         |
+| `poll_interval` | duration | optional  | How often to poll for changes to the public key material.                                                                                                        | `"10s"` |
 
 | experimental      | Type   | Required? | Description                                                 | Default |
 |:------------------|--------|-----------|-------------------------------------------------------------|---------|
@@ -122,6 +194,13 @@ will terminate if another domain is requested.
 | experimental      | Description                                             | Default |
 |:------------------|---------------------------------------------------------|---------|
 | `named_pipe_name` | Pipe name of the Workload API named pipe. Windows only. |         |
+
+#### File Section
+
+| Key             | Type     | Required? | Description                                               | Default |
+|-----------------|----------|-----------|-----------------------------------------------------------|---------|
+| `path`          | string   | required  | Path on disk to the spiffe formatted trust bundle to use. |         |
+| `poll_interval` | duration | optional  | How often to poll for changes to the public key material. | `"10s"` |
 
 #### Health Checks Section
 
@@ -195,6 +274,20 @@ domains = ["mypublicdomain.test"]
 serving_cert_file {
  cert_file_path = "/some/path/on/disk/to/cert.pem"
  key_file_path = "/some/path/on/disk/to/key.pem"
+}
+workload_api {
+    socket_path = "/tmp/spire-agent/public/api.sock"
+    trust_domain = "domain.test"
+}
+```
+
+#### Workload API and Serving Certificate from the Workload API
+
+```hcl
+log_level = "debug"
+domains = ["mypublicdomain.test"]
+serving_cert_source "workload_api" {
+    addr = ":8443"
 }
 workload_api {
     socket_path = "/tmp/spire-agent/public/api.sock"

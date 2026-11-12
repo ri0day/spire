@@ -3,24 +3,40 @@ package x509pop
 import (
 	"context"
 	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"math/big"
+	"net"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus/hooks/test"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	identityproviderv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/hostservice/server/identityprovider/v1"
+	plugintypes "github.com/spiffe/spire-plugin-sdk/proto/spire/plugin/types"
 	"github.com/spiffe/spire/pkg/common/catalog"
 	"github.com/spiffe/spire/pkg/common/plugin/x509pop"
+	spirecommonutil "github.com/spiffe/spire/pkg/common/util"
 	"github.com/spiffe/spire/pkg/server/plugin/nodeattestor"
 	"github.com/spiffe/spire/proto/spire/common"
+	"github.com/spiffe/spire/test/fakes/fakeidentityprovider"
 	"github.com/spiffe/spire/test/fixture"
 	"github.com/spiffe/spire/test/plugintest"
 	"github.com/spiffe/spire/test/spiretest"
 	"github.com/spiffe/spire/test/util"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/peer"
 )
 
 func TestX509PoP(t *testing.T) {
@@ -36,6 +52,8 @@ type Suite struct {
 	leafCert         *x509.Certificate
 	intermediateCert *x509.Certificate
 	rootCert         *x509.Certificate
+	svidReg          [][]byte
+	svidExchange     [][]byte
 
 	alternativeBundlePath string
 	alternativeBundle     *x509.Certificate
@@ -47,6 +65,8 @@ func (s *Suite) SetupTest() {
 	s.rootCertPath = fixture.Join("nodeattestor", "x509pop", "root-crt.pem")
 	leafCertPath := fixture.Join("nodeattestor", "x509pop", "leaf-crt-bundle.pem")
 	leafKeyPath := fixture.Join("nodeattestor", "x509pop", "leaf-key.pem")
+	svidRegPath := fixture.Join("nodeattestor", "x509pop", "svidreg.pem")
+	svidExchangePath := fixture.Join("nodeattestor", "x509pop", "svidexchange.pem")
 
 	kp, err := tls.LoadX509KeyPair(leafCertPath, leafKeyPath)
 	require.NoError(err)
@@ -59,6 +79,15 @@ func (s *Suite) SetupTest() {
 	s.rootCert, err = util.LoadCert(s.rootCertPath)
 	require.NoError(err)
 
+	kp, err = tls.LoadX509KeyPair(svidRegPath, leafKeyPath)
+	require.NoError(err)
+	s.svidReg = kp.Certificate
+	require.NoError(err)
+
+	kp, err = tls.LoadX509KeyPair(svidExchangePath, leafKeyPath)
+	require.NoError(err)
+	s.svidExchange = kp.Certificate
+
 	// Add alternative bundle
 	s.alternativeBundlePath = fixture.Join("certs", "ca.pem")
 	s.alternativeBundle, err = util.LoadCert(s.alternativeBundlePath)
@@ -70,36 +99,112 @@ func (s *Suite) TestAttestSuccess() {
 		desc          string
 		giveConfig    string
 		expectAgentID string
+		certs         [][]byte
+		serialnumber  string
+		expectGroup   string
 	}{
 		{
 			desc:          "default success (ca_bundle_path)",
 			expectAgentID: "spiffe://example.org/spire/agent/x509pop/" + x509pop.Fingerprint(s.leafCert),
 			giveConfig:    s.createConfiguration("ca_bundle_path", ""),
+			certs:         s.leafBundle,
+			serialnumber:  "serialnumber:0a1b2c3d4e5f",
 		},
 		{
 			desc:          "success with custom agent id (ca_bundle_path)",
 			expectAgentID: "spiffe://example.org/spire/agent/cn/COMMONNAME",
 			giveConfig:    s.createConfiguration("ca_bundle_path", `agent_path_template = "/cn/{{ .Subject.CommonName }}"`),
+			certs:         s.leafBundle,
+			serialnumber:  "serialnumber:0a1b2c3d4e5f",
 		},
 		{
 			desc:          "default success (ca_bundle_paths)",
 			expectAgentID: "spiffe://example.org/spire/agent/x509pop/" + x509pop.Fingerprint(s.leafCert),
 			giveConfig:    s.createConfiguration("ca_bundle_path", ""),
+			certs:         s.leafBundle,
+			serialnumber:  "serialnumber:0a1b2c3d4e5f",
 		},
 		{
 			desc:          "success with custom agent id (ca_bundle_paths)",
 			expectAgentID: "spiffe://example.org/spire/agent/serialnumber/0a1b2c3d4e5f",
 			giveConfig:    s.createConfiguration("ca_bundle_paths", `agent_path_template = "/serialnumber/{{ .SerialNumberHex }}"`),
+			certs:         s.leafBundle,
+			serialnumber:  "serialnumber:0a1b2c3d4e5f",
+		},
+		{
+			desc:          "success with spiffe exchange",
+			expectAgentID: "spiffe://example.org/spire/agent/x509pop/testhost",
+			giveConfig:    s.createConfigurationModeSPIFFE(""),
+			certs:         s.svidExchange,
+			serialnumber:  "serialnumber:0a1b2c3d4e7f",
+		},
+		{
+			desc:          "success with custom X509pop san selectors",
+			expectAgentID: "spiffe://example.org/spire/agent/foo/us-east-1/production/path/to/value",
+			giveConfig:    s.createConfiguration("ca_bundle_paths", `agent_path_template = "/foo/{{ .URISanSelectors.datacenter }}/{{ .URISanSelectors.environment }}/{{ .URISanSelectors.key }}"`),
+			certs:         s.leafBundle,
+			serialnumber:  "serialnumber:0a1b2c3d4e5f",
+		},
+		{
+			desc:          "success with max intermediates at limit",
+			expectAgentID: "spiffe://example.org/spire/agent/x509pop/" + x509pop.Fingerprint(s.leafCert),
+			giveConfig:    s.createConfiguration("ca_bundle_path", "max_intermediates = 1"),
+			certs:         s.leafBundle, // has 1 leaf and 1 intermediate
+			serialnumber:  "serialnumber:0a1b2c3d4e5f",
+		},
+		{
+			desc:          "success with group selector",
+			expectAgentID: "spiffe://example.org/spire/agent/x509pop/testhost",
+			giveConfig:    s.createConfigurationModeSPIFFE(`group_template = "{{ .SVIDPathTrimmed }}"` + "\n" + `allowed_groups = ["testhost"]`),
+			certs:         s.svidExchange,
+			serialnumber:  "serialnumber:0a1b2c3d4e7f",
+			expectGroup:   "testhost",
+		},
+		{
+			desc:          "group selector not emitted when path not allowed",
+			expectAgentID: "spiffe://example.org/spire/agent/x509pop/testhost",
+			giveConfig:    s.createConfigurationModeSPIFFE(`group_template = "{{ .SVIDPathTrimmed }}"` + "\n" + `allowed_groups = ["other"]`),
+			certs:         s.svidExchange,
+			serialnumber:  "serialnumber:0a1b2c3d4e7f",
+		},
+		{
+			desc:          "success with group selector in external_pki mode",
+			expectAgentID: "spiffe://example.org/spire/agent/x509pop/" + x509pop.Fingerprint(s.leafCert),
+			giveConfig:    s.createConfiguration("ca_bundle_path", `group_template = "{{ .Subject.CommonName }}"`+"\n"+`allowed_groups = ["COMMONNAME"]`),
+			certs:         s.leafBundle,
+			serialnumber:  "serialnumber:0a1b2c3d4e5f",
+			expectGroup:   "COMMONNAME",
+		},
+		{
+			desc:          "surrounding whitespace is trimmed from the group",
+			expectAgentID: "spiffe://example.org/spire/agent/x509pop/testhost",
+			giveConfig:    s.createConfigurationModeSPIFFE(`group_template = "\n{{ .SVIDPathTrimmed }}\n"` + "\n" + `allowed_groups = ["testhost"]`),
+			certs:         s.svidExchange,
+			serialnumber:  "serialnumber:0a1b2c3d4e7f",
+			expectGroup:   "testhost",
+		},
+		{
+			desc:          "no group when the template renders nothing",
+			expectAgentID: "spiffe://example.org/spire/agent/x509pop/testhost",
+			giveConfig:    s.createConfigurationModeSPIFFE(`group_template = "{{ if hasKey .URISanSelectors \"nope\" }}{{ .URISanSelectors.nope }}{{ end }}"` + "\n" + `allowed_groups = ["testhost"]`),
+			certs:         s.svidExchange,
+			serialnumber:  "serialnumber:0a1b2c3d4e7f",
+		},
+		{
+			desc:          "no group when the template fails to execute",
+			expectAgentID: "spiffe://example.org/spire/agent/x509pop/testhost",
+			giveConfig:    s.createConfigurationModeSPIFFE(`group_template = "{{ .URISanSelectors.nope }}"` + "\n" + `allowed_groups = ["testhost"]`),
+			certs:         s.svidExchange,
+			serialnumber:  "serialnumber:0a1b2c3d4e7f",
 		},
 	}
 
 	for _, tt := range tests {
-		tt := tt // alias loop variable as it is used in the closure
 		s.T().Run(tt.desc, func(t *testing.T) {
 			attestor := s.loadPlugin(t, tt.giveConfig)
 
 			attestationData := &x509pop.AttestationData{
-				Certificates: s.leafBundle,
+				Certificates: tt.certs,
 			}
 			payload := marshal(t, attestationData)
 
@@ -119,19 +224,35 @@ func (s *Suite) TestAttestSuccess() {
 			require.NoError(t, err)
 			require.Equal(t, tt.expectAgentID, result.AgentID)
 
+			expectedSelectors := []*common.Selector{
+				{Type: "x509pop", Value: "subject:cn:COMMONNAME"},
+				{Type: "x509pop", Value: "ca:fingerprint:" + x509pop.Fingerprint(s.intermediateCert)},
+				{Type: "x509pop", Value: "ca:fingerprint:" + x509pop.Fingerprint(s.rootCert)},
+				{Type: "x509pop", Value: tt.serialnumber},
+				{Type: "x509pop", Value: "san:datacenter:us-east-1"},
+				{Type: "x509pop", Value: "san:environment:production"},
+				{Type: "x509pop", Value: "san:key:path/to/value"},
+			}
+
+			if tt.expectGroup != "" {
+				expectedSelectors = append(expectedSelectors, &common.Selector{
+					Type:  "x509pop",
+					Value: "group:" + tt.expectGroup,
+				})
+			}
+
+			spirecommonutil.SortSelectors(expectedSelectors)
+			spirecommonutil.SortSelectors(result.Selectors)
+
 			spiretest.AssertProtoListEqual(t,
-				[]*common.Selector{
-					{Type: "x509pop", Value: "subject:cn:COMMONNAME"},
-					{Type: "x509pop", Value: "ca:fingerprint:" + x509pop.Fingerprint(s.intermediateCert)},
-					{Type: "x509pop", Value: "ca:fingerprint:" + x509pop.Fingerprint(s.rootCert)},
-					{Type: "x509pop", Value: "serialnumber:0a1b2c3d4e5f"},
-				}, result.Selectors)
+				expectedSelectors, result.Selectors)
 		})
 	}
 }
 
 func (s *Suite) TestAttestFailure() {
 	successConfiguration := s.createConfiguration("ca_bundle_path", "")
+	spiffeConfiguration := s.createConfigurationModeSPIFFE("")
 
 	makePayload := func(t *testing.T, attestationData *x509pop.AttestationData) []byte {
 		return marshal(t, attestationData)
@@ -144,12 +265,22 @@ func (s *Suite) TestAttestFailure() {
 		require.Nil(t, result)
 	}
 
-	challengeResponseFails := func(t *testing.T, attestor nodeattestor.NodeAttestor, challengeResp string, expectCode codes.Code, expectMessage string) {
+	challengeResponseFails := func(t *testing.T, attestor nodeattestor.NodeAttestor, certs [][]byte, challengeResp string, fullChallenge bool, expectCode codes.Code, expectMessage string) {
 		payload := makePayload(t, &x509pop.AttestationData{
-			Certificates: s.leafBundle,
+			Certificates: certs,
 		})
 		doChallenge := func(ctx context.Context, challenge []byte) ([]byte, error) {
 			return []byte(challengeResp), nil
+		}
+		if fullChallenge {
+			doChallenge = func(ctx context.Context, challenge []byte) ([]byte, error) {
+				require.NotEmpty(t, challenge)
+				popChallenge := new(x509pop.Challenge)
+				unmarshal(t, challenge, popChallenge)
+				response, err := x509pop.CalculateResponse(s.leafKey, popChallenge)
+				require.NoError(t, err)
+				return marshal(t, response), nil
+			}
 		}
 		result, err := attestor.Attest(context.Background(), payload, doChallenge)
 		spiretest.RequireGRPCStatusContains(t, err, expectCode, expectMessage)
@@ -158,7 +289,9 @@ func (s *Suite) TestAttestFailure() {
 
 	s.T().Run("not configured", func(t *testing.T) {
 		attestor := new(nodeattestor.V1)
-		plugintest.Load(t, BuiltIn(), attestor)
+		plugintest.Load(t, BuiltIn(), attestor,
+			plugintest.HostServices(identityproviderv1.IdentityProviderServiceServer(fakeidentityprovider.New())),
+		)
 		attestFails(t, attestor, []byte("payload"), codes.FailedPrecondition,
 			"nodeattestor(x509pop): not configured")
 	})
@@ -203,12 +336,74 @@ func (s *Suite) TestAttestFailure() {
 
 	s.T().Run("malformed challenge response", func(t *testing.T) {
 		attestor := s.loadPlugin(t, successConfiguration)
-		challengeResponseFails(t, attestor, "", codes.InvalidArgument, "nodeattestor(x509pop): unable to unmarshal challenge response")
+		challengeResponseFails(t, attestor, s.leafBundle, "", false, codes.InvalidArgument, "nodeattestor(x509pop): unable to unmarshal challenge response")
 	})
 
 	s.T().Run("invalid response", func(t *testing.T) {
 		attestor := s.loadPlugin(t, successConfiguration)
-		challengeResponseFails(t, attestor, "{}", codes.PermissionDenied, "nodeattestor(x509pop): challenge response verification failed")
+		challengeResponseFails(t, attestor, s.leafBundle, "{}", false, codes.PermissionDenied, "nodeattestor(x509pop): challenge response verification failed")
+	})
+
+	s.T().Run("spiffe bad prefix", func(t *testing.T) {
+		attestor := s.loadPlugin(t, spiffeConfiguration)
+
+		challengeResponseFails(t, attestor, s.svidReg, "", true, codes.PermissionDenied, "nodeattestor(x509pop): x509 cert doesnt match SVID prefix")
+	})
+
+	s.T().Run("spiffe non svid", func(t *testing.T) {
+		attestor := s.loadPlugin(t, spiffeConfiguration)
+
+		challengeResponseFails(t, attestor, s.leafBundle, "", true, codes.PermissionDenied, "nodeattestor(x509pop): valid SVID x509 cert not found")
+	})
+
+	s.T().Run("spiffe non svid", func(t *testing.T) {
+		attestor := s.loadPluginFull(t, spiffeConfiguration, fakeidentityprovider.New())
+
+		challengeResponseFails(t, attestor, s.svidExchange, "", true, codes.Internal, "nodeattestor(x509pop): failed to get trust bundle")
+	})
+
+	s.T().Run("too many intermediates", func(t *testing.T) {
+		attestor := s.loadPlugin(t, successConfiguration)
+
+		// Create a certificate chain with defaultMaxIntermediates + 2 certificates
+		// (1 leaf + defaultMaxIntermediates + 1 extra)
+		certs := make([][]byte, defaultMaxIntermediates+2)
+		certs[0] = s.leafBundle[0] // leaf
+		for i := 1; i < len(certs); i++ {
+			certs[i] = s.leafBundle[1] // reuse intermediate (doesn't matter for this test)
+		}
+
+		payload := makePayload(t, &x509pop.AttestationData{Certificates: certs})
+		attestFails(t, attestor, payload, codes.InvalidArgument,
+			"nodeattestor(x509pop): too many intermediate certificates")
+	})
+
+	s.T().Run("leaf RSA key too large", func(t *testing.T) {
+		// Use a smaller limit (2048) and generate a slightly larger key (3072) for faster tests
+		customConfig := s.createConfiguration("ca_bundle_path", "max_rsa_key_size = 2048")
+		attestor := s.loadPlugin(t, customConfig)
+
+		// Generate a certificate with a 3072-bit RSA key (exceeds 2048 limit)
+		testKeySize := 3072
+		leafCert := generateCertWithRSAKeySize(t, testKeySize)
+
+		payload := makePayload(t, &x509pop.AttestationData{Certificates: [][]byte{leafCert, s.leafBundle[1]}})
+		attestFails(t, attestor, payload, codes.InvalidArgument,
+			"nodeattestor(x509pop): leaf certificate key size too large")
+	})
+
+	s.T().Run("intermediate RSA key too large", func(t *testing.T) {
+		// Use a smaller limit (2048) and generate a slightly larger key (3072) for faster tests
+		customConfig := s.createConfiguration("ca_bundle_path", "max_rsa_key_size = 2048")
+		attestor := s.loadPlugin(t, customConfig)
+
+		// Generate an intermediate certificate with a 3072-bit RSA key (exceeds 2048 limit)
+		testKeySize := 3072
+		intermediateCert := generateCertWithRSAKeySize(t, testKeySize)
+
+		payload := makePayload(t, &x509pop.AttestationData{Certificates: [][]byte{s.leafBundle[0], intermediateCert}})
+		attestFails(t, attestor, payload, codes.InvalidArgument,
+			"nodeattestor(x509pop): intermediate certificate 0 key size too large")
 	})
 }
 
@@ -216,6 +411,7 @@ func (s *Suite) TestConfigure() {
 	doConfig := func(t *testing.T, coreConfig catalog.CoreConfig, config string) error {
 		var err error
 		plugintest.Load(t, BuiltIn(), nil,
+			plugintest.HostServices(identityproviderv1.IdentityProviderServiceServer(fakeidentityprovider.New())),
 			plugintest.CaptureConfigureError(&err),
 			plugintest.CoreConfig(coreConfig),
 			plugintest.Configure(config),
@@ -236,7 +432,7 @@ func (s *Suite) TestConfigure() {
 		err := doConfig(t, catalog.CoreConfig{}, `
 		ca_bundle_path = "blah"
 `)
-		spiretest.RequireGRPCStatusContains(t, err, codes.InvalidArgument, "trust_domain is required")
+		spiretest.RequireGRPCStatusContains(t, err, codes.InvalidArgument, "server core configuration must contain trust_domain")
 	})
 
 	s.T().Run("missing ca_bundle_path and ca_bundle_paths", func(t *testing.T) {
@@ -266,16 +462,206 @@ func (s *Suite) TestConfigure() {
 
 		spiretest.RequireGRPCStatusContains(t, err, codes.InvalidArgument, "unable to load trust bundle")
 	})
+
+	s.T().Run("bad mode and ca_bundle_paths", func(t *testing.T) {
+		err := doConfig(t, coreConfig, `
+		mode = "spiffe"
+		ca_bundle_paths = ["blah"]
+		`)
+
+		spiretest.RequireGRPCStatusContains(t, err, codes.InvalidArgument, "you can not use ca_bundle_path or ca_bundle_paths in spiffe mode")
+	})
+
+	s.T().Run("bad mode and ca_bundle_path", func(t *testing.T) {
+		err := doConfig(t, coreConfig, `
+		mode = "spiffe"
+		ca_bundle_path = "blah"
+		`)
+
+		spiretest.RequireGRPCStatusContains(t, err, codes.InvalidArgument, "you can not use ca_bundle_path or ca_bundle_paths in spiffe mode")
+	})
+
+	s.T().Run("invalid max_intermediates (zero)", func(t *testing.T) {
+		err := doConfig(t, coreConfig, fmt.Sprintf(`
+		ca_bundle_path = %q
+		max_intermediates = 0
+		`, s.rootCertPath))
+
+		spiretest.RequireGRPCStatusContains(t, err, codes.InvalidArgument, "max_intermediates must be greater than 0")
+	})
+
+	s.T().Run("invalid max_intermediates (negative)", func(t *testing.T) {
+		err := doConfig(t, coreConfig, fmt.Sprintf(`
+		ca_bundle_path = %q
+		max_intermediates = -1
+		`, s.rootCertPath))
+
+		spiretest.RequireGRPCStatusContains(t, err, codes.InvalidArgument, "max_intermediates must be greater than 0")
+	})
+
+	s.T().Run("invalid max_rsa_key_size (zero)", func(t *testing.T) {
+		err := doConfig(t, coreConfig, fmt.Sprintf(`
+		ca_bundle_path = %q
+		max_rsa_key_size = 0
+		`, s.rootCertPath))
+
+		spiretest.RequireGRPCStatusContains(t, err, codes.InvalidArgument, "max_rsa_key_size must be greater than 0")
+	})
+
+	s.T().Run("invalid max_rsa_key_size (negative)", func(t *testing.T) {
+		err := doConfig(t, coreConfig, fmt.Sprintf(`
+		ca_bundle_path = %q
+		max_rsa_key_size = -1
+		`, s.rootCertPath))
+
+		spiretest.RequireGRPCStatusContains(t, err, codes.InvalidArgument, "max_rsa_key_size must be greater than 0")
+	})
+
+	s.T().Run("custom max_intermediates", func(t *testing.T) {
+		err := doConfig(t, coreConfig, fmt.Sprintf(`
+		ca_bundle_path = %q
+		max_intermediates = 20
+		`, s.rootCertPath))
+
+		require.NoError(t, err)
+	})
+
+	s.T().Run("custom max_rsa_key_size", func(t *testing.T) {
+		err := doConfig(t, coreConfig, fmt.Sprintf(`
+		ca_bundle_path = %q
+		max_rsa_key_size = 8192
+		`, s.rootCertPath))
+
+		require.NoError(t, err)
+	})
+
+	s.T().Run("invalid group_template", func(t *testing.T) {
+		err := doConfig(t, coreConfig, `
+		mode = "spiffe"
+		group_template = "{{ .Invalid"
+		allowed_groups = ["foo"]
+		`)
+		spiretest.RequireGRPCStatusContains(t, err, codes.InvalidArgument, "failed to parse group template")
+	})
+
+	s.T().Run("group_template without allowed_groups", func(t *testing.T) {
+		err := doConfig(t, coreConfig, `
+		mode = "spiffe"
+		group_template = "{{ .SVIDPathTrimmed }}"
+		`)
+		spiretest.RequireGRPCStatusContains(t, err, codes.InvalidArgument, "allowed_groups must be set when group_template is configured")
+	})
+
+	s.T().Run("invalid group_template reports the reason", func(t *testing.T) {
+		err := doConfig(t, coreConfig, `
+		mode = "spiffe"
+		group_template = "{{ .Invalid"
+		allowed_groups = ["foo"]
+		`)
+		spiretest.RequireGRPCStatusContains(t, err, codes.InvalidArgument, "unclosed action")
+	})
+
+	s.T().Run("allowed_groups without group_template", func(t *testing.T) {
+		err := doConfig(t, coreConfig, `
+		mode = "spiffe"
+		allowed_groups = ["foo"]
+		`)
+		spiretest.RequireGRPCStatusContains(t, err, codes.InvalidArgument, "group_template must be set when allowed_groups is configured")
+	})
+}
+
+func (s *Suite) TestGroupTemplateLogging() {
+	attest := func(t *testing.T, extraConfig string) ([]*logrus.Entry, error) {
+		log, hook := test.NewNullLogger()
+		log.SetLevel(logrus.DebugLevel)
+
+		attestor := s.loadPluginFull(t, s.createConfigurationModeSPIFFE(extraConfig), nil, plugintest.Log(log))
+		payload := marshal(t, &x509pop.AttestationData{Certificates: s.svidExchange})
+
+		_, err := attestor.Attest(context.Background(), payload, func(_ context.Context, challenge []byte) ([]byte, error) {
+			popChallenge := new(x509pop.Challenge)
+			unmarshal(t, challenge, popChallenge)
+			response, err := x509pop.CalculateResponse(s.leafKey, popChallenge)
+			require.NoError(t, err)
+			return marshal(t, response), nil
+		})
+		return hook.AllEntries(), err
+	}
+
+	requireLogged := func(t *testing.T, entries []*logrus.Entry, level logrus.Level, message string, containsField string) {
+		t.Helper()
+		for _, entry := range entries {
+			if entry.Message != message {
+				continue
+			}
+			require.Equal(t, level, entry.Level, "unexpected level for log entry %q", message)
+			if containsField != "" {
+				require.Contains(t, fmt.Sprint(entry.Data), containsField)
+			}
+			return
+		}
+		require.Failf(t, "log entry not found", "no entry with message %q in %v", message, entries)
+	}
+
+	s.T().Run("group not in the configured list", func(t *testing.T) {
+		entries, err := attest(t, `group_template = "{{ .SVIDPathTrimmed }}"`+"\n"+`allowed_groups = ["other"]`)
+		require.NoError(t, err)
+
+		spiretest.AssertLogsContainEntries(t, entries, []spiretest.LogEntry{
+			{
+				Level:   logrus.DebugLevel,
+				Message: "Group not in allowed_groups",
+				Data:    logrus.Fields{"group": "testhost"},
+			},
+		})
+	})
+
+	s.T().Run("template renders no group", func(t *testing.T) {
+		entries, err := attest(t, `group_template = "{{ if false }}unreachable{{ end }}"`+"\n"+`allowed_groups = ["testhost"]`)
+		require.NoError(t, err)
+
+		requireLogged(t, entries, logrus.DebugLevel, "Group template produced no group", "")
+	})
+
+	s.T().Run("template fails to execute", func(t *testing.T) {
+		entries, err := attest(t, `group_template = "{{ .URISanSelectors.nope }}"`+"\n"+`allowed_groups = ["testhost"]`)
+		require.NoError(t, err)
+
+		requireLogged(t, entries, logrus.DebugLevel, "Failed to execute group template", "map has no entry for key")
+	})
 }
 
 func (s *Suite) loadPlugin(t *testing.T, config string) nodeattestor.NodeAttestor {
+	return s.loadPluginFull(t, config, nil)
+}
+
+func (s *Suite) loadPluginFull(t *testing.T, config string, identityProvider *fakeidentityprovider.IdentityProvider, extraOptions ...plugintest.Option) nodeattestor.NodeAttestor {
 	v1 := new(nodeattestor.V1)
-	plugintest.Load(t, BuiltIn(), v1,
+
+	if identityProvider == nil {
+		caRaw, err := os.ReadFile(s.rootCertPath)
+		if err != nil {
+			return nil
+		}
+		ca, _ := pem.Decode(caRaw)
+
+		bundle := &plugintypes.Bundle{
+			X509Authorities: []*plugintypes.X509Certificate{
+				{Asn1: ca.Bytes},
+			},
+		}
+
+		identityProvider = fakeidentityprovider.New()
+		identityProvider.AppendBundle(bundle)
+	}
+	options := append([]plugintest.Option{
+		plugintest.HostServices(identityproviderv1.IdentityProviderServiceServer(identityProvider)),
 		plugintest.CoreConfig(catalog.CoreConfig{
 			TrustDomain: spiffeid.RequireTrustDomainFromString("example.org"),
 		}),
 		plugintest.Configure(config),
-	)
+	}, extraOptions...)
+	plugintest.Load(t, BuiltIn(), v1, options...)
 	return v1
 }
 
@@ -301,6 +687,13 @@ ca_bundle_paths = %s
 	return ""
 }
 
+func (s *Suite) createConfigurationModeSPIFFE(extraConfig string) string {
+	return fmt.Sprintf(`
+mode = "spiffe"
+%s
+`, extraConfig)
+}
+
 func marshal(t *testing.T, obj any) []byte {
 	data, err := json.Marshal(obj)
 	require.NoError(t, err)
@@ -313,4 +706,151 @@ func unmarshal(t *testing.T, data []byte, obj any) {
 
 func expectNoChallenge(context.Context, []byte) ([]byte, error) {
 	return nil, errors.New("challenge is not expected")
+}
+
+func (s *Suite) TestVerifyClientIP() {
+	clientIP := net.ParseIP("192.0.2.1")
+
+	makePayload := func(t *testing.T, certs [][]byte) []byte {
+		return marshal(t, &x509pop.AttestationData{Certificates: certs})
+	}
+
+	s.T().Run("client IP not available", func(t *testing.T) {
+		config := s.createConfiguration("ca_bundle_path", "verify_client_ip = true")
+		attestor := s.loadPlugin(t, config)
+		payload := makePayload(t, s.leafBundle)
+		challengeFn := func(ctx context.Context, challenge []byte) ([]byte, error) {
+			popChallenge := new(x509pop.Challenge)
+			unmarshal(t, challenge, popChallenge)
+			response, err := x509pop.CalculateResponse(s.leafKey, popChallenge)
+			require.NoError(t, err)
+			return marshal(t, response), nil
+		}
+		result, err := attestor.Attest(context.Background(), payload, challengeFn)
+		spiretest.RequireGRPCStatusContains(t, err, codes.Internal, "client IP not available for verification")
+		require.Nil(t, result)
+	})
+
+	s.T().Run("client IP does not match cert SAN", func(t *testing.T) {
+		config := s.createConfiguration("ca_bundle_path", "verify_client_ip = true")
+		attestor := s.loadPlugin(t, config)
+		payload := makePayload(t, s.leafBundle)
+		ctx := peer.NewContext(context.Background(), &peer.Peer{
+			Addr: &net.TCPAddr{IP: clientIP, Port: 12345},
+		})
+		challengeFn := func(ctx context.Context, challenge []byte) ([]byte, error) {
+			popChallenge := new(x509pop.Challenge)
+			unmarshal(t, challenge, popChallenge)
+			response, err := x509pop.CalculateResponse(s.leafKey, popChallenge)
+			require.NoError(t, err)
+			return marshal(t, response), nil
+		}
+		result, err := attestor.Attest(ctx, payload, challengeFn)
+		spiretest.RequireGRPCStatusContains(t, err, codes.PermissionDenied, "does not match any certificate IP SAN")
+		require.Nil(t, result)
+	})
+
+	s.T().Run("client IP matches cert SAN", func(t *testing.T) {
+		certChain, leafKey, rootCertPath := generateCertChainWithIPSAN(t, clientIP)
+		config := fmt.Sprintf("ca_bundle_path = %q\nverify_client_ip = true\n", rootCertPath)
+		attestor := s.loadPlugin(t, config)
+		payload := makePayload(t, certChain)
+		ctx := peer.NewContext(context.Background(), &peer.Peer{
+			Addr: &net.TCPAddr{IP: clientIP, Port: 12345},
+		})
+		challengeFn := func(ctx context.Context, challenge []byte) ([]byte, error) {
+			popChallenge := new(x509pop.Challenge)
+			unmarshal(t, challenge, popChallenge)
+			response, err := x509pop.CalculateResponse(leafKey, popChallenge)
+			require.NoError(t, err)
+			return marshal(t, response), nil
+		}
+		result, err := attestor.Attest(ctx, payload, challengeFn)
+		require.NoError(t, err)
+		require.NotNil(t, result)
+	})
+
+	s.T().Run("client IPv6 matches cert SAN", func(t *testing.T) {
+		ipv6 := net.ParseIP("2001:db8::1")
+		certChain, leafKey, rootCertPath := generateCertChainWithIPSAN(t, ipv6)
+		config := fmt.Sprintf("ca_bundle_path = %q\nverify_client_ip = true\n", rootCertPath)
+		attestor := s.loadPlugin(t, config)
+		payload := makePayload(t, certChain)
+		ctx := peer.NewContext(context.Background(), &peer.Peer{
+			Addr: &net.TCPAddr{IP: ipv6, Port: 12345},
+		})
+		challengeFn := func(ctx context.Context, challenge []byte) ([]byte, error) {
+			popChallenge := new(x509pop.Challenge)
+			unmarshal(t, challenge, popChallenge)
+			response, err := x509pop.CalculateResponse(leafKey, popChallenge)
+			require.NoError(t, err)
+			return marshal(t, response), nil
+		}
+		result, err := attestor.Attest(ctx, payload, challengeFn)
+		require.NoError(t, err)
+		require.NotNil(t, result)
+	})
+}
+
+func generateCertChainWithIPSAN(t *testing.T, ip net.IP) (certChain [][]byte, leafKey crypto.PrivateKey, rootCertPath string) {
+	t.Helper()
+
+	rootKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+
+	rootTemplate := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+	}
+	rootDER, err := x509.CreateCertificate(rand.Reader, rootTemplate, rootTemplate, &rootKey.PublicKey, rootKey)
+	require.NoError(t, err)
+	rootCert, err := x509.ParseCertificate(rootDER)
+	require.NoError(t, err)
+
+	leafKeyRSA, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+
+	leafTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		IPAddresses:  []net.IP{ip},
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, leafTemplate, rootCert, &leafKeyRSA.PublicKey, rootKey)
+	require.NoError(t, err)
+
+	rootPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: rootDER})
+	rootCertPath = filepath.Join(t.TempDir(), "root.pem")
+	require.NoError(t, os.WriteFile(rootCertPath, rootPEM, 0o600))
+
+	return [][]byte{leafDER}, leafKeyRSA, rootCertPath
+}
+
+func generateCertWithRSAKeySize(t *testing.T, keySize int) []byte {
+	// Generate RSA key with specified size
+	key, err := rsa.GenerateKey(rand.Reader, keySize)
+	require.NoError(t, err)
+
+	// Create a self-signed certificate template
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			CommonName: "Test Certificate",
+		},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+
+	// Create the certificate
+	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	require.NoError(t, err)
+
+	return certDER
 }

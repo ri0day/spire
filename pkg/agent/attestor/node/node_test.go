@@ -281,8 +281,6 @@ func TestAttestor(t *testing.T) {
 	}
 
 	for _, testCase := range testCases {
-		testCase := testCase
-
 		t.Run(testCase.name, func(t *testing.T) {
 			require := require.New(t)
 
@@ -319,16 +317,16 @@ func TestAttestor(t *testing.T) {
 			// create the attestor
 			log, _ := test.NewNullLogger()
 			attestor := attestor.New(&attestor.Config{
-				Catalog:           catalog,
-				Metrics:           telemetry.Blackhole{},
-				JoinToken:         testCase.agentService.joinToken,
-				Storage:           sto,
-				Log:               log,
-				TrustDomain:       trustDomain,
-				TrustBundle:       makeTrustBundle(testCase.bootstrapBundle),
-				InsecureBootstrap: testCase.insecureBootstrap,
-				ServerAddress:     listener.Addr().String(),
-				NodeAttestor:      agentNA,
+				Catalog:              catalog,
+				Metrics:              telemetry.Blackhole{},
+				JoinToken:            testCase.agentService.joinToken,
+				Storage:              sto,
+				Log:                  log,
+				TrustDomain:          trustDomain,
+				BootstrapTrustBundle: makeTrustBundle(testCase.bootstrapBundle),
+				InsecureBootstrap:    testCase.insecureBootstrap,
+				ServerAddress:        listener.Addr().String(),
+				NodeAttestor:         agentNA,
 			})
 
 			// perform attestation
@@ -527,7 +525,6 @@ func TestIsSVIDExpired(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.Desc, func(t *testing.T) {
 			isExpired := attestor.IsSVIDExpired(tt.SVID, func() time.Time { return now })
 			require.Equal(t, tt.ExpectExpired, isExpired)

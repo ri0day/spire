@@ -3,7 +3,6 @@ package sqlstore
 import (
 	"errors"
 	"fmt"
-	"math"
 	"strconv"
 
 	"github.com/blang/semver/v4"
@@ -11,6 +10,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/spiffe/spire/pkg/common/telemetry"
 	"github.com/spiffe/spire/pkg/common/version"
+	"github.com/spiffe/spire/pkg/server/datastore/sqlcommon"
 )
 
 // Each time the database requires a migration, the "schema" version is
@@ -216,20 +216,89 @@ import (
 // | v1.8.7  |        |                                                                           |
 // |---------|        |                                                                           |
 // | v1.8.8  |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.8.9  |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.8.10 |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.8.11 |        |                                                                           |
 // |*********|********|***************************************************************************|
 // | v1.9.0  |        |                                                                           |
 // |---------|        |                                                                           |
 // | v1.9.1  |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.9.2  |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.9.3  |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.9.4  |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.9.5  |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.9.6  |        |                                                                           |
+// |*********|********|***************************************************************************|
+// | v1.10.0 |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.10.1 |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.10.2 |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.10.3 |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.10.4 |        |                                                                           |
+// |*********|********|***************************************************************************|
+// | v1.11.0 |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.11.1 |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.11.2 |        |                                                                           |
+// |---------|        |                                                                           |
+// | v1.11.3 |        |                                                                           |
+// |*********|********|***************************************************************************|
+// | v1.12.0 |        |                                                                           |
+// | v1.12.1 |        |                                                                           |
+// | v1.12.2 |        |                                                                           |
+// | v1.12.3 |        |                                                                           |
+// | v1.12.4 |        |                                                                           |
+// | v1.12.5 |        |                                                                           |
+// | v1.12.6 |        |                                                                           |
+// |*********|********|***************************************************************************|
+// | v1.13.0 |        |                                                                           |
+// | v1.13.1 |        |                                                                           |
+// | v1.13.2 |        |                                                                           |
+// | v1.13.3 |        |                                                                           |
+// | v1.13.4 |        |                                                                           |
+// | v1.13.5 |        |                                                                           |
+// |*********|********|***************************************************************************|
+// | v1.14.0 |        |                                                                           |
+// | v1.14.1 |        |                                                                           |
+// | v1.14.2 |        |                                                                           |
+// | v1.14.3 | 24     | Added agent_version column to attested_node_entries                       |
+// | v1.14.4 |        |                                                                           |
+// | v1.14.5 |        |                                                                           |
+// | v1.14.6 |        |                                                                           |
+// | v1.14.7 |        |                                                                           |
+// | v1.14.8 |        |                                                                           |
+// |*********|********|***************************************************************************|
+// | v1.15.0 | 25     | Added additional_attributes column to registered_entries                  |
+// | v1.15.1 |        |                                                                           |
+// | v1.15.2 |        |                                                                           |
+// | v1.15.3 |        |                                                                           |
+// | v1.15.4 |        |                                                                           |
+// |*********|********|***************************************************************************|
+// | v1.16.0 | 26     | Added journal_id column to ca_journals                                    |
+// |         |--------|---------------------------------------------------------------------------|
+// |         | 27     | Added wit_svid_ttl column to registered_entries                           |
 // ================================================================================================
 
 const (
 	// the latest schema version of the database in the code
-	latestSchemaVersion = 23
+	latestSchemaVersion = 27
 
 	// lastMinorReleaseSchemaVersion is the schema version supported by the
 	// last minor release. When the migrations are opportunistically pruned
 	// from the code after a minor release, this number should be updated.
-	lastMinorReleaseSchemaVersion = 21
+	lastMinorReleaseSchemaVersion = 23
 )
 
 // the current code version
@@ -241,12 +310,12 @@ func migrateDB(db *gorm.DB, dbType string, disableMigration bool, log logrus.Fie
 	// version before continuing, and fail if we're not.
 	if codeVersion.Major > 1 {
 		log.Error("Migration code needs updating for current release version")
-		return sqlError.New("current migration code not compatible with current release version")
+		return sqlcommon.NewSQLError("current migration code not compatible with current release version")
 	}
 
 	isNew := !db.HasTable(&Migration{})
 	if err := db.Error; err != nil {
-		return sqlError.Wrap(err)
+		return sqlcommon.NewWrappedSQLError(err)
 	}
 
 	if isNew {
@@ -255,12 +324,12 @@ func migrateDB(db *gorm.DB, dbType string, disableMigration bool, log logrus.Fie
 
 	// ensure migrations table exists so we can check versioning in all cases
 	if err := db.AutoMigrate(&Migration{}).Error; err != nil {
-		return sqlError.Wrap(err)
+		return sqlcommon.NewWrappedSQLError(err)
 	}
 
 	migration := new(Migration)
 	if err := db.Assign(Migration{}).FirstOrCreate(migration).Error; err != nil {
-		return sqlError.Wrap(err)
+		return sqlcommon.NewWrappedSQLError(err)
 	}
 
 	schemaVersion := migration.Version
@@ -270,7 +339,7 @@ func migrateDB(db *gorm.DB, dbType string, disableMigration bool, log logrus.Fie
 	dbCodeVersion, err := getDBCodeVersion(*migration)
 	if err != nil {
 		log.WithError(err).Error("Error getting DB code version")
-		return sqlError.New("error getting DB code version: %v", err)
+		return sqlcommon.NewSQLError("error getting DB code version: %v", err)
 	}
 
 	log = log.WithField(telemetry.VersionInfo, dbCodeVersion.String())
@@ -286,7 +355,7 @@ func migrateDB(db *gorm.DB, dbType string, disableMigration bool, log logrus.Fie
 			}
 
 			if err := db.Model(&Migration{}).Updates(newMigration).Error; err != nil {
-				return sqlError.Wrap(err)
+				return sqlcommon.NewWrappedSQLError(err)
 			}
 		}
 		return nil
@@ -295,7 +364,7 @@ func migrateDB(db *gorm.DB, dbType string, disableMigration bool, log logrus.Fie
 	if disableMigration {
 		if err = isDisabledMigrationAllowed(codeVersion, dbCodeVersion); err != nil {
 			log.WithError(err).Error("Auto-migrate must be enabled")
-			return sqlError.Wrap(err)
+			return sqlcommon.NewWrappedSQLError(err)
 		}
 		return nil
 	}
@@ -306,7 +375,7 @@ func migrateDB(db *gorm.DB, dbType string, disableMigration bool, log logrus.Fie
 	if schemaVersion > latestSchemaVersion {
 		if !isCompatibleCodeVersion(codeVersion, dbCodeVersion) {
 			log.Error("Incompatible DB schema is too new for code version, upgrade SPIRE Server")
-			return sqlError.New("incompatible DB schema and code version")
+			return sqlcommon.NewSQLError("incompatible DB schema and code version")
 		}
 		log.Warn("DB schema is ahead of code version, upgrading SPIRE Server is recommended")
 		return nil
@@ -320,7 +389,7 @@ func migrateDB(db *gorm.DB, dbType string, disableMigration bool, log logrus.Fie
 	for schemaVersion < latestSchemaVersion {
 		tx := db.Begin()
 		if err := tx.Error; err != nil {
-			return sqlError.Wrap(err)
+			return sqlcommon.NewWrappedSQLError(err)
 		}
 		schemaVersion, err = migrateVersion(tx, schemaVersion, log)
 		if err != nil {
@@ -328,7 +397,7 @@ func migrateDB(db *gorm.DB, dbType string, disableMigration bool, log logrus.Fie
 			return err
 		}
 		if err := tx.Commit().Error; err != nil {
-			return sqlError.Wrap(err)
+			return sqlcommon.NewWrappedSQLError(err)
 		}
 	}
 
@@ -337,7 +406,7 @@ func migrateDB(db *gorm.DB, dbType string, disableMigration bool, log logrus.Fie
 }
 
 func isDisabledMigrationAllowed(thisCodeVersion, dbCodeVersion semver.Version) error {
-	// If auto-migrate is disabled and we are running a compatible version (+/- 1
+	// If auto-migrate is disabled, and we are running a compatible version (+/- 1
 	// minor from the stored code version) then we are done here
 	if !isCompatibleCodeVersion(thisCodeVersion, dbCodeVersion) {
 		return errors.New("auto-migration must be enabled for current DB")
@@ -359,19 +428,16 @@ func getDBCodeVersion(migration Migration) (dbCodeVersion semver.Version, err er
 }
 
 func isCompatibleCodeVersion(thisCodeVersion, dbCodeVersion semver.Version) bool {
-	// If major version is the same and minor version is +/- 1, versions are
-	// compatible
-	if dbCodeVersion.Major != thisCodeVersion.Major || (math.Abs(float64(int64(dbCodeVersion.Minor)-int64(thisCodeVersion.Minor))) > 1) {
-		return false
-	}
-	return true
+	// If major version is the same and minor version is +/- 1, versions are compatible
+	minMinor, maxMinor := min(dbCodeVersion.Minor, thisCodeVersion.Minor), max(dbCodeVersion.Minor, thisCodeVersion.Minor)
+	return dbCodeVersion.Major == thisCodeVersion.Major && (minMinor == maxMinor || minMinor+1 == maxMinor)
 }
 
 func initDB(db *gorm.DB, dbType string, log logrus.FieldLogger) (err error) {
 	log.Info("Initializing new database")
 	tx := db.Begin()
 	if err := tx.Error; err != nil {
-		return sqlError.Wrap(err)
+		return sqlcommon.NewWrappedSQLError(err)
 	}
 
 	tables := []any{
@@ -391,7 +457,7 @@ func initDB(db *gorm.DB, dbType string, log logrus.FieldLogger) (err error) {
 
 	if err := tableOptionsForDialect(tx, dbType).AutoMigrate(tables...).Error; err != nil {
 		tx.Rollback()
-		return sqlError.Wrap(err)
+		return sqlcommon.NewWrappedSQLError(err)
 	}
 
 	if err := tx.Assign(Migration{
@@ -399,7 +465,7 @@ func initDB(db *gorm.DB, dbType string, log logrus.FieldLogger) (err error) {
 		CodeVersion: codeVersion.String(),
 	}).FirstOrCreate(&Migration{}).Error; err != nil {
 		tx.Rollback()
-		return sqlError.Wrap(err)
+		return sqlcommon.NewWrappedSQLError(err)
 	}
 
 	if err := addFederatedRegistrationEntriesRegisteredEntryIDIndex(tx); err != nil {
@@ -407,7 +473,7 @@ func initDB(db *gorm.DB, dbType string, log logrus.FieldLogger) (err error) {
 	}
 
 	if err := tx.Commit().Error; err != nil {
-		return sqlError.Wrap(err)
+		return sqlcommon.NewWrappedSQLError(err)
 	}
 
 	return nil
@@ -417,7 +483,7 @@ func tableOptionsForDialect(tx *gorm.DB, dbType string) *gorm.DB {
 	// This allows for setting table options for a particular DB type.
 	// For MySQL, (for compatibility reasons) we want to make sure that
 	// we can support indexes on strings (varchar(255) in the DB).
-	if isMySQLDbType(dbType) {
+	if sqlcommon.IsMySQLDbType(dbType) {
 		return tx.Set("gorm:table_options", "ENGINE=InnoDB  ROW_FORMAT=DYNAMIC DEFAULT CHARSET=utf8")
 	}
 	return tx
@@ -431,25 +497,43 @@ func migrateVersion(tx *gorm.DB, currVersion int, log logrus.FieldLogger) (versi
 		Version:     nextVersion,
 		CodeVersion: version.Version(),
 	}).Error; err != nil {
-		return 0, sqlError.Wrap(err)
+		return 0, sqlcommon.NewWrappedSQLError(err)
 	}
 
 	if currVersion < lastMinorReleaseSchemaVersion {
-		return 0, sqlError.New("migrating from schema version %d requires a previous SPIRE release; please follow the upgrade strategy at doc/upgrading.md", currVersion)
+		return 0, sqlcommon.NewSQLError("migrating from schema version %d requires a previous SPIRE release; please follow the upgrade strategy at doc/upgrading.md", currVersion)
 	}
 
 	// Place all migrations handled by the current minor release here. This
 	// list can be opportunistically pruned after every minor release but won't
 	// break things if it isn't.
+	//
+	// When adding a supported migration to version XX, add a case and the
+	// corresponding function. The case in the following switch statement will
+	// look like this:
+	//
+	// case XX:
+	//   err = migrateToVXX(tx)
+	//
+	// And the migrateToVXX function will be like this:
+	// func migrateToVXX(tx *gorm.DB) error {
+	//   if err := tx.AutoMigrate(&Foo{}, &Bar{}).Error; err != nil {
+	//     return sqlcommon.NewWrappedSQLError(err)
+	//   }
+	//   return nil
+	// }
+	//
 	switch currVersion {
-	case 21:
-		// TODO: remove this migration in 1.9.0
-		err = migrateToV22(tx)
-	case 22:
-		// TODO: remove this migration in 1.9.0
-		err = migrateToV23(tx)
+	case 23:
+		err = migrateToV24(tx)
+	case 24:
+		err = migrateToV25(tx)
+	case 25:
+		err = migrateToV26(tx)
+	case 26:
+		err = migrateToV27(tx)
 	default:
-		err = sqlError.New("no migration support for unknown schema version %d", currVersion)
+		err = sqlcommon.NewSQLError("no migration support for unknown schema version %d", currVersion)
 	}
 	if err != nil {
 		return 0, err
@@ -458,16 +542,34 @@ func migrateVersion(tx *gorm.DB, currVersion int, log logrus.FieldLogger) (versi
 	return nextVersion, nil
 }
 
-func migrateToV22(tx *gorm.DB) error {
-	if err := tx.AutoMigrate(&RegisteredEntryEvent{}, &AttestedNodeEvent{}).Error; err != nil {
-		return sqlError.Wrap(err)
+func migrateToV24(tx *gorm.DB) error {
+	// Add agent_version column to attested_node_entries table
+	if err := tx.AutoMigrate(&AttestedNode{}).Error; err != nil {
+		return sqlcommon.NewWrappedSQLError(err)
 	}
 	return nil
 }
 
-func migrateToV23(tx *gorm.DB) error {
+func migrateToV25(tx *gorm.DB) error {
+	// Add additional_attributes column to registered_entries table
+	if err := tx.AutoMigrate(&RegisteredEntry{}).Error; err != nil {
+		return sqlcommon.NewWrappedSQLError(err)
+	}
+	return nil
+}
+
+func migrateToV26(tx *gorm.DB) error {
+	// Add journal_id column to ca_journals table.
 	if err := tx.AutoMigrate(&CAJournal{}).Error; err != nil {
-		return sqlError.Wrap(err)
+		return sqlcommon.NewWrappedSQLError(err)
+	}
+	return nil
+}
+
+func migrateToV27(tx *gorm.DB) error {
+	// Add wit_svid_ttl column to registered_entries table
+	if err := tx.AutoMigrate(&RegisteredEntry{}).Error; err != nil {
+		return sqlcommon.NewWrappedSQLError(err)
 	}
 	return nil
 }
@@ -480,7 +582,7 @@ func addFederatedRegistrationEntriesRegisteredEntryIDIndex(tx *gorm.DB) error {
 	// to introduce the index since there is no explicit struct to add tags to
 	// so we have to manually create it.
 	if err := tx.Table("federated_registration_entries").AddIndex("idx_federated_registration_entries_registered_entry_id", "registered_entry_id").Error; err != nil {
-		return sqlError.Wrap(err)
+		return sqlcommon.NewWrappedSQLError(err)
 	}
 	return nil
 }

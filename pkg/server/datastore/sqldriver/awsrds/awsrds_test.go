@@ -6,6 +6,11 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,9 +22,14 @@ import (
 
 const (
 	fakeSQLDriverName  = "fake-sql-driver"
-	token              = "aws-rds-host:1234?Action=connect&DBUser=test_user&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=TESTTESTTESTTESTTEST%2F20240116%2Fus-east-2%2Frds-db%2Faws4_request&X-Amz-Date=20240116T150146Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" //nolint: gosec // for testing
+	token              = "aws-rds-host:1234?Action=connect&DBUser=test_user&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=TESTTESTTESTTESTTEST%2F20240116%2Fus-east-2%2Frds-db%2Faws4_request&X-Amz-Date=20240116T150146Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 	mysqlConnString    = "test_user:@tcp(aws-rds-host:1234)/spire?parseTime=true&allowCleartextPasswords=1&tls=true"
 	postgresConnString = "dbname=postgres user=postgres host=the-host sslmode=require"
+
+	imdsToken          = "imds-session-token"
+	imdsTokenHeader    = "X-aws-ec2-metadata-token"
+	imdsTokenTTLHeader = "X-aws-ec2-metadata-token-ttl-seconds"
+	imdsRole           = "spire-server-role"
 )
 
 var (
@@ -210,7 +220,7 @@ func TestAWSRDS(t *testing.T) {
 			tokenProvider: &fakeTokenBuilder{
 				authToken: token,
 			},
-			expectedError: "could not parse connection string: cannot parse `not-valid!`: failed to parse as DSN (invalid dsn)",
+			expectedError: "could not parse connection string: cannot parse `not-valid!`: failed to parse as keyword/value (invalid keyword/value)",
 		},
 		{
 			name: "postgres - success with static credentials",
@@ -270,11 +280,12 @@ func TestCacheToken(t *testing.T) {
 	dsn, err := config.FormatDSN()
 	require.NoError(t, err)
 
-	now := time.Now().UTC()
-	nowString := now.Format(iso8601BasicFormat)
+	initialTime := time.Now().UTC()
+	nowString := initialTime.Format(iso8601BasicFormat)
+	ttl := 900
 
 	// Set a first token to be always returned by the token builder.
-	firstToken := fmt.Sprintf("X-Amz-Date=%s&X-Amz-Expires=900&X-Amz-Signature=first-token", nowString)
+	firstToken := fmt.Sprintf("X-Amz-Date=%s&X-Amz-Expires=%d&X-Amz-Signature=first-token", nowString, ttl)
 	fakeSQLDriverWrapper.tokenBuilder = &fakeTokenBuilder{
 		authToken: firstToken,
 	}
@@ -299,10 +310,14 @@ func TestCacheToken(t *testing.T) {
 	// token (not expired) that we can use. For that, we start by setting a new
 	// token that will be returned by the token builder when getAWSAuthToken is
 	// called.
-	newToken := fmt.Sprintf("X-Amz-Date=%s&X-Amz-Expires=900&X-Amz-Signature=second-token", nowString)
+
+	newToken := fmt.Sprintf("X-Amz-Date=%s&X-Amz-Expires=%d&X-Amz-Signature=second-token", nowString, ttl)
 	fakeSQLDriverWrapper.tokenBuilder = &fakeTokenBuilder{
 		authToken: newToken,
 	}
+
+	// Advance the clock just a few seconds.
+	nowFunc = func() time.Time { return initialTime.Add(time.Second * 15) }
 
 	// Call Open again, the cached token should be used.
 	db, err = gorm.Open(fakeSQLDriverName, dsn)
@@ -318,8 +333,14 @@ func TestCacheToken(t *testing.T) {
 
 	// We will now make firstToken to expire, so we can test that the token
 	// builder is called to get a new token when the current token has expired.
-	// For that, we advance the clock one hour.
-	nowFunc = func() time.Time { return now.Add(time.Hour) }
+	// For that, we advance the clock the number of seconds of the ttl of the
+	// token.
+	newTime := initialTime.Add(time.Second * time.Duration(ttl))
+
+	// nowFunc will subtract the clock skew from the new time, to make sure
+	// that we get a new token even if it's not expired, but it's within the
+	// clock skew period.
+	nowFunc = func() time.Time { return newTime.Add(-clockSkew) }
 
 	// Call Open again, the new token should be used.
 	db, err = gorm.Open(fakeSQLDriverName, dsn)
@@ -332,6 +353,60 @@ func TestCacheToken(t *testing.T) {
 
 	// The token retrieved should be the new token.
 	require.Equal(t, newToken, token)
+}
+
+func TestNewAWSClientConfigUsesIMDSv2(t *testing.T) {
+	// Instance metadata must be the only credential source that the default
+	// chain can resolve for this test to exercise IMDS, so every AWS_ variable
+	// the SDK might read is cleared before the ones this test needs are set.
+	for _, entry := range os.Environ() {
+		name, _, _ := strings.Cut(entry, "=")
+		if strings.HasPrefix(name, "AWS_") {
+			t.Setenv(name, "")
+		}
+	}
+	missingFile := filepath.Join(t.TempDir(), "missing")
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", missingFile)
+	t.Setenv("AWS_CONFIG_FILE", missingFile)
+
+	// Fake instance metadata service that requires IMDSv2, rejecting any
+	// request that does not carry a session token.
+	var unauthenticatedRequests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut && r.URL.Path == "/latest/api/token" {
+			w.Header().Set(imdsTokenTTLHeader, r.Header.Get(imdsTokenTTLHeader))
+			_, _ = w.Write([]byte(imdsToken))
+			return
+		}
+
+		if r.Header.Get(imdsTokenHeader) != imdsToken {
+			unauthenticatedRequests++
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+
+		switch r.URL.Path {
+		case "/latest/meta-data/iam/security-credentials/":
+			_, _ = w.Write([]byte(imdsRole))
+		case "/latest/meta-data/iam/security-credentials/" + imdsRole:
+			_, _ = w.Write([]byte(`{"Code":"Success","Type":"AWS-HMAC","AccessKeyId":"ACCESSKEYID","SecretAccessKey":"secretaccesskey","Token":"sessiontoken","Expiration":"2100-01-01T00:00:00Z"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	t.Setenv("AWS_EC2_METADATA_SERVICE_ENDPOINT", server.URL)
+
+	ctx := context.Background()
+	awsClientConfig, err := newAWSClientConfig(ctx, &Config{Region: "us-east-2"})
+	require.NoError(t, err)
+
+	credentials, err := awsClientConfig.Credentials.Retrieve(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "ACCESSKEYID", credentials.AccessKeyID)
+	require.Equal(t, "secretaccesskey", credentials.SecretAccessKey)
+	require.Equal(t, "sessiontoken", credentials.SessionToken)
+	require.Zero(t, unauthenticatedRequests)
 }
 
 func TestFormatDSN(t *testing.T) {

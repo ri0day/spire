@@ -62,6 +62,17 @@ func (m *Mock) WaitForAfterCh() <-chan time.Duration {
 	return m.afterC
 }
 
+// SleepCh returns the channel that Sleep notifies when a sleep begins,
+// carrying the sleep duration. The notification is a non-blocking send on a
+// buffered channel, so it can be dropped if a previous one has not been
+// drained. Drive a Sleep-based retry loop by receiving each notification and
+// advancing the clock by its duration before the next Sleep can begin: that
+// keeps at most one sleep outstanding (so nothing is dropped) and avoids
+// coupling to the number of sleeps.
+func (m *Mock) SleepCh() <-chan time.Duration {
+	return m.sleepC
+}
+
 // WaitForTimer waits up to the specified timeout for Timer to be called on the clock.
 func (m *Mock) WaitForTimer(timeout time.Duration, format string, args ...any) {
 	select {
@@ -85,13 +96,13 @@ func (m *Mock) WaitForTicker(timeout time.Duration, format string, args ...any) 
 	m.WaitForTickerMulti(timeout, 1, format, args...)
 }
 
-func (m *Mock) WaitForTickerMulti(timeout time.Duration, count int, format string, args ...any) {
+func (m *Mock) WaitForTickerMulti(timeout time.Duration, count int32, format string, args ...any) {
 	deadlineChan := time.After(timeout)
 	for {
 		select {
 		case <-m.tickerC:
-			if m.tickerCount.Load() >= int32(count) {
-				m.tickerCount.Add(-1 * int32(count))
+			if m.tickerCount.Load() >= count {
+				m.tickerCount.Add(-1 * count)
 				return
 			}
 		case <-deadlineChan:

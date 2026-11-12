@@ -3,11 +3,13 @@ package bundle
 import (
 	"context"
 	"fmt"
+	"maps"
 
 	"github.com/sirupsen/logrus"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	bundlev1 "github.com/spiffe/spire-api-sdk/proto/spire/api/server/bundle/v1"
 	"github.com/spiffe/spire-api-sdk/proto/spire/api/types"
+	commonapi "github.com/spiffe/spire/pkg/common/api"
 	"github.com/spiffe/spire/pkg/common/telemetry"
 	"github.com/spiffe/spire/pkg/server/api"
 	"github.com/spiffe/spire/pkg/server/api/rpccontext"
@@ -22,14 +24,7 @@ import (
 // UpstreamPublisher defines the publisher interface.
 type UpstreamPublisher interface {
 	PublishJWTKey(ctx context.Context, jwtKey *common.PublicKey) ([]*common.PublicKey, error)
-}
-
-// UpstreamPublisherFunc defines the function.
-type UpstreamPublisherFunc func(ctx context.Context, jwtKey *common.PublicKey) ([]*common.PublicKey, error)
-
-// PublishJWTKey publishes the JWT key with the given function.
-func (fn UpstreamPublisherFunc) PublishJWTKey(ctx context.Context, jwtKey *common.PublicKey) ([]*common.PublicKey, error) {
-	return fn(ctx, jwtKey)
+	PublishWITKey(ctx context.Context, witKey *common.PublicKey) ([]*common.PublicKey, error)
 }
 
 // Config defines the bundle service configuration.
@@ -67,7 +62,7 @@ func (s *Service) CountBundles(ctx context.Context, _ *bundlev1.CountBundlesRequ
 	count, err := s.ds.CountBundles(ctx)
 	if err != nil {
 		log := rpccontext.Logger(ctx)
-		return nil, api.MakeErr(log, codes.Internal, "failed to count bundles", err)
+		return nil, commonapi.MakeErr(log, codes.Internal, "failed to count bundles", err)
 	}
 	rpccontext.AuditRPC(ctx)
 
@@ -81,16 +76,16 @@ func (s *Service) GetBundle(ctx context.Context, req *bundlev1.GetBundleRequest)
 
 	commonBundle, err := s.ds.FetchBundle(dscache.WithCache(ctx), s.td.IDString())
 	if err != nil {
-		return nil, api.MakeErr(log, codes.Internal, "failed to fetch bundle", err)
+		return nil, commonapi.MakeErr(log, codes.Internal, "failed to fetch bundle", err)
 	}
 
 	if commonBundle == nil {
-		return nil, api.MakeErr(log, codes.NotFound, "bundle not found", nil)
+		return nil, commonapi.MakeErr(log, codes.NotFound, "bundle not found", nil)
 	}
 
 	bundle, err := api.BundleToProto(commonBundle)
 	if err != nil {
-		return nil, api.MakeErr(log, codes.Internal, "failed to convert bundle", err)
+		return nil, commonapi.MakeErr(log, codes.Internal, "failed to convert bundle", err)
 	}
 
 	applyBundleMask(bundle, req.OutputMask)
@@ -102,13 +97,9 @@ func (s *Service) GetBundle(ctx context.Context, req *bundlev1.GetBundleRequest)
 func (s *Service) AppendBundle(ctx context.Context, req *bundlev1.AppendBundleRequest) (*types.Bundle, error) {
 	parseRequest := func() logrus.Fields {
 		fields := logrus.Fields{}
-		for k, v := range api.FieldsFromJwtAuthoritiesProto(req.JwtAuthorities) {
-			fields[k] = v
-		}
+		maps.Copy(fields, api.FieldsFromJwtAuthoritiesProto(req.JwtAuthorities))
 
-		for k, v := range api.FieldsFromX509AuthoritiesProto(req.X509Authorities) {
-			fields[k] = v
-		}
+		maps.Copy(fields, api.FieldsFromX509AuthoritiesProto(req.X509Authorities))
 
 		return fields
 	}
@@ -117,19 +108,19 @@ func (s *Service) AppendBundle(ctx context.Context, req *bundlev1.AppendBundleRe
 	log := rpccontext.Logger(ctx)
 
 	if len(req.JwtAuthorities) == 0 && len(req.X509Authorities) == 0 {
-		return nil, api.MakeErr(log, codes.InvalidArgument, "no authorities to append", nil)
+		return nil, commonapi.MakeErr(log, codes.InvalidArgument, "no authorities to append", nil)
 	}
 
 	log = log.WithField(telemetry.TrustDomainID, s.td.Name())
 
 	jwtAuth, err := api.ParseJWTAuthorities(req.JwtAuthorities)
 	if err != nil {
-		return nil, api.MakeErr(log, codes.InvalidArgument, "failed to convert JWT authority", err)
+		return nil, commonapi.MakeErr(log, codes.InvalidArgument, "failed to convert JWT authority", err)
 	}
 
 	x509Auth, err := api.ParseX509Authorities(req.X509Authorities)
 	if err != nil {
-		return nil, api.MakeErr(log, codes.InvalidArgument, "failed to convert X.509 authority", err)
+		return nil, commonapi.MakeErr(log, codes.InvalidArgument, "failed to convert X.509 authority", err)
 	}
 
 	dsBundle, err := s.ds.AppendBundle(ctx, &common.Bundle{
@@ -138,12 +129,12 @@ func (s *Service) AppendBundle(ctx context.Context, req *bundlev1.AppendBundleRe
 		RootCas:        x509Auth,
 	})
 	if err != nil {
-		return nil, api.MakeErr(log, codes.Internal, "failed to append bundle", err)
+		return nil, commonapi.MakeErr(log, codes.Internal, "failed to append bundle", err)
 	}
 
 	bundle, err := api.BundleToProto(dsBundle)
 	if err != nil {
-		return nil, api.MakeErr(log, codes.Internal, "failed to convert bundle", err)
+		return nil, commonapi.MakeErr(log, codes.Internal, "failed to convert bundle", err)
 	}
 
 	applyBundleMask(bundle, req.OutputMask)
@@ -166,26 +157,64 @@ func (s *Service) PublishJWTAuthority(ctx context.Context, req *bundlev1.Publish
 	log := rpccontext.Logger(ctx)
 
 	if err := rpccontext.RateLimit(ctx, 1); err != nil {
-		return nil, api.MakeErr(log, status.Code(err), "rejecting request due to key publishing rate limiting", err)
+		return nil, commonapi.MakeErr(log, status.Code(err), "rejecting request due to key publishing rate limiting", err)
 	}
 
 	if req.JwtAuthority == nil {
-		return nil, api.MakeErr(log, codes.InvalidArgument, "missing JWT authority", nil)
+		return nil, commonapi.MakeErr(log, codes.InvalidArgument, "missing JWT authority", nil)
 	}
 
 	keys, err := api.ParseJWTAuthorities([]*types.JWTKey{req.JwtAuthority})
 	if err != nil {
-		return nil, api.MakeErr(log, codes.InvalidArgument, "invalid JWT authority", err)
+		return nil, commonapi.MakeErr(log, codes.InvalidArgument, "invalid JWT authority", err)
 	}
 
 	resp, err := s.up.PublishJWTKey(ctx, keys[0])
 	if err != nil {
-		return nil, api.MakeErr(log, codes.Internal, "failed to publish JWT key", err)
+		return nil, commonapi.MakeErr(log, codes.Internal, "failed to publish JWT key", err)
 	}
 	rpccontext.AuditRPC(ctx)
 
 	return &bundlev1.PublishJWTAuthorityResponse{
-		JwtAuthorities: api.PublicKeysToProto(resp),
+		JwtAuthorities: api.PublicKeysToJWTKeys(resp),
+	}, nil
+}
+
+// PublishWITAuthority published the WIT key on the server.
+func (s *Service) PublishWITAuthority(ctx context.Context, req *bundlev1.PublishWITAuthorityRequest) (*bundlev1.PublishWITAuthorityResponse, error) {
+	parseRequest := func() logrus.Fields {
+		fields := logrus.Fields{}
+		if req.WitAuthority != nil {
+			fields[telemetry.WITAuthorityExpiresAt] = req.WitAuthority.ExpiresAt
+			fields[telemetry.WITAuthorityKeyID] = req.WitAuthority.KeyId
+			fields[telemetry.WITAuthorityPublicKeySHA256] = api.HashByte(req.WitAuthority.PublicKey)
+		}
+		return fields
+	}
+	rpccontext.AddRPCAuditFields(ctx, parseRequest())
+	log := rpccontext.Logger(ctx)
+
+	if err := rpccontext.RateLimit(ctx, 1); err != nil {
+		return nil, commonapi.MakeErr(log, status.Code(err), "rejecting request due to key publishing rate limiting", err)
+	}
+
+	if req.WitAuthority == nil {
+		return nil, commonapi.MakeErr(log, codes.InvalidArgument, "missing WIT authority", nil)
+	}
+
+	keys, err := api.ParseWITAuthorities([]*types.WITKey{req.WitAuthority})
+	if err != nil {
+		return nil, commonapi.MakeErr(log, codes.InvalidArgument, "invalid WIT authority", err)
+	}
+
+	resp, err := s.up.PublishWITKey(ctx, keys[0])
+	if err != nil {
+		return nil, commonapi.MakeErr(log, codes.Internal, "failed to publish WIT key", err)
+	}
+	rpccontext.AuditRPC(ctx)
+
+	return &bundlev1.PublishWITAuthorityResponse{
+		WitAuthorities: api.PublicKeysToWITKeys(resp),
 	}, nil
 }
 
@@ -205,7 +234,7 @@ func (s *Service) ListFederatedBundles(ctx context.Context, req *bundlev1.ListFe
 
 	dsResp, err := s.ds.ListBundles(ctx, listReq)
 	if err != nil {
-		return nil, api.MakeErr(log, codes.Internal, "failed to list bundles", err)
+		return nil, commonapi.MakeErr(log, codes.Internal, "failed to list bundles", err)
 	}
 
 	resp := &bundlev1.ListFederatedBundlesResponse{}
@@ -218,7 +247,7 @@ func (s *Service) ListFederatedBundles(ctx context.Context, req *bundlev1.ListFe
 		log = log.WithField(telemetry.TrustDomainID, commonBundle.TrustDomainId)
 		td, err := spiffeid.TrustDomainFromString(commonBundle.TrustDomainId)
 		if err != nil {
-			return nil, api.MakeErr(log, codes.Internal, "bundle has an invalid trust domain ID", err)
+			return nil, commonapi.MakeErr(log, codes.Internal, "bundle has an invalid trust domain ID", err)
 		}
 
 		// Filter server bundle
@@ -228,7 +257,7 @@ func (s *Service) ListFederatedBundles(ctx context.Context, req *bundlev1.ListFe
 
 		b, err := api.BundleToProto(commonBundle)
 		if err != nil {
-			return nil, api.MakeErr(log, codes.Internal, "failed to convert bundle", err)
+			return nil, commonapi.MakeErr(log, codes.Internal, "failed to convert bundle", err)
 		}
 		applyBundleMask(b, req.OutputMask)
 		resp.Bundles = append(resp.Bundles, b)
@@ -245,25 +274,25 @@ func (s *Service) GetFederatedBundle(ctx context.Context, req *bundlev1.GetFeder
 
 	td, err := spiffeid.TrustDomainFromString(req.TrustDomain)
 	if err != nil {
-		return nil, api.MakeErr(log, codes.InvalidArgument, "trust domain argument is not valid", err)
+		return nil, commonapi.MakeErr(log, codes.InvalidArgument, "trust domain argument is not valid", err)
 	}
 
 	if s.td.Compare(td) == 0 {
-		return nil, api.MakeErr(log, codes.InvalidArgument, "getting a federated bundle for the server's own trust domain is not allowed", nil)
+		return nil, commonapi.MakeErr(log, codes.InvalidArgument, "getting a federated bundle for the server's own trust domain is not allowed", nil)
 	}
 
 	commonBundle, err := s.ds.FetchBundle(ctx, td.IDString())
 	if err != nil {
-		return nil, api.MakeErr(log, codes.Internal, "failed to fetch bundle", err)
+		return nil, commonapi.MakeErr(log, codes.Internal, "failed to fetch bundle", err)
 	}
 
 	if commonBundle == nil {
-		return nil, api.MakeErr(log, codes.NotFound, "bundle not found", nil)
+		return nil, commonapi.MakeErr(log, codes.NotFound, "bundle not found", nil)
 	}
 
 	bundle, err := api.BundleToProto(commonBundle)
 	if err != nil {
-		return nil, api.MakeErr(log, codes.Internal, "failed to convert bundle", err)
+		return nil, commonapi.MakeErr(log, codes.Internal, "failed to convert bundle", err)
 	}
 
 	applyBundleMask(bundle, req.OutputMask)
@@ -295,20 +324,20 @@ func (s *Service) createFederatedBundle(ctx context.Context, b *types.Bundle, ou
 	td, err := spiffeid.TrustDomainFromString(b.TrustDomain)
 	if err != nil {
 		return &bundlev1.BatchCreateFederatedBundleResponse_Result{
-			Status: api.MakeStatus(log, codes.InvalidArgument, "trust domain argument is not valid", err),
+			Status: commonapi.MakeStatus(log, codes.InvalidArgument, "trust domain argument is not valid", err),
 		}
 	}
 
 	if s.td.Compare(td) == 0 {
 		return &bundlev1.BatchCreateFederatedBundleResponse_Result{
-			Status: api.MakeStatus(log, codes.InvalidArgument, "creating a federated bundle for the server's own trust domain is not allowed", nil),
+			Status: commonapi.MakeStatus(log, codes.InvalidArgument, "creating a federated bundle for the server's own trust domain is not allowed", nil),
 		}
 	}
 
 	commonBundle, err := api.ProtoToBundle(b)
 	if err != nil {
 		return &bundlev1.BatchCreateFederatedBundleResponse_Result{
-			Status: api.MakeStatus(log, codes.InvalidArgument, "failed to convert bundle", err),
+			Status: commonapi.MakeStatus(log, codes.InvalidArgument, "failed to convert bundle", err),
 		}
 	}
 
@@ -317,18 +346,18 @@ func (s *Service) createFederatedBundle(ctx context.Context, b *types.Bundle, ou
 	case codes.OK:
 	case codes.AlreadyExists:
 		return &bundlev1.BatchCreateFederatedBundleResponse_Result{
-			Status: api.MakeStatus(log, codes.AlreadyExists, "bundle already exists", nil),
+			Status: commonapi.MakeStatus(log, codes.AlreadyExists, "bundle already exists", nil),
 		}
 	default:
 		return &bundlev1.BatchCreateFederatedBundleResponse_Result{
-			Status: api.MakeStatus(log, codes.Internal, "unable to create bundle", err),
+			Status: commonapi.MakeStatus(log, codes.Internal, "unable to create bundle", err),
 		}
 	}
 
 	protoBundle, err := api.BundleToProto(cb)
 	if err != nil {
 		return &bundlev1.BatchCreateFederatedBundleResponse_Result{
-			Status: api.MakeStatus(log, codes.Internal, "failed to convert bundle", err),
+			Status: commonapi.MakeStatus(log, codes.Internal, "failed to convert bundle", err),
 		}
 	}
 
@@ -336,7 +365,7 @@ func (s *Service) createFederatedBundle(ctx context.Context, b *types.Bundle, ou
 
 	log.Debug("Federated bundle created")
 	return &bundlev1.BatchCreateFederatedBundleResponse_Result{
-		Status: api.OK(),
+		Status: commonapi.OK(),
 		Bundle: protoBundle,
 	}
 }
@@ -347,41 +376,41 @@ func (s *Service) setFederatedBundle(ctx context.Context, b *types.Bundle, outpu
 	td, err := spiffeid.TrustDomainFromString(b.TrustDomain)
 	if err != nil {
 		return &bundlev1.BatchSetFederatedBundleResponse_Result{
-			Status: api.MakeStatus(log, codes.InvalidArgument, "trust domain argument is not valid", err),
+			Status: commonapi.MakeStatus(log, codes.InvalidArgument, "trust domain argument is not valid", err),
 		}
 	}
 
 	if s.td.Compare(td) == 0 {
 		return &bundlev1.BatchSetFederatedBundleResponse_Result{
-			Status: api.MakeStatus(log, codes.InvalidArgument, "setting a federated bundle for the server's own trust domain is not allowed", nil),
+			Status: commonapi.MakeStatus(log, codes.InvalidArgument, "setting a federated bundle for the server's own trust domain is not allowed", nil),
 		}
 	}
 
 	commonBundle, err := api.ProtoToBundle(b)
 	if err != nil {
 		return &bundlev1.BatchSetFederatedBundleResponse_Result{
-			Status: api.MakeStatus(log, codes.InvalidArgument, "failed to convert bundle", err),
+			Status: commonapi.MakeStatus(log, codes.InvalidArgument, "failed to convert bundle", err),
 		}
 	}
 	dsBundle, err := s.ds.SetBundle(ctx, commonBundle)
 
 	if err != nil {
 		return &bundlev1.BatchSetFederatedBundleResponse_Result{
-			Status: api.MakeStatus(log, codes.Internal, "failed to set bundle", err),
+			Status: commonapi.MakeStatus(log, codes.Internal, "failed to set bundle", err),
 		}
 	}
 
 	protoBundle, err := api.BundleToProto(dsBundle)
 	if err != nil {
 		return &bundlev1.BatchSetFederatedBundleResponse_Result{
-			Status: api.MakeStatus(log, codes.Internal, "failed to convert bundle", err),
+			Status: commonapi.MakeStatus(log, codes.Internal, "failed to convert bundle", err),
 		}
 	}
 
 	applyBundleMask(protoBundle, outputMask)
 	log.Info("Bundle set successfully")
 	return &bundlev1.BatchSetFederatedBundleResponse_Result{
-		Status: api.OK(),
+		Status: commonapi.OK(),
 		Bundle: protoBundle,
 	}
 }
@@ -409,20 +438,20 @@ func (s *Service) updateFederatedBundle(ctx context.Context, b *types.Bundle, in
 	td, err := spiffeid.TrustDomainFromString(b.TrustDomain)
 	if err != nil {
 		return &bundlev1.BatchUpdateFederatedBundleResponse_Result{
-			Status: api.MakeStatus(log, codes.InvalidArgument, "trust domain argument is not valid", err),
+			Status: commonapi.MakeStatus(log, codes.InvalidArgument, "trust domain argument is not valid", err),
 		}
 	}
 
 	if s.td.Compare(td) == 0 {
 		return &bundlev1.BatchUpdateFederatedBundleResponse_Result{
-			Status: api.MakeStatus(log, codes.InvalidArgument, "updating a federated bundle for the server's own trust domain is not allowed", nil),
+			Status: commonapi.MakeStatus(log, codes.InvalidArgument, "updating a federated bundle for the server's own trust domain is not allowed", nil),
 		}
 	}
 
 	commonBundle, err := api.ProtoToBundle(b)
 	if err != nil {
 		return &bundlev1.BatchUpdateFederatedBundleResponse_Result{
-			Status: api.MakeStatus(log, codes.InvalidArgument, "failed to convert bundle", err),
+			Status: commonapi.MakeStatus(log, codes.InvalidArgument, "failed to convert bundle", err),
 		}
 	}
 	dsBundle, err := s.ds.UpdateBundle(ctx, commonBundle, api.ProtoToBundleMask(inputMask))
@@ -431,18 +460,18 @@ func (s *Service) updateFederatedBundle(ctx context.Context, b *types.Bundle, in
 	case codes.OK:
 	case codes.NotFound:
 		return &bundlev1.BatchUpdateFederatedBundleResponse_Result{
-			Status: api.MakeStatus(log, codes.NotFound, "bundle not found", err),
+			Status: commonapi.MakeStatus(log, codes.NotFound, "bundle not found", err),
 		}
 	default:
 		return &bundlev1.BatchUpdateFederatedBundleResponse_Result{
-			Status: api.MakeStatus(log, codes.Internal, "failed to update bundle", err),
+			Status: commonapi.MakeStatus(log, codes.Internal, "failed to update bundle", err),
 		}
 	}
 
 	protoBundle, err := api.BundleToProto(dsBundle)
 	if err != nil {
 		return &bundlev1.BatchUpdateFederatedBundleResponse_Result{
-			Status: api.MakeStatus(log, codes.Internal, "failed to convert bundle", err),
+			Status: commonapi.MakeStatus(log, codes.Internal, "failed to convert bundle", err),
 		}
 	}
 
@@ -450,7 +479,7 @@ func (s *Service) updateFederatedBundle(ctx context.Context, b *types.Bundle, in
 
 	log.Debug("Federated bundle updated")
 	return &bundlev1.BatchUpdateFederatedBundleResponse_Result{
-		Status: api.OK(),
+		Status: commonapi.OK(),
 		Bundle: protoBundle,
 	}
 }
@@ -477,7 +506,7 @@ func (s *Service) BatchDeleteFederatedBundle(ctx context.Context, req *bundlev1.
 	log := rpccontext.Logger(ctx)
 	mode, err := parseDeleteMode(req.Mode)
 	if err != nil {
-		return nil, api.MakeErr(log, codes.InvalidArgument, "failed to parse deletion mode", err)
+		return nil, commonapi.MakeErr(log, codes.InvalidArgument, "failed to parse deletion mode", err)
 	}
 	log = log.WithField(telemetry.DeleteFederatedBundleMode, mode.String())
 
@@ -505,7 +534,7 @@ func (s *Service) deleteFederatedBundle(ctx context.Context, log logrus.FieldLog
 	td, err := spiffeid.TrustDomainFromString(trustDomain)
 	if err != nil {
 		return &bundlev1.BatchDeleteFederatedBundleResponse_Result{
-			Status:      api.MakeStatus(log, codes.InvalidArgument, "trust domain argument is not valid", err),
+			Status:      commonapi.MakeStatus(log, codes.InvalidArgument, "trust domain argument is not valid", err),
 			TrustDomain: trustDomain,
 		}
 	}
@@ -513,7 +542,7 @@ func (s *Service) deleteFederatedBundle(ctx context.Context, log logrus.FieldLog
 	if s.td.Compare(td) == 0 {
 		return &bundlev1.BatchDeleteFederatedBundleResponse_Result{
 			TrustDomain: trustDomain,
-			Status:      api.MakeStatus(log, codes.InvalidArgument, "removing the bundle for the server trust domain is not allowed", nil),
+			Status:      commonapi.MakeStatus(log, codes.InvalidArgument, "removing the bundle for the server trust domain is not allowed", nil),
 		}
 	}
 
@@ -523,18 +552,18 @@ func (s *Service) deleteFederatedBundle(ctx context.Context, log logrus.FieldLog
 	switch code {
 	case codes.OK:
 		return &bundlev1.BatchDeleteFederatedBundleResponse_Result{
-			Status:      api.OK(),
+			Status:      commonapi.OK(),
 			TrustDomain: trustDomain,
 		}
 	case codes.NotFound:
 		return &bundlev1.BatchDeleteFederatedBundleResponse_Result{
-			Status:      api.MakeStatus(log, codes.NotFound, "bundle not found", err),
+			Status:      commonapi.MakeStatus(log, codes.NotFound, "bundle not found", err),
 			TrustDomain: trustDomain,
 		}
 	default:
 		return &bundlev1.BatchDeleteFederatedBundleResponse_Result{
 			TrustDomain: trustDomain,
-			Status:      api.MakeStatus(log, code, "failed to delete federated bundle", err),
+			Status:      commonapi.MakeStatus(log, code, "failed to delete federated bundle", err),
 		}
 	}
 }
@@ -571,5 +600,9 @@ func applyBundleMask(b *types.Bundle, mask *types.BundleMask) {
 
 	if !mask.JwtAuthorities {
 		b.JwtAuthorities = nil
+	}
+
+	if !mask.WitAuthorities {
+		b.WitAuthorities = nil
 	}
 }

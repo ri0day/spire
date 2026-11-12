@@ -11,11 +11,15 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"maps"
 	"path"
 	"reflect"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"cloud.google.com/go/iam"
 	"cloud.google.com/go/iam/apiv1/iampb"
@@ -28,9 +32,12 @@ import (
 	"google.golang.org/api/option"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
+
+var lastUpdateFilterRegexp = regexp.MustCompile(fmt.Sprintf(`labels.%s < ([[:digit:]]+)`, labelNameLastUpdate))
 
 type fakeCryptoKeyIterator struct {
 	mu sync.RWMutex
@@ -97,9 +104,7 @@ func (fck *fakeCryptoKey) fetchFakeCryptoKeyVersions() map[string]*fakeCryptoKey
 	}
 
 	fakeCryptoKeyVersions := make(map[string]*fakeCryptoKeyVersion, len(fck.fakeCryptoKeyVersions))
-	for key, fakeCryptoKeyVersion := range fck.fakeCryptoKeyVersions {
-		fakeCryptoKeyVersions[key] = fakeCryptoKeyVersion
-	}
+	maps.Copy(fakeCryptoKeyVersions, fck.fakeCryptoKeyVersions)
 	return fakeCryptoKeyVersions
 }
 
@@ -155,9 +160,7 @@ func (fs *fakeStore) fetchFakeCryptoKeys() map[string]*fakeCryptoKey {
 	}
 
 	fakeCryptoKeys := make(map[string]*fakeCryptoKey, len(fs.fakeCryptoKeys))
-	for key, fakeCryptoKey := range fs.fakeCryptoKeys {
-		fakeCryptoKeys[key] = fakeCryptoKey
-	}
+	maps.Copy(fakeCryptoKeys, fs.fakeCryptoKeys)
 	return fakeCryptoKeys
 }
 
@@ -333,7 +336,7 @@ func (k *fakeKMSClient) setGetPublicKeySequentialErrs(fakeError error, count int
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	fakeErrors := make([]error, count)
-	for i := 0; i < count; i++ {
+	for i := range count {
 		fakeErrors[i] = fakeError
 	}
 	k.getPublicKeyErrs = fakeErrors
@@ -484,7 +487,10 @@ func (k *fakeKMSClient) CreateCryptoKey(_ context.Context, req *kmspb.CreateCryp
 	}
 	k.store.putFakeCryptoKey(fck)
 
-	return cryptoKey, nil
+	// Return a clone to decouple the caller's copy from the fake
+	// store's copy, mimicking the behavior of a real KMS service
+	// where no memory is shared between client and server.
+	return proto.Clone(cryptoKey).(*kmspb.CryptoKey), nil
 }
 
 func (k *fakeKMSClient) CreateCryptoKeyVersion(_ context.Context, req *kmspb.CreateCryptoKeyVersionRequest, _ ...gax.CallOption) (*kmspb.CryptoKeyVersion, error) {
@@ -580,8 +586,11 @@ func (k *fakeKMSClient) GetPublicKey(_ context.Context, req *kmspb.GetPublicKeyR
 	}
 
 	if k.pemCrc32C != nil {
-		// Override pemCrc32C
-		fakeCryptoKeyVersion.publicKey.PemCrc32C = k.pemCrc32C
+		// Override pemCrc32C on a clone so the shared fixture public key is
+		// not mutated, which would corrupt it for other tests and reruns.
+		publicKey := proto.Clone(fakeCryptoKeyVersion.publicKey).(*kmspb.PublicKey)
+		publicKey.PemCrc32C = k.pemCrc32C
+		return publicKey, nil
 	}
 
 	return fakeCryptoKeyVersion.publicKey, nil
@@ -614,15 +623,37 @@ func (k *fakeKMSClient) ListCryptoKeys(_ context.Context, req *kmspb.ListCryptoK
 		}
 
 		// We Have a simplified filtering logic in this fake implementation,
-		// where we only care about the spire-active label.
+		// where we only care about the spire-active and spire-last-update labels.
 		if req.Filter != "" {
 			if !strings.Contains(req.Filter, "labels.spire-active = true") {
-				{
-					k.t.Fatal("Unsupported filter in ListCryptoKeys request")
+				k.t.Fatal("Unsupported filter in ListCryptoKeys request")
+			}
+
+			lastUpdateRegexpResults := lastUpdateFilterRegexp.FindStringSubmatch(req.Filter)
+			var lastUpdateTimeFilter time.Time
+			var keyLastUpdateTime time.Time
+			if len(lastUpdateRegexpResults) == 2 {
+				lastUpdate := lastUpdateRegexpResults[1]
+				lastUpdateUnix, err := strconv.ParseInt(lastUpdate, 10, 64)
+				if err != nil {
+					k.t.Fatalf("Failed to parse last update time in request filter: %s", err)
 				}
-				if fck.Labels[labelNameActive] != "true" {
-					continue
+
+				lastUpdateTimeFilter = time.Unix(lastUpdateUnix, 0)
+
+				if keyLastUpdate, ok := fck.Labels[labelNameLastUpdate]; ok {
+					keyLastUpdateUnix, err := strconv.ParseInt(keyLastUpdate, 10, 64)
+					if err != nil {
+						k.t.Fatalf("Failed to parse last update time in crypto key: %s", err)
+					}
+
+					keyLastUpdateTime = time.Unix(keyLastUpdateUnix, 0)
 				}
+			}
+
+			if fck.Labels[labelNameActive] != "true" ||
+				(!lastUpdateTimeFilter.IsZero() && !keyLastUpdateTime.IsZero() && !keyLastUpdateTime.Before(lastUpdateTimeFilter)) {
+				continue
 			}
 		}
 
@@ -686,8 +717,10 @@ func (k *fakeKMSClient) UpdateCryptoKey(_ context.Context, req *kmspb.UpdateCryp
 	fck.mu.Lock()
 	defer fck.mu.Unlock()
 
-	fck.CryptoKey = req.CryptoKey
-	return fck.CryptoKey, nil
+	// Clone to decouple the fake store's copy from the caller's
+	// copy, preventing shared-memory data races.
+	fck.CryptoKey = proto.Clone(req.CryptoKey).(*kmspb.CryptoKey)
+	return proto.Clone(fck.CryptoKey).(*kmspb.CryptoKey), nil
 }
 
 func (k *fakeKMSClient) createFakeCryptoKeyVersion(cryptoKey *kmspb.CryptoKey, version string) (*fakeCryptoKeyVersion, error) {

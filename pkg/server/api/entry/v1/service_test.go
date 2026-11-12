@@ -17,6 +17,7 @@ import (
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	entryv1 "github.com/spiffe/spire-api-sdk/proto/spire/api/server/entry/v1"
 	"github.com/spiffe/spire-api-sdk/proto/spire/api/types"
+	commonapi "github.com/spiffe/spire/pkg/common/api"
 	"github.com/spiffe/spire/pkg/common/telemetry"
 	"github.com/spiffe/spire/pkg/server/api"
 	"github.com/spiffe/spire/pkg/server/api/entry/v1"
@@ -141,13 +142,12 @@ func TestCountEntries(t *testing.T) {
 			},
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			ds := fakedatastore.New(t)
 			test := setupServiceTest(t, ds)
 			defer test.Cleanup()
 
-			for i := 0; i < int(tt.count); i++ {
+			for i := range int(tt.count) {
 				_, err := test.ds.CreateRegistrationEntry(ctx, &common.RegistrationEntry{
 					ParentId: spiffeid.RequireFromSegments(td, fmt.Sprintf("parent%d", i)).String(),
 					SpiffeId: spiffeid.RequireFromSegments(td, fmt.Sprintf("child%d", i)).String(),
@@ -1194,7 +1194,6 @@ func TestListEntries(t *testing.T) {
 			},
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			test.logHook.Reset()
 			ds.SetNextError(tt.dsError)
@@ -1246,6 +1245,9 @@ func TestGetEntry(t *testing.T) {
 		DnsNames:    []string{"dns1", "dns2"},
 		Downstream:  true,
 		Hint:        "internal",
+		AdditionalAttributes: &common.RegistrationEntry_AdditionalAttributes{
+			DisableX509SvidPrefetch: true,
+		},
 	})
 	require.NoError(t, err)
 
@@ -1311,6 +1313,9 @@ func TestGetEntry(t *testing.T) {
 				Downstream:    true,
 				ExpiresAt:     expiresAt,
 				Hint:          "internal",
+				AdditionalAttributes: &types.Entry_AdditionalAttributes{
+					DisableX509SvidPrefetch: true,
+				},
 			},
 			expectLogs: []spiretest.LogEntry{
 				{
@@ -1444,7 +1449,6 @@ func TestGetEntry(t *testing.T) {
 			},
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			test.logHook.Reset()
 			ds.SetNextError(tt.dsError)
@@ -1511,6 +1515,9 @@ func TestBatchCreateEntry(t *testing.T) {
 		X509SvidTtl:   45,
 		JwtSvidTtl:    30,
 		Hint:          "external",
+		AdditionalAttributes: &types.Entry_AdditionalAttributes{
+			DisableX509SvidPrefetch: true,
+		},
 	}
 	// Registration entry for test entry
 	testDSEntry := &common.RegistrationEntry{
@@ -1529,8 +1536,18 @@ func TestBatchCreateEntry(t *testing.T) {
 		X509SvidTtl:   45,
 		JwtSvidTtl:    30,
 		Hint:          "external",
-		CreatedAt:     1678731397,
+		AdditionalAttributes: &common.RegistrationEntry_AdditionalAttributes{
+			DisableX509SvidPrefetch: true,
+		},
+		CreatedAt: 1678731397,
 	}
+
+	longTTLEntry := proto.Clone(testEntry).(*types.Entry)
+	longTTLEntry.X509SvidTtl = 18000
+	longTTLEntry.JwtSvidTtl = 18000
+	longTTLDSEntry := proto.Clone(testDSEntry).(*common.RegistrationEntry)
+	longTTLDSEntry.X509SvidTtl = 18000
+	longTTLDSEntry.JwtSvidTtl = 18000
 
 	for _, tt := range []struct {
 		name          string
@@ -1567,6 +1584,7 @@ func TestBatchCreateEntry(t *testing.T) {
 						telemetry.SPIFFEID:       "spiffe://example.org/workload",
 						telemetry.X509SVIDTTL:    "45",
 						telemetry.JWTSVIDTTL:     "30",
+						telemetry.WITSVIDTTL:     "0",
 						telemetry.StoreSvid:      "false",
 						telemetry.Hint:           "external",
 						telemetry.CreatedAt:      "0",
@@ -1596,6 +1614,7 @@ func TestBatchCreateEntry(t *testing.T) {
 						telemetry.SPIFFEID:       "spiffe://example.org/malformed",
 						telemetry.X509SVIDTTL:    "0",
 						telemetry.JWTSVIDTTL:     "0",
+						telemetry.WITSVIDTTL:     "0",
 						telemetry.StoreSvid:      "false",
 						telemetry.Hint:           "",
 						telemetry.CreatedAt:      "0",
@@ -1617,6 +1636,7 @@ func TestBatchCreateEntry(t *testing.T) {
 						telemetry.SPIFFEID:       "spiffe://example.org/workload2",
 						telemetry.X509SVIDTTL:    "0",
 						telemetry.JWTSVIDTTL:     "0",
+						telemetry.WITSVIDTTL:     "0",
 						telemetry.StoreSvid:      "false",
 						telemetry.Hint:           "",
 						telemetry.CreatedAt:      "0",
@@ -1664,7 +1684,8 @@ func TestBatchCreateEntry(t *testing.T) {
 					},
 					Selectors: []*types.Selector{{Type: "type", Value: "value"}},
 					DnsNames:  []string{""},
-				}, {
+				},
+				{
 					Id: "entry2",
 					ParentId: &types.SPIFFEID{
 						TrustDomain: "example.org",
@@ -1712,6 +1733,7 @@ func TestBatchCreateEntry(t *testing.T) {
 						telemetry.SPIFFEID:       "spiffe://example.org/svidstore",
 						telemetry.X509SVIDTTL:    "0",
 						telemetry.JWTSVIDTTL:     "0",
+						telemetry.WITSVIDTTL:     "0",
 						telemetry.StoreSvid:      "false",
 						telemetry.Hint:           "internal",
 						telemetry.CreatedAt:      "0",
@@ -1739,7 +1761,8 @@ func TestBatchCreateEntry(t *testing.T) {
 						{Type: "type", Value: "value2"},
 					},
 					Hint: "internal",
-				}},
+				},
+			},
 			expectDsEntries: map[string]*common.RegistrationEntry{
 				"entry1": {
 					EntryId:  "entry1",
@@ -1783,6 +1806,7 @@ func TestBatchCreateEntry(t *testing.T) {
 						telemetry.SPIFFEID:       "spiffe://example.org/svidstore",
 						telemetry.X509SVIDTTL:    "0",
 						telemetry.JWTSVIDTTL:     "0",
+						telemetry.WITSVIDTTL:     "0",
 						telemetry.StoreSvid:      "true",
 						telemetry.Hint:           "",
 						telemetry.CreatedAt:      "0",
@@ -1810,7 +1834,8 @@ func TestBatchCreateEntry(t *testing.T) {
 						{Type: "type", Value: "value2"},
 					},
 					StoreSvid: true,
-				}},
+				},
+			},
 			expectDsEntries: map[string]*common.RegistrationEntry{
 				"entry1": {
 					EntryId:  "entry1",
@@ -1846,7 +1871,10 @@ func TestBatchCreateEntry(t *testing.T) {
 						JwtSvidTtl:    30,
 						StoreSvid:     false,
 						Hint:          "external",
-						CreatedAt:     1678731397,
+						AdditionalAttributes: &types.Entry_AdditionalAttributes{
+							DisableX509SvidPrefetch: true,
+						},
+						CreatedAt: 1678731397,
 					},
 				},
 			},
@@ -1871,6 +1899,49 @@ func TestBatchCreateEntry(t *testing.T) {
 						telemetry.SPIFFEID:       "spiffe://example.org/workload",
 						telemetry.X509SVIDTTL:    "45",
 						telemetry.JWTSVIDTTL:     "30",
+						telemetry.WITSVIDTTL:     "0",
+						telemetry.StoreSvid:      "false",
+						telemetry.Hint:           "external",
+						telemetry.CreatedAt:      "0",
+					},
+				},
+			},
+		},
+		{
+			name: "warn on incompatible TTLs",
+			expectResults: []*entryv1.BatchCreateEntryResponse_Result{
+				{
+					Status: &types.Status{Code: int32(codes.OK), Message: "OK"},
+					Entry: &types.Entry{
+						Id: "entry1",
+					},
+				},
+			},
+			outputMask:      &types.EntryMask{},
+			reqEntries:      []*types.Entry{longTTLEntry},
+			expectDsEntries: map[string]*common.RegistrationEntry{"entry1": longTTLDSEntry},
+			expectLogs: []spiretest.LogEntry{
+				entryLifetimeWarning(telemetry.X509SVIDTTL, "entry1"),
+				entryLifetimeWarning(telemetry.JWTSVIDTTL, "entry1"),
+				{
+					Level:   logrus.InfoLevel,
+					Message: "API accessed",
+					Data: logrus.Fields{
+						telemetry.Status:         "success",
+						telemetry.Type:           "audit",
+						telemetry.Admin:          "true",
+						telemetry.DNSName:        "dns1",
+						telemetry.Downstream:     "true",
+						telemetry.RegistrationID: "entry1",
+						telemetry.ExpiresAt:      strconv.FormatInt(testEntry.ExpiresAt, 10),
+						telemetry.FederatesWith:  "domain1.org",
+						telemetry.ParentID:       "spiffe://example.org/host",
+						telemetry.RevisionNumber: "0",
+						telemetry.Selectors:      "type:value1,type:value2",
+						telemetry.SPIFFEID:       "spiffe://example.org/workload",
+						telemetry.X509SVIDTTL:    "18000",
+						telemetry.JWTSVIDTTL:     "18000",
+						telemetry.WITSVIDTTL:     "0",
 						telemetry.StoreSvid:      "false",
 						telemetry.Hint:           "external",
 						telemetry.CreatedAt:      "0",
@@ -1910,6 +1981,7 @@ func TestBatchCreateEntry(t *testing.T) {
 						telemetry.SPIFFEID:       "spiffe://example.org/workload",
 						telemetry.X509SVIDTTL:    "45",
 						telemetry.JWTSVIDTTL:     "30",
+						telemetry.WITSVIDTTL:     "0",
 						telemetry.StoreSvid:      "false",
 						telemetry.Hint:           "external",
 						telemetry.CreatedAt:      "0",
@@ -1979,6 +2051,7 @@ func TestBatchCreateEntry(t *testing.T) {
 						telemetry.SPIFFEID:       "spiffe://example.org/bar",
 						telemetry.X509SVIDTTL:    "45",
 						telemetry.JWTSVIDTTL:     "30",
+						telemetry.WITSVIDTTL:     "0",
 						telemetry.StoreSvid:      "false",
 						telemetry.Hint:           "",
 						telemetry.CreatedAt:      "0",
@@ -2023,6 +2096,7 @@ func TestBatchCreateEntry(t *testing.T) {
 						telemetry.SPIFFEID:       "spiffe://example.org/workload",
 						telemetry.X509SVIDTTL:    "45",
 						telemetry.JWTSVIDTTL:     "30",
+						telemetry.WITSVIDTTL:     "0",
 						telemetry.StoreSvid:      "false",
 						telemetry.Hint:           "external",
 						telemetry.CreatedAt:      "0",
@@ -2103,6 +2177,7 @@ func TestBatchCreateEntry(t *testing.T) {
 						telemetry.SPIFFEID:       "spiffe://example.org/bar",
 						telemetry.X509SVIDTTL:    "45",
 						telemetry.JWTSVIDTTL:     "30",
+						telemetry.WITSVIDTTL:     "0",
 						telemetry.StatusCode:     "AlreadyExists",
 						telemetry.StatusMessage:  "similar entry already exists",
 						telemetry.StoreSvid:      "false",
@@ -2126,6 +2201,7 @@ func TestBatchCreateEntry(t *testing.T) {
 						telemetry.SPIFFEID:       "spiffe://example.org/bar",
 						telemetry.X509SVIDTTL:    "45",
 						telemetry.JWTSVIDTTL:     "30",
+						telemetry.WITSVIDTTL:     "0",
 						telemetry.StatusCode:     "AlreadyExists",
 						telemetry.StatusMessage:  "similar entry already exists",
 						telemetry.StoreSvid:      "false",
@@ -2166,6 +2242,7 @@ func TestBatchCreateEntry(t *testing.T) {
 						telemetry.RevisionNumber: "0",
 						telemetry.X509SVIDTTL:    "0",
 						telemetry.JWTSVIDTTL:     "0",
+						telemetry.WITSVIDTTL:     "0",
 						telemetry.StoreSvid:      "false",
 						telemetry.StatusCode:     "InvalidArgument",
 						telemetry.StatusMessage:  "failed to convert entry: invalid parent ID: trust domain is missing",
@@ -2181,27 +2258,78 @@ func TestBatchCreateEntry(t *testing.T) {
 			},
 		},
 		{
-			name: "invalid entry ID",
+			name: "invalid WIT-SVID TTL",
 			expectResults: []*entryv1.BatchCreateEntryResponse_Result{
 				{
 					Status: &types.Status{
-						Code:    int32(codes.Internal),
-						Message: "failed to create entry: datastore-sql: invalid registration entry: entry ID contains invalid characters",
-					},
-				},
-				{
-					Status: &types.Status{
-						Code:    int32(codes.Internal),
-						Message: "failed to create entry: datastore-sql: invalid registration entry: entry ID too long",
+						Code:    int32(codes.InvalidArgument),
+						Message: "failed to convert entry: WIT-SVID TTL is not supported yet",
 					},
 				},
 			},
 			expectLogs: []spiretest.LogEntry{
 				{
 					Level:   logrus.ErrorLevel,
-					Message: "Failed to create entry",
+					Message: "Invalid argument: failed to convert entry",
 					Data: logrus.Fields{
-						logrus.ErrorKey:    "datastore-sql: invalid registration entry: entry ID contains invalid characters",
+						logrus.ErrorKey: "WIT-SVID TTL is not supported yet",
+					},
+				},
+				{
+					Level:   logrus.InfoLevel,
+					Message: "API accessed",
+					Data: logrus.Fields{
+						telemetry.Status:         "error",
+						telemetry.Type:           "audit",
+						telemetry.Admin:          "false",
+						telemetry.Downstream:     "false",
+						telemetry.ExpiresAt:      "0",
+						telemetry.ParentID:       "spiffe://example.org/host",
+						telemetry.RevisionNumber: "0",
+						telemetry.Selectors:      "type:value1",
+						telemetry.SPIFFEID:       "spiffe://example.org/workload",
+						telemetry.X509SVIDTTL:    "0",
+						telemetry.JWTSVIDTTL:     "0",
+						telemetry.WITSVIDTTL:     "15",
+						telemetry.StoreSvid:      "false",
+						telemetry.StatusCode:     "InvalidArgument",
+						telemetry.StatusMessage:  "failed to convert entry: WIT-SVID TTL is not supported yet",
+						telemetry.Hint:           "",
+						telemetry.CreatedAt:      "0",
+					},
+				},
+			},
+			reqEntries: []*types.Entry{
+				{
+					ParentId:   &types.SPIFFEID{TrustDomain: "example.org", Path: "/host"},
+					SpiffeId:   &types.SPIFFEID{TrustDomain: "example.org", Path: "/workload"},
+					Selectors:  []*types.Selector{{Type: "type", Value: "value1"}},
+					WitSvidTtl: 15,
+				},
+			},
+		},
+		{
+			name: "invalid entry ID",
+			expectResults: []*entryv1.BatchCreateEntryResponse_Result{
+				{
+					Status: &types.Status{
+						Code:    int32(codes.InvalidArgument),
+						Message: "failed to create entry: datastore-validation: invalid registration entry: entry ID contains invalid characters",
+					},
+				},
+				{
+					Status: &types.Status{
+						Code:    int32(codes.InvalidArgument),
+						Message: "failed to create entry: datastore-validation: invalid registration entry: entry ID too long",
+					},
+				},
+			},
+			expectLogs: []spiretest.LogEntry{
+				{
+					Level:   logrus.ErrorLevel,
+					Message: "Invalid argument: failed to create entry",
+					Data: logrus.Fields{
+						logrus.ErrorKey:    "rpc error: code = InvalidArgument desc = datastore-validation: invalid registration entry: entry ID contains invalid characters",
 						telemetry.SPIFFEID: "spiffe://example.org/bar",
 					},
 				},
@@ -2221,18 +2349,19 @@ func TestBatchCreateEntry(t *testing.T) {
 						telemetry.SPIFFEID:       "spiffe://example.org/bar",
 						telemetry.X509SVIDTTL:    "45",
 						telemetry.JWTSVIDTTL:     "30",
+						telemetry.WITSVIDTTL:     "0",
 						telemetry.Hint:           "",
 						telemetry.CreatedAt:      "0",
 						telemetry.StoreSvid:      "false",
-						telemetry.StatusCode:     "Internal",
-						telemetry.StatusMessage:  "failed to create entry: datastore-sql: invalid registration entry: entry ID contains invalid characters",
+						telemetry.StatusCode:     "InvalidArgument",
+						telemetry.StatusMessage:  "failed to create entry: datastore-validation: invalid registration entry: entry ID contains invalid characters",
 					},
 				},
 				{
 					Level:   logrus.ErrorLevel,
-					Message: "Failed to create entry",
+					Message: "Invalid argument: failed to create entry",
 					Data: logrus.Fields{
-						logrus.ErrorKey:    "datastore-sql: invalid registration entry: entry ID too long",
+						logrus.ErrorKey:    "rpc error: code = InvalidArgument desc = datastore-validation: invalid registration entry: entry ID too long",
 						telemetry.SPIFFEID: "spiffe://example.org/bar",
 					},
 				},
@@ -2252,11 +2381,12 @@ func TestBatchCreateEntry(t *testing.T) {
 						telemetry.SPIFFEID:       "spiffe://example.org/bar",
 						telemetry.X509SVIDTTL:    "45",
 						telemetry.JWTSVIDTTL:     "30",
+						telemetry.WITSVIDTTL:     "0",
 						telemetry.Hint:           "",
 						telemetry.CreatedAt:      "0",
 						telemetry.StoreSvid:      "false",
-						telemetry.StatusCode:     "Internal",
-						telemetry.StatusMessage:  "failed to create entry: datastore-sql: invalid registration entry: entry ID too long",
+						telemetry.StatusCode:     "InvalidArgument",
+						telemetry.StatusMessage:  "failed to create entry: datastore-validation: invalid registration entry: entry ID too long",
 					},
 				},
 			},
@@ -2313,6 +2443,7 @@ func TestBatchCreateEntry(t *testing.T) {
 						telemetry.SPIFFEID:       "spiffe://example.org/workload",
 						telemetry.X509SVIDTTL:    "45",
 						telemetry.JWTSVIDTTL:     "30",
+						telemetry.WITSVIDTTL:     "0",
 						telemetry.Hint:           "external",
 						telemetry.CreatedAt:      "0",
 						telemetry.StoreSvid:      "false",
@@ -2365,6 +2496,7 @@ func TestBatchCreateEntry(t *testing.T) {
 						telemetry.SPIFFEID:       "spiffe://example.org/workload",
 						telemetry.X509SVIDTTL:    "45",
 						telemetry.JWTSVIDTTL:     "30",
+						telemetry.WITSVIDTTL:     "0",
 						telemetry.Hint:           "external",
 						telemetry.CreatedAt:      "0",
 						telemetry.StoreSvid:      "false",
@@ -2390,7 +2522,6 @@ func TestBatchCreateEntry(t *testing.T) {
 			}},
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			ds := newFakeDS(t)
 
@@ -2546,29 +2677,29 @@ func TestBatchDeleteEntry(t *testing.T) {
 			expectDs: dsEntries,
 			expectResult: func(m map[string]*common.RegistrationEntry) ([]*entryv1.BatchDeleteEntryResponse_Result, []spiretest.LogEntry) {
 				return []*entryv1.BatchDeleteEntryResponse_Result{
-						{
-							Status: &types.Status{
-								Code:    int32(codes.InvalidArgument),
-								Message: "missing entry ID",
-							},
+					{
+						Status: &types.Status{
+							Code:    int32(codes.InvalidArgument),
+							Message: "missing entry ID",
 						},
-					}, []spiretest.LogEntry{
-						{
-							Level:   logrus.ErrorLevel,
-							Message: "Invalid argument: missing entry ID",
+					},
+				}, []spiretest.LogEntry{
+					{
+						Level:   logrus.ErrorLevel,
+						Message: "Invalid argument: missing entry ID",
+					},
+					{
+						Level:   logrus.InfoLevel,
+						Message: "API accessed",
+						Data: logrus.Fields{
+							telemetry.Status:         "error",
+							telemetry.Type:           "audit",
+							telemetry.RegistrationID: "",
+							telemetry.StatusCode:     "InvalidArgument",
+							telemetry.StatusMessage:  "missing entry ID",
 						},
-						{
-							Level:   logrus.InfoLevel,
-							Message: "API accessed",
-							Data: logrus.Fields{
-								telemetry.Status:         "error",
-								telemetry.Type:           "audit",
-								telemetry.RegistrationID: "",
-								telemetry.StatusCode:     "InvalidArgument",
-								telemetry.StatusMessage:  "missing entry ID",
-							},
-						},
-					}
+					},
+				}
 			},
 			ids: func(m map[string]*common.RegistrationEntry) []string {
 				return []string{""}
@@ -2580,34 +2711,34 @@ func TestBatchDeleteEntry(t *testing.T) {
 			expectDs: dsEntries,
 			expectResult: func(m map[string]*common.RegistrationEntry) ([]*entryv1.BatchDeleteEntryResponse_Result, []spiretest.LogEntry) {
 				return []*entryv1.BatchDeleteEntryResponse_Result{
-						{
-							Status: &types.Status{
-								Code:    int32(codes.Internal),
-								Message: "failed to delete entry: some error",
-							},
-							Id: m[fooSpiffeID].EntryId,
+					{
+						Status: &types.Status{
+							Code:    int32(codes.Internal),
+							Message: "failed to delete entry: some error",
 						},
-					}, []spiretest.LogEntry{
-						{
-							Level:   logrus.ErrorLevel,
-							Message: "Failed to delete entry",
-							Data: logrus.Fields{
-								telemetry.RegistrationID: m[fooSpiffeID].EntryId,
-								logrus.ErrorKey:          "some error",
-							},
+						Id: m[fooSpiffeID].EntryId,
+					},
+				}, []spiretest.LogEntry{
+					{
+						Level:   logrus.ErrorLevel,
+						Message: "Failed to delete entry",
+						Data: logrus.Fields{
+							telemetry.RegistrationID: m[fooSpiffeID].EntryId,
+							logrus.ErrorKey:          "some error",
 						},
-						{
-							Level:   logrus.InfoLevel,
-							Message: "API accessed",
-							Data: logrus.Fields{
-								telemetry.Status:         "error",
-								telemetry.Type:           "audit",
-								telemetry.RegistrationID: m[fooSpiffeID].EntryId,
-								telemetry.StatusCode:     "Internal",
-								telemetry.StatusMessage:  "failed to delete entry: some error",
-							},
+					},
+					{
+						Level:   logrus.InfoLevel,
+						Message: "API accessed",
+						Data: logrus.Fields{
+							telemetry.Status:         "error",
+							telemetry.Type:           "audit",
+							telemetry.RegistrationID: m[fooSpiffeID].EntryId,
+							telemetry.StatusCode:     "Internal",
+							telemetry.StatusMessage:  "failed to delete entry: some error",
 						},
-					}
+					},
+				}
 			},
 			ids: func(m map[string]*common.RegistrationEntry) []string {
 				return []string{m[fooSpiffeID].EntryId}
@@ -2618,40 +2749,39 @@ func TestBatchDeleteEntry(t *testing.T) {
 			expectDs: dsEntries,
 			expectResult: func(m map[string]*common.RegistrationEntry) ([]*entryv1.BatchDeleteEntryResponse_Result, []spiretest.LogEntry) {
 				return []*entryv1.BatchDeleteEntryResponse_Result{
-						{
-							Status: &types.Status{
-								Code:    int32(codes.NotFound),
-								Message: "entry not found",
-							},
-							Id: "invalid id",
+					{
+						Status: &types.Status{
+							Code:    int32(codes.NotFound),
+							Message: "entry not found",
 						},
-					}, []spiretest.LogEntry{
-						{
-							Level:   logrus.ErrorLevel,
-							Message: "Entry not found",
-							Data: logrus.Fields{
-								telemetry.RegistrationID: "invalid id",
-							},
+						Id: "invalid id",
+					},
+				}, []spiretest.LogEntry{
+					{
+						Level:   logrus.ErrorLevel,
+						Message: "Entry not found",
+						Data: logrus.Fields{
+							telemetry.RegistrationID: "invalid id",
 						},
-						{
-							Level:   logrus.InfoLevel,
-							Message: "API accessed",
-							Data: logrus.Fields{
-								telemetry.Status:         "error",
-								telemetry.Type:           "audit",
-								telemetry.RegistrationID: "invalid id",
-								telemetry.StatusCode:     "NotFound",
-								telemetry.StatusMessage:  "entry not found",
-							},
+					},
+					{
+						Level:   logrus.InfoLevel,
+						Message: "API accessed",
+						Data: logrus.Fields{
+							telemetry.Status:         "error",
+							telemetry.Type:           "audit",
+							telemetry.RegistrationID: "invalid id",
+							telemetry.StatusCode:     "NotFound",
+							telemetry.StatusMessage:  "entry not found",
 						},
-					}
+					},
+				}
 			},
 			ids: func(m map[string]*common.RegistrationEntry) []string {
 				return []string{"invalid id"}
 			},
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			ds := fakedatastore.New(t)
 			test := setupServiceTest(t, ds)
@@ -2868,7 +2998,6 @@ func TestGetAuthorizedEntries(t *testing.T) {
 			},
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			test := setupServiceTest(t, fakedatastore.New(t))
 			defer test.Cleanup()
@@ -3142,6 +3271,7 @@ func TestSyncAuthorizedEntries(t *testing.T) {
 								ParentId:       entry1.ParentId,
 								Selectors:      entry1.Selectors,
 								RevisionNumber: entry1.RevisionNumber,
+								CreatedAt:      entry1.CreatedAt,
 							},
 							{
 								Id:             entry2.Id,
@@ -3265,7 +3395,6 @@ func TestSyncAuthorizedEntries(t *testing.T) {
 			},
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			test := setupServiceTest(t, fakedatastore.New(t))
 			defer func() {
@@ -3303,7 +3432,7 @@ func TestSyncAuthorizedEntries(t *testing.T) {
 }
 
 func FuzzSyncAuthorizedStreams(f *testing.F) {
-	rnd := rand.New(rand.NewSource(time.Now().Unix())) //nolint: gosec // this rand source ok for fuzz tests
+	rnd := rand.New(rand.NewSource(time.Now().Unix()))
 
 	const entryPageSize = 5
 
@@ -3322,7 +3451,7 @@ func FuzzSyncAuthorizedStreams(f *testing.F) {
 
 	const maxEntries = 40
 	var entries []*types.Entry
-	for i := 0; i < maxEntries; i++ {
+	for i := range maxEntries {
 		entries = append(entries, &types.Entry{Id: strconv.Itoa(i), RevisionNumber: 1})
 	}
 
@@ -3374,7 +3503,7 @@ func FuzzSyncAuthorizedStreams(f *testing.F) {
 		// The number of entries exceeded the page size. Expect one or more
 		// pages of entry revisions.
 		var actualIDs []string
-		for page := 0; page < calculatePageCount(totalEntries)-1; page++ {
+		for range calculatePageCount(totalEntries) - 1 {
 			resp := recvNoError(t, stream)
 			require.Equal(t, len(resp.EntryRevisions), entryPageSize)
 			require.Zero(t, resp.Entries)
@@ -3397,7 +3526,7 @@ func FuzzSyncAuthorizedStreams(f *testing.F) {
 		require.NoError(t, stream.Send(&entryv1.SyncAuthorizedEntriesRequest{Ids: staleIDs}))
 
 		actualIDs = actualIDs[:0]
-		for page := 0; page < calculatePageCount(len(staleIDs))-1; page++ {
+		for range calculatePageCount(len(staleIDs)) - 1 {
 			resp = recvNoError(t, stream)
 			require.Equal(t, len(resp.Entries), entryPageSize)
 			require.Zero(t, resp.EntryRevisions)
@@ -3410,7 +3539,7 @@ func FuzzSyncAuthorizedStreams(f *testing.F) {
 		require.False(t, resp.More)
 		actualIDs = appendEntryIDs(actualIDs, resp.Entries)
 
-		// Ensure that all of the entries were received that were requested
+		// Ensure that all the entries were received that were requested
 		sort.Strings(staleIDs)
 		require.Equal(t, staleIDs, actualIDs)
 
@@ -3457,8 +3586,8 @@ func TestBatchUpdateEntry(t *testing.T) {
 	updateEverythingEntry := &types.Entry{
 		ParentId:    &types.SPIFFEID{TrustDomain: "example.org", Path: "/validUpdated"},
 		SpiffeId:    &types.SPIFFEID{TrustDomain: "example.org", Path: "/validUpdated"},
-		X509SvidTtl: 400000,
-		JwtSvidTtl:  300000,
+		X509SvidTtl: 4000,
+		JwtSvidTtl:  3000,
 		Selectors: []*types.Selector{
 			{Type: "unix", Value: "uid:9999"},
 		},
@@ -3508,7 +3637,8 @@ func TestBatchUpdateEntry(t *testing.T) {
 				{
 					Status: &types.Status{Code: int32(codes.OK), Message: "OK"},
 					Entry: &types.Entry{
-						ParentId: &types.SPIFFEID{TrustDomain: "example.org", Path: "/parentUpdated"}},
+						ParentId: &types.SPIFFEID{TrustDomain: "example.org", Path: "/parentUpdated"},
+					},
 				},
 			},
 			expectLogs: func(m map[string]string) []spiretest.LogEntry {
@@ -3551,7 +3681,8 @@ func TestBatchUpdateEntry(t *testing.T) {
 				{
 					Status: &types.Status{Code: int32(codes.OK), Message: "OK"},
 					Entry: &types.Entry{
-						SpiffeId: &types.SPIFFEID{TrustDomain: "example.org", Path: "/workloadUpdated"}},
+						SpiffeId: &types.SPIFFEID{TrustDomain: "example.org", Path: "/workloadUpdated"},
+					},
 				},
 			},
 			expectLogs: func(m map[string]string) []spiretest.LogEntry {
@@ -3764,7 +3895,7 @@ func TestBatchUpdateEntry(t *testing.T) {
 			},
 		},
 		{
-			name:           "Success Update X509SVIDTTL",
+			name:           "Success Update X509SVIDTTL with incompatible TTL warning",
 			initialEntries: []*types.Entry{initialEntry},
 			inputMask: &types.EntryMask{
 				X509SvidTtl: true,
@@ -3774,13 +3905,13 @@ func TestBatchUpdateEntry(t *testing.T) {
 			},
 			updateEntries: []*types.Entry{
 				{
-					X509SvidTtl: 1000,
+					X509SvidTtl: 18000,
 				},
 			},
 			expectDsEntries: func(id string) []*types.Entry {
 				modifiedEntry := proto.Clone(initialEntry).(*types.Entry)
 				modifiedEntry.Id = id
-				modifiedEntry.X509SvidTtl = 1000
+				modifiedEntry.X509SvidTtl = 18000
 				modifiedEntry.RevisionNumber = 1
 				return []*types.Entry{modifiedEntry}
 			},
@@ -3788,12 +3919,13 @@ func TestBatchUpdateEntry(t *testing.T) {
 				{
 					Status: &types.Status{Code: int32(codes.OK), Message: "OK"},
 					Entry: &types.Entry{
-						X509SvidTtl: 1000,
+						X509SvidTtl: 18000,
 					},
 				},
 			},
 			expectLogs: func(m map[string]string) []spiretest.LogEntry {
 				return []spiretest.LogEntry{
+					entryLifetimeWarning(telemetry.X509SVIDTTL, m[entry1SpiffeID.Path]),
 					{
 						Level:   logrus.InfoLevel,
 						Message: "API accessed",
@@ -3801,7 +3933,7 @@ func TestBatchUpdateEntry(t *testing.T) {
 							telemetry.Status:         "success",
 							telemetry.Type:           "audit",
 							telemetry.RegistrationID: m[entry1SpiffeID.Path],
-							telemetry.X509SVIDTTL:    "1000",
+							telemetry.X509SVIDTTL:    "18000",
 						},
 					},
 				}
@@ -3993,13 +4125,13 @@ func TestBatchUpdateEntry(t *testing.T) {
 			},
 			updateEntries: []*types.Entry{
 				{
-					DnsNames: []string{"dnsUpdated"},
+					DnsNames: []string{"dnsupdated"},
 				},
 			},
 			expectDsEntries: func(id string) []*types.Entry {
 				modifiedEntry := proto.Clone(initialEntry).(*types.Entry)
 				modifiedEntry.Id = id
-				modifiedEntry.DnsNames = []string{"dnsUpdated"}
+				modifiedEntry.DnsNames = []string{"dnsupdated"}
 				modifiedEntry.RevisionNumber = 1
 				return []*types.Entry{modifiedEntry}
 			},
@@ -4007,7 +4139,7 @@ func TestBatchUpdateEntry(t *testing.T) {
 				{
 					Status: &types.Status{Code: int32(codes.OK), Message: "OK"},
 					Entry: &types.Entry{
-						DnsNames: []string{"dnsUpdated"},
+						DnsNames: []string{"dnsupdated"},
 					},
 				},
 			},
@@ -4020,7 +4152,7 @@ func TestBatchUpdateEntry(t *testing.T) {
 							telemetry.Status:         "success",
 							telemetry.Type:           "audit",
 							telemetry.RegistrationID: m[entry1SpiffeID.Path],
-							telemetry.DNSName:        "dnsUpdated",
+							telemetry.DNSName:        "dnsupdated",
 						},
 					},
 				}
@@ -4071,7 +4203,98 @@ func TestBatchUpdateEntry(t *testing.T) {
 			},
 		},
 		{
-			name:           "Success Don't Update X509SVIDTTL",
+			name:           "Success Update AdditionalAttributes",
+			initialEntries: []*types.Entry{initialEntry},
+			inputMask: &types.EntryMask{
+				AdditionalAttributes: true,
+			},
+			outputMask: &types.EntryMask{
+				AdditionalAttributes: true,
+			},
+			updateEntries: []*types.Entry{
+				{
+					AdditionalAttributes: &types.Entry_AdditionalAttributes{
+						JwtSvidIncludeJti: true,
+					},
+				},
+			},
+			expectDsEntries: func(id string) []*types.Entry {
+				modifiedEntry := proto.Clone(initialEntry).(*types.Entry)
+				modifiedEntry.Id = id
+				modifiedEntry.AdditionalAttributes = &types.Entry_AdditionalAttributes{
+					JwtSvidIncludeJti: true,
+				}
+				modifiedEntry.RevisionNumber = 1
+				return []*types.Entry{modifiedEntry}
+			},
+			expectResults: []*entryv1.BatchUpdateEntryResponse_Result{
+				{
+					Status: &types.Status{Code: int32(codes.OK), Message: "OK"},
+					Entry: &types.Entry{
+						AdditionalAttributes: &types.Entry_AdditionalAttributes{
+							JwtSvidIncludeJti: true,
+						},
+					},
+				},
+			},
+			expectLogs: func(m map[string]string) []spiretest.LogEntry {
+				return []spiretest.LogEntry{
+					{
+						Level:   logrus.InfoLevel,
+						Message: "API accessed",
+						Data: logrus.Fields{
+							telemetry.Status:         "success",
+							telemetry.Type:           "audit",
+							telemetry.RegistrationID: m[entry1SpiffeID.Path],
+						},
+					},
+				}
+			},
+		},
+		{
+			name:           "Success Don't Update AdditionalAttributes",
+			initialEntries: []*types.Entry{initialEntry},
+			inputMask:      &types.EntryMask{
+				// With AdditionalAttributes false, the update should be a no-op for that field
+			},
+			outputMask: &types.EntryMask{
+				AdditionalAttributes: true,
+			},
+			updateEntries: []*types.Entry{
+				{
+					AdditionalAttributes: &types.Entry_AdditionalAttributes{
+						JwtSvidIncludeJti: true,
+					},
+				},
+			},
+			expectDsEntries: func(m string) []*types.Entry {
+				modifiedEntry := proto.Clone(initialEntry).(*types.Entry)
+				modifiedEntry.Id = m
+				modifiedEntry.RevisionNumber = 1
+				return []*types.Entry{modifiedEntry}
+			},
+			expectResults: []*entryv1.BatchUpdateEntryResponse_Result{
+				{
+					Status: &types.Status{Code: int32(codes.OK), Message: "OK"},
+					Entry:  &types.Entry{},
+				},
+			},
+			expectLogs: func(m map[string]string) []spiretest.LogEntry {
+				return []spiretest.LogEntry{
+					{
+						Level:   logrus.InfoLevel,
+						Message: "API accessed",
+						Data: logrus.Fields{
+							telemetry.Status:         "success",
+							telemetry.Type:           "audit",
+							telemetry.RegistrationID: m[entry1SpiffeID.Path],
+						},
+					},
+				}
+			},
+		},
+		{
+			name:           "Success Don't Update X509SVIDTTL or warn about ignored value",
 			initialEntries: []*types.Entry{initialEntry},
 			inputMask:      &types.EntryMask{
 				// With this empty, the update operation should be a no-op
@@ -4081,7 +4304,7 @@ func TestBatchUpdateEntry(t *testing.T) {
 			},
 			updateEntries: []*types.Entry{
 				{
-					X509SvidTtl: 500000,
+					X509SvidTtl: 18000,
 				},
 			},
 			expectDsEntries: func(m string) []*types.Entry {
@@ -4130,17 +4353,17 @@ func TestBatchUpdateEntry(t *testing.T) {
 			},
 			expectResults: []*entryv1.BatchUpdateEntryResponse_Result{
 				{
-					Status: &types.Status{Code: int32(codes.Internal), Message: "failed to update entry: datastore-sql: invalid registration entry: selector types must be the same when store SVID is enabled"},
+					Status: &types.Status{Code: int32(codes.InvalidArgument), Message: "failed to update entry: datastore-validation: invalid registration entry: selector types must be the same when store SVID is enabled"},
 				},
 			},
 			expectLogs: func(m map[string]string) []spiretest.LogEntry {
 				return []spiretest.LogEntry{
 					{
 						Level:   logrus.ErrorLevel,
-						Message: "Failed to update entry",
+						Message: "Invalid argument: failed to update entry",
 						Data: logrus.Fields{
 							telemetry.RegistrationID: m[entry1SpiffeID.Path],
-							logrus.ErrorKey:          "rpc error: code = Unknown desc = datastore-sql: invalid registration entry: selector types must be the same when store SVID is enabled",
+							logrus.ErrorKey:          "rpc error: code = InvalidArgument desc = datastore-validation: invalid registration entry: selector types must be the same when store SVID is enabled",
 						},
 					},
 					{
@@ -4148,12 +4371,56 @@ func TestBatchUpdateEntry(t *testing.T) {
 						Message: "API accessed",
 						Data: logrus.Fields{
 							telemetry.Status:         "error",
-							telemetry.StatusCode:     "Internal",
-							telemetry.StatusMessage:  "failed to update entry: datastore-sql: invalid registration entry: selector types must be the same when store SVID is enabled",
+							telemetry.StatusCode:     "InvalidArgument",
+							telemetry.StatusMessage:  "failed to update entry: datastore-validation: invalid registration entry: selector types must be the same when store SVID is enabled",
 							telemetry.Type:           "audit",
 							telemetry.RegistrationID: m[entry1SpiffeID.Path],
 							telemetry.Selectors:      "type1:key1:value,type2:key2:value",
 							telemetry.StoreSvid:      "true",
+						},
+					},
+				}
+			},
+		},
+		{
+			name:           "Fail WIT-SVID TTL",
+			initialEntries: []*types.Entry{initialEntry},
+			inputMask: &types.EntryMask{
+				WitSvidTtl: true,
+			},
+			updateEntries: []*types.Entry{
+				{
+					WitSvidTtl: 1000,
+				},
+			},
+			expectResults: []*entryv1.BatchUpdateEntryResponse_Result{
+				{
+					Status: &types.Status{
+						Code:    int32(codes.InvalidArgument),
+						Message: "failed to convert entry: WIT-SVID TTL is not supported yet",
+					},
+				},
+			},
+			expectLogs: func(m map[string]string) []spiretest.LogEntry {
+				return []spiretest.LogEntry{
+					{
+						Level:   logrus.ErrorLevel,
+						Message: "Invalid argument: failed to convert entry",
+						Data: logrus.Fields{
+							telemetry.RegistrationID: m[entry1SpiffeID.Path],
+							logrus.ErrorKey:          "WIT-SVID TTL is not supported yet",
+						},
+					},
+					{
+						Level:   logrus.InfoLevel,
+						Message: "API accessed",
+						Data: logrus.Fields{
+							telemetry.Status:         "error",
+							telemetry.Type:           "audit",
+							telemetry.RegistrationID: m[entry1SpiffeID.Path],
+							telemetry.StatusCode:     "InvalidArgument",
+							telemetry.StatusMessage:  "failed to convert entry: WIT-SVID TTL is not supported yet",
+							telemetry.WITSVIDTTL:     "1000",
 						},
 					},
 				}
@@ -4172,8 +4439,10 @@ func TestBatchUpdateEntry(t *testing.T) {
 			},
 			expectResults: []*entryv1.BatchUpdateEntryResponse_Result{
 				{
-					Status: &types.Status{Code: int32(codes.InvalidArgument),
-						Message: "failed to convert entry: invalid spiffe ID: trust domain is missing"},
+					Status: &types.Status{
+						Code:    int32(codes.InvalidArgument),
+						Message: "failed to convert entry: invalid spiffe ID: trust domain is missing",
+					},
 				},
 			},
 			expectLogs: func(m map[string]string) []spiretest.LogEntry {
@@ -4213,8 +4482,10 @@ func TestBatchUpdateEntry(t *testing.T) {
 			},
 			expectResults: []*entryv1.BatchUpdateEntryResponse_Result{
 				{
-					Status: &types.Status{Code: int32(codes.InvalidArgument),
-						Message: "failed to convert entry: invalid parent ID: trust domain is missing"},
+					Status: &types.Status{
+						Code:    int32(codes.InvalidArgument),
+						Message: "failed to convert entry: invalid parent ID: trust domain is missing",
+					},
 				},
 			},
 			expectLogs: func(m map[string]string) []spiretest.LogEntry {
@@ -4254,8 +4525,10 @@ func TestBatchUpdateEntry(t *testing.T) {
 			},
 			expectResults: []*entryv1.BatchUpdateEntryResponse_Result{
 				{
-					Status: &types.Status{Code: int32(codes.InvalidArgument),
-						Message: "failed to convert entry: invalid parent ID: trust domain is missing"},
+					Status: &types.Status{
+						Code:    int32(codes.InvalidArgument),
+						Message: "failed to convert entry: invalid parent ID: trust domain is missing",
+					},
 				},
 			},
 			expectLogs: func(m map[string]string) []spiretest.LogEntry {
@@ -4295,8 +4568,10 @@ func TestBatchUpdateEntry(t *testing.T) {
 			},
 			expectResults: []*entryv1.BatchUpdateEntryResponse_Result{
 				{
-					Status: &types.Status{Code: int32(codes.InvalidArgument),
-						Message: "failed to convert entry: invalid spiffe ID: trust domain is missing"},
+					Status: &types.Status{
+						Code:    int32(codes.InvalidArgument),
+						Message: "failed to convert entry: invalid spiffe ID: trust domain is missing",
+					},
 				},
 			},
 			expectLogs: func(m map[string]string) []spiretest.LogEntry {
@@ -4336,8 +4611,10 @@ func TestBatchUpdateEntry(t *testing.T) {
 			},
 			expectResults: []*entryv1.BatchUpdateEntryResponse_Result{
 				{
-					Status: &types.Status{Code: int32(codes.InvalidArgument),
-						Message: "failed to convert entry: selector list is empty"},
+					Status: &types.Status{
+						Code:    int32(codes.InvalidArgument),
+						Message: "failed to convert entry: selector list is empty",
+					},
 				},
 			},
 			expectLogs: func(m map[string]string) []spiretest.LogEntry {
@@ -4425,8 +4702,8 @@ func TestBatchUpdateEntry(t *testing.T) {
 					Entry: &types.Entry{
 						ParentId:    &types.SPIFFEID{TrustDomain: "example.org", Path: "/validUpdated"},
 						SpiffeId:    &types.SPIFFEID{TrustDomain: "example.org", Path: "/validUpdated"},
-						X509SvidTtl: 400000,
-						JwtSvidTtl:  300000,
+						X509SvidTtl: 4000,
+						JwtSvidTtl:  3000,
 						Selectors: []*types.Selector{
 							{Type: "unix", Value: "uid:9999"},
 						},
@@ -4457,8 +4734,9 @@ func TestBatchUpdateEntry(t *testing.T) {
 							telemetry.RevisionNumber: "0",
 							telemetry.Selectors:      "unix:uid:9999",
 							telemetry.SPIFFEID:       "spiffe://example.org/validUpdated",
-							telemetry.X509SVIDTTL:    "400000",
-							telemetry.JWTSVIDTTL:     "300000",
+							telemetry.X509SVIDTTL:    "4000",
+							telemetry.JWTSVIDTTL:     "3000",
+							telemetry.WITSVIDTTL:     "0",
 							telemetry.StoreSvid:      "false",
 							telemetry.Hint:           "newHint",
 							telemetry.CreatedAt:      "0",
@@ -4476,7 +4754,7 @@ func TestBatchUpdateEntry(t *testing.T) {
 			outputMask: nil,
 			updateEntries: []*types.Entry{
 				{
-					X509SvidTtl: 500000,
+					X509SvidTtl: 5000,
 				},
 			},
 			expectResults: []*entryv1.BatchUpdateEntryResponse_Result{
@@ -4485,7 +4763,7 @@ func TestBatchUpdateEntry(t *testing.T) {
 					Entry: &types.Entry{
 						ParentId:    parent,
 						SpiffeId:    entry1SpiffeID,
-						X509SvidTtl: 500000,
+						X509SvidTtl: 5000,
 						Selectors: []*types.Selector{
 							{Type: "unix", Value: "uid:1000"},
 							{Type: "unix", Value: "uid:2000"},
@@ -4510,7 +4788,7 @@ func TestBatchUpdateEntry(t *testing.T) {
 							telemetry.Status:         "success",
 							telemetry.Type:           "audit",
 							telemetry.RegistrationID: m[entry1SpiffeID.Path],
-							telemetry.X509SVIDTTL:    "500000",
+							telemetry.X509SVIDTTL:    "5000",
 						},
 					},
 				}
@@ -4565,13 +4843,13 @@ func TestBatchUpdateEntry(t *testing.T) {
 			outputMask: &types.EntryMask{},
 			updateEntries: []*types.Entry{
 				{
-					X509SvidTtl: 500000,
+					X509SvidTtl: 5000,
 				},
 			},
 			expectDsEntries: func(m string) []*types.Entry {
 				modifiedEntry := proto.Clone(initialEntry).(*types.Entry)
 				modifiedEntry.Id = m
-				modifiedEntry.X509SvidTtl = 500000
+				modifiedEntry.X509SvidTtl = 5000
 				modifiedEntry.RevisionNumber = 1
 				return []*types.Entry{modifiedEntry}
 			},
@@ -4590,14 +4868,13 @@ func TestBatchUpdateEntry(t *testing.T) {
 							telemetry.Status:         "success",
 							telemetry.Type:           "audit",
 							telemetry.RegistrationID: m[entry1SpiffeID.Path],
-							telemetry.X509SVIDTTL:    "500000",
+							telemetry.X509SVIDTTL:    "5000",
 						},
 					},
 				}
 			},
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			ds := fakedatastore.New(t)
 			test := setupServiceTest(t, ds)
@@ -4616,7 +4893,7 @@ func TestBatchUpdateEntry(t *testing.T) {
 			spiffeToIDMap := make(map[string]string)
 			updateEntries := tt.updateEntries
 			for i := range createResp.Results {
-				require.Equal(t, api.OK(), createResp.Results[i].Status)
+				require.Equal(t, commonapi.OK(), createResp.Results[i].Status)
 				updateEntries[i].Id = createResp.Results[i].Entry.Id
 				spiffeToIDMap[createResp.Results[i].Entry.SpiffeId.Path] = createResp.Results[i].Entry.Id
 			}
@@ -4770,10 +5047,10 @@ func setupServiceTest(t *testing.T, ds datastore.DataStore, options ...serviceTe
 		entry.RegisterService(s, service)
 	},
 		grpctest.OverrideContext(overrideContext),
-		grpctest.Middleware(middleware.WithAuditLog(false)),
+		grpctest.Middleware(middleware.WithAuditLog(false, false)),
 	)
 
-	conn := server.Dial(t)
+	conn := server.NewGRPCClient(t)
 
 	test.client = entryv1.NewEntryClient(conn)
 	test.done = server.Stop
@@ -4833,7 +5110,21 @@ type entryFetcher struct {
 	entries []*types.Entry
 }
 
-func (f *entryFetcher) FetchAuthorizedEntries(ctx context.Context, agentID spiffeid.ID) ([]*types.Entry, error) {
+func (f *entryFetcher) LookupAuthorizedEntries(ctx context.Context, agentID spiffeid.ID, _ map[string]struct{}) (map[string]api.ReadOnlyEntry, error) {
+	entries, err := f.FetchAuthorizedEntries(ctx, agentID)
+	if err != nil {
+		return nil, err
+	}
+
+	entriesMap := make(map[string]api.ReadOnlyEntry)
+	for _, entry := range entries {
+		entriesMap[entry.GetId()] = entry
+	}
+
+	return entriesMap, nil
+}
+
+func (f *entryFetcher) FetchAuthorizedEntries(ctx context.Context, agentID spiffeid.ID) ([]api.ReadOnlyEntry, error) {
 	if f.err != "" {
 		return nil, status.Error(codes.Internal, f.err)
 	}
@@ -4844,10 +5135,15 @@ func (f *entryFetcher) FetchAuthorizedEntries(ctx context.Context, agentID spiff
 	}
 
 	if caller != agentID {
-		return nil, fmt.Errorf("provided caller id is different to expected")
+		return nil, errors.New("provided caller id is different to expected")
 	}
 
-	return f.entries, nil
+	entries := []api.ReadOnlyEntry{}
+	for _, entry := range f.entries {
+		entries = append(entries, api.NewReadOnlyEntry(entry))
+	}
+
+	return entries, nil
 }
 
 type HasID interface {
@@ -4863,4 +5159,21 @@ func appendEntryIDs[T HasID](ids []string, entries []T) []string {
 		ids = append(ids, entry.GetId())
 	}
 	return ids
+}
+
+func entryLifetimeWarning(name, entryID string) spiretest.LogEntry {
+	return spiretest.LogEntry{
+		Level:   logrus.WarnLevel,
+		Message: "Requested TTL exceeds the lifetime guaranteed by scheduled authority rotation; shorter lifetimes may be issued",
+		Data: logrus.Fields{
+			telemetry.Alert:          "true",
+			telemetry.AlertType:      telemetry.ShortenedLifetimeAlertType,
+			telemetry.TTLName:        name,
+			telemetry.RequestedTTL:   "18000",
+			telemetry.MaxTTL:         "14400",
+			telemetry.CATTL:          "86400",
+			telemetry.SPIFFEID:       "spiffe://example.org/workload",
+			telemetry.RegistrationID: entryID,
+		},
+	}
 }

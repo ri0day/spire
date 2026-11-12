@@ -4,12 +4,14 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/andres-erbsen/clock"
-	"github.com/go-jose/go-jose/v3/jwt"
+	"github.com/go-jose/go-jose/v4/jwt"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/spire/pkg/common/idutil"
+	"github.com/spiffe/spire/pkg/common/jwtsvid"
 )
 
 type Config struct {
@@ -83,8 +85,8 @@ func (v *Validator) ValidateX509SVID(svid *x509.Certificate, id spiffeid.ID) err
 	}
 
 	if len(svid.ExtKeyUsage) > 0 {
-		hasServerAuth := hasExtKeyUsage(svid.ExtKeyUsage, x509.ExtKeyUsageServerAuth)
-		hasClientAuth := hasExtKeyUsage(svid.ExtKeyUsage, x509.ExtKeyUsageClientAuth)
+		hasServerAuth := slices.Contains(svid.ExtKeyUsage, x509.ExtKeyUsageServerAuth)
+		hasClientAuth := slices.Contains(svid.ExtKeyUsage, x509.ExtKeyUsageClientAuth)
 		switch {
 		case !hasServerAuth && hasClientAuth:
 			return errors.New("invalid X509-SVID: missing serverAuth extended key usage")
@@ -105,7 +107,7 @@ func (v *Validator) ValidateX509SVID(svid *x509.Certificate, id spiffeid.ID) err
 }
 
 func (v *Validator) ValidateWorkloadJWTSVID(rawToken string, id spiffeid.ID) error {
-	token, err := jwt.ParseSigned(rawToken)
+	token, err := jwt.ParseSigned(rawToken, jwtsvid.AllowedSignatureAlgorithms)
 	if err != nil {
 		return fmt.Errorf("failed to parse JWT-SVID for validation: %w", err)
 	}
@@ -127,8 +129,35 @@ func (v *Validator) ValidateWorkloadJWTSVID(rawToken string, id spiffeid.ID) err
 		return fmt.Errorf(`invalid JWT-SVID "nbf" claim: not yet valid until %s`, claims.NotBefore.Time().Format(time.RFC3339))
 	case len(claims.Audience) == 0:
 		return errors.New(`invalid JWT-SVID "aud" claim: required but missing`)
-	case hasEmptyAudienceValue(claims.Audience):
+	case slices.Contains(claims.Audience, ""):
 		return errors.New(`invalid JWT-SVID "aud" claim: contains empty value`)
+	}
+	return nil
+}
+
+func (v *Validator) ValidateWorkloadWITSVID(rawToken string, id spiffeid.ID) error {
+	token, err := jwt.ParseSigned(rawToken, jwtsvid.AllowedSignatureAlgorithms)
+	if err != nil {
+		return fmt.Errorf("failed to parse WIT-SVID for validation: %w", err)
+	}
+
+	var claims jwt.Claims
+	if err := token.UnsafeClaimsWithoutVerification(&claims); err != nil {
+		return fmt.Errorf("failed to extract WIT-SVID claims for validation: %w", err)
+	}
+
+	now := v.clock.Now()
+	switch {
+	case claims.Subject != id.String():
+		return fmt.Errorf(`invalid WIT-SVID "sub" claim: expected %q but got %q`, id, claims.Subject)
+	case claims.Expiry == nil:
+		return errors.New(`invalid WIT-SVID "exp" claim: required but missing`)
+	case !claims.Expiry.Time().After(now):
+		return fmt.Errorf(`invalid WIT-SVID "exp" claim: already expired as of %s`, claims.Expiry.Time().Format(time.RFC3339))
+	case claims.NotBefore != nil && claims.NotBefore.Time().After(now):
+		return fmt.Errorf(`invalid WIT-SVID "nbf" claim: not yet valid until %s`, claims.NotBefore.Time().Format(time.RFC3339))
+	case slices.Contains(claims.Audience, ""):
+		return errors.New(`invalid WIT-SVID "aud" claim: contains empty value`)
 	}
 	return nil
 }
@@ -162,23 +191,4 @@ func checkX509CertificateExpiration(cert *x509.Certificate, now time.Time) error
 		return fmt.Errorf("already expired as of %s", cert.NotAfter.Format(time.RFC3339))
 	}
 	return nil
-}
-
-func hasExtKeyUsage(extKeyUsage []x509.ExtKeyUsage, want x509.ExtKeyUsage) bool {
-	for _, candidate := range extKeyUsage {
-		if candidate == want {
-			return true
-		}
-	}
-	return false
-}
-
-func hasEmptyAudienceValue(audience jwt.Audience) bool {
-	// shift audience
-	for _, value := range audience {
-		if value == "" {
-			return true
-		}
-	}
-	return false
 }

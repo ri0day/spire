@@ -5,11 +5,13 @@ package process
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"unsafe"
 
 	"github.com/hashicorp/go-hclog"
 	"github.com/spiffe/spire/pkg/common/telemetry"
+	"github.com/spiffe/spire/pkg/common/util"
 	"golang.org/x/sys/windows"
 )
 
@@ -46,7 +48,11 @@ func (h *helper) GetContainerIDByProcess(pID int32, log hclog.Logger) (string, e
 	currentProcess := h.wapi.CurrentProcess()
 
 	// Duplicate the process handle that we want to validate, with limited permissions.
-	childProcessHandle, err := h.wapi.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pID))
+	pidUint32, err := util.CheckedCast[uint32](pID)
+	if err != nil {
+		return "", fmt.Errorf("invalid value for PID: %w", err)
+	}
+	childProcessHandle, err := h.wapi.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pidUint32)
 	if err != nil {
 		return "", fmt.Errorf("failed to open child process: %w", err)
 	}
@@ -63,18 +69,17 @@ func (h *helper) GetContainerIDByProcess(pID int32, log hclog.Logger) (string, e
 
 	// Verify if process ID is a vmcompute process
 	isVmcomputeProcess := func(pID uint32) bool {
-		for _, vmID := range vmComputeProcessIds {
-			if pID == vmID {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(vmComputeProcessIds, pID)
 	}
 
 	var jobNames []string
 	for _, handle := range handles {
+		pidUint32, err := util.CheckedCast[uint32](handle.UniqueProcessID)
+		if err != nil {
+			return "", fmt.Errorf("invalid value for PID: %w", err)
+		}
 		// Filter all handles related with vmcompute processes
-		if !isVmcomputeProcess(uint32(handle.UniqueProcessID)) {
+		if !isVmcomputeProcess(pidUint32) {
 			continue
 		}
 
@@ -138,7 +143,11 @@ func (h *helper) searchProcessByExeFile(exeFile string, log hclog.Logger) ([]uin
 
 func (h *helper) getJobName(handle SystemHandleInformationExItem, currentProcess windows.Handle, childProcessHandle windows.Handle, log hclog.Logger) (string, error) {
 	// Open the handle associated with the process ID, with permissions to duplicate the handle
-	hProcess, err := h.wapi.OpenProcess(windows.PROCESS_DUP_HANDLE, false, uint32(handle.UniqueProcessID))
+	pidUint32, err := util.CheckedCast[uint32](handle.UniqueProcessID)
+	if err != nil {
+		return "", fmt.Errorf("invalid value for PID: %w", err)
+	}
+	hProcess, err := h.wapi.OpenProcess(windows.PROCESS_DUP_HANDLE, false, pidUint32)
 	if err != nil {
 		if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
 			// This is expected when trying to open process as a non admin user
@@ -193,7 +202,7 @@ func (h *helper) getJobName(handle SystemHandleInformationExItem, currentProcess
 		return "", fmt.Errorf("failed to get object name: %w", err)
 	}
 
-	// Jobs created on windows environments start with "\Container_"
+	// Jobs created on Windows environments start with "\Container_"
 	if !strings.HasPrefix(objectName, containerPrefix) {
 		return "", nil
 	}

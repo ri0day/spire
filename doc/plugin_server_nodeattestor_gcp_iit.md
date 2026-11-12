@@ -1,6 +1,6 @@
 # Server plugin: NodeAttestor "gcp_iit"
 
-*Must be used in conjunction with the agent-side gcp_iit plugin*
+*Must be used in conjunction with the [agent-side gcp_iit plugin](plugin_agent_nodeattestor_gcp_iit.md)*
 
 The `gcp_iit` plugin automatically attests instances using the [GCP Instance Identity Token](https://cloud.google.com/compute/docs/instances/verifying-instance-identity). It also allows an operator to use GCP Instance IDs when defining SPIFFE ID attestation policies.
 Agents attested by the gcp_iit attestor will be issued a SPIFFE ID like `spiffe://TRUST_DOMAIN/spire/agent/gcp_iit/PROJECT_ID/INSTANCE_ID`
@@ -32,20 +32,20 @@ A sample configuration:
 
 This plugin generates the following selectors based on information contained in the Instance Identity Token:
 
-| Selector                | Example                                | Description                               |
-|-------------------------|----------------------------------------|-------------------------------------------|
-| `gcp_iit:project-id`    | `gcp_iit:project-id:big-kahuna-123456` | ID of the project containing the instance |
-| `gcp_iit:zone`          | `gcp_iit:zone:us-west1-b`              | Zone containing the instance              |
-| `gcp_iit:instance-name` | `gcp_iit:instance-name:blog-server`    | Name of the instance                      |
+| Selector                | Example                                                      | Description                               |
+|-------------------------|--------------------------------------------------------------|------------------------------------------ |
+| `gcp_iit:project-id`    | `gcp_iit:project-id:big-kahuna-123456`                       | ID of the project containing the instance |
+| `gcp_iit:zone`          | `gcp_iit:zone:us-west1-b`                                    | Zone containing the instance              |
+| `gcp_iit:instance-name` | `gcp_iit:instance-name:blog-server`                          | Name of the instance                      |
+| `gcp_iit:sa`            | `gcp_iit:sa:123456789-compute@developer.gserviceaccount.com` | Service account email                     |
 
 If `use_instance_metadata` is true, then the Google Compute Engine API is queried for instance metadata which is used to populate these additional selectors:
 
-| Selector           | Example                                                      | Description                          |
-|--------------------|--------------------------------------------------------------|--------------------------------------|
-| `gcp_iit:tag`      | `gcp_iit:tag:blog-server`                                    | Instance tag (one selector per)      |
-| `gcp_iit:sa`       | `gcp_iit:sa:123456789-compute@developer.gserviceaccount.com` | Service account (one selector per)   |
-| `gcp_iit:label`    | `gcp_iit:label:key:value`                                    | Instance label                       |
-| `gcp_iit:metadata` | `gcp_iit:metadata:key:value`                                 | Instance metadata (see caveat below) |
+| Selector           | Example                      | Description                          |
+|--------------------|------------------------------|--------------------------------------|
+| `gcp_iit:tag`      | `gcp_iit:tag:blog-server`    | Instance tag (one selector per)      |
+| `gcp_iit:label`    | `gcp_iit:label:key:value`    | Instance label                       |
+| `gcp_iit:metadata` | `gcp_iit:metadata:key:value` | Instance metadata (see caveat below) |
 
 Not all instance label and metadata values are useful for node selection. To
 prevent the creation of large amounts of useless selectors, labels and metadata
@@ -74,6 +74,7 @@ The service account must have IAM permissions and Authorization Scopes granting 
 
 The agent path template is a way of customizing the format of generated SPIFFE IDs for agents.
 The template formatter is using Golang text/template conventions, it can reference values provided by the plugin or in a [Compute Engine identity token](https://cloud.google.com/compute/docs/instances/verifying-instance-identity#payload).
+Details about the template engine are available in the [template engine documentation](template_engine.md). Note that agent SPIFFE IDs must be unique within a trust domain, so if two agents use the same service account, the path template must contain additional fully distinguishing identifiers.
 
 Some useful values are:
 
@@ -85,6 +86,7 @@ Some useful values are:
 | .ProjectNumber             | The unique number for the project where you created the instance |
 | .Zone                      | The zone where the instance is located                           |
 | .InstanceCreationTimestamp | A Unix timestamp indicating when you created the instance.       |
+| .ServiceAccount            | The service account email ("@" is replaced with "_")             |
 
 ## Security Considerations
 

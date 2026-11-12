@@ -32,8 +32,6 @@ func (c *grpcCredentials) ServerHandshake(conn net.Conn) (net.Conn, credentials.
 func (c *grpcCredentials) Info() credentials.ProtocolInfo {
 	return credentials.ProtocolInfo{
 		SecurityProtocol: authType,
-		SecurityVersion:  "0.2",
-		ServerName:       "spire-agent",
 	}
 }
 
@@ -53,15 +51,6 @@ func WatcherFromContext(ctx context.Context) (Watcher, bool) {
 	}
 
 	return ai.Watcher, true
-}
-
-func CallerFromContext(ctx context.Context) (CallerInfo, bool) {
-	ai, ok := AuthInfoFromContext(ctx)
-	if !ok {
-		return CallerInfo{}, false
-	}
-
-	return ai.Caller, true
 }
 
 func AuthInfoFromContext(ctx context.Context) (AuthInfo, bool) {

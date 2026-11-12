@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"path"
 	"testing"
 
 	"github.com/spiffe/spire/pkg/agent"
@@ -17,6 +18,10 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 )
+
+// testWorkloadAPIAddr is a platform-appropriate SPIFFE Workload API endpoint
+// address for exercising trust_bundle_spiffe_workload_api validation.
+const testWorkloadAPIAddr = "unix:///tmp/agent.sock"
 
 func TestCommand_Run(t *testing.T) {
 	testTempDir := t.TempDir()
@@ -150,6 +155,8 @@ func TestParseFlagsGood(t *testing.T) {
 		"-serverAddress=127.0.0.1",
 		"-serverPort=8081",
 		"-socketPath=/tmp/spire-agent/public/api.sock",
+		"-disableWorkloadAPI",
+		"-disableSDSAPI",
 		"-trustBundle=conf/agent/dummy_root_ca.crt",
 		"-trustBundleUrl=https://test.url",
 		"-trustDomain=example.org",
@@ -161,6 +168,8 @@ func TestParseFlagsGood(t *testing.T) {
 	assert.Equal(t, c.ServerAddress, "127.0.0.1")
 	assert.Equal(t, c.ServerPort, 8081)
 	assert.Equal(t, c.SocketPath, "/tmp/spire-agent/public/api.sock")
+	assert.True(t, c.DisableWorkloadAPI)
+	assert.True(t, c.DisableSDSAPI)
 	assert.Equal(t, c.TrustBundlePath, "conf/agent/dummy_root_ca.crt")
 	assert.Equal(t, c.TrustBundleURL, "https://test.url")
 	assert.Equal(t, c.TrustDomain, "example.org")
@@ -186,28 +195,28 @@ func TestParseConfigGood(t *testing.T) {
 	// Check for plugins configurations
 	expectedPluginConfigs := catalog.PluginConfigs{
 		{
-			Type:     "plugin_type_agent",
-			Name:     "plugin_name_agent",
-			Path:     "./pluginAgentCmd",
-			Checksum: "pluginAgentChecksum",
-			Data:     data,
-			Disabled: false,
+			Type:       "plugin_type_agent",
+			Name:       "plugin_name_agent",
+			Path:       "./pluginAgentCmd",
+			Checksum:   "pluginAgentChecksum",
+			DataSource: catalog.FixedData(data),
+			Disabled:   false,
 		},
 		{
-			Type:     "plugin_type_agent",
-			Name:     "plugin_disabled",
-			Path:     "./pluginAgentCmd",
-			Checksum: "pluginAgentChecksum",
-			Data:     data,
-			Disabled: true,
+			Type:       "plugin_type_agent",
+			Name:       "plugin_disabled",
+			Path:       "./pluginAgentCmd",
+			Checksum:   "pluginAgentChecksum",
+			DataSource: catalog.FixedData(data),
+			Disabled:   true,
 		},
 		{
-			Type:     "plugin_type_agent",
-			Name:     "plugin_enabled",
-			Path:     "./pluginAgentCmd",
-			Checksum: "pluginAgentChecksum",
-			Data:     data,
-			Disabled: false,
+			Type:       "plugin_type_agent",
+			Name:       "plugin_enabled",
+			Path:       "./pluginAgentCmd",
+			Checksum:   "pluginAgentChecksum",
+			DataSource: catalog.FileData("plugin.conf"),
+			Disabled:   false,
 		},
 	}
 
@@ -237,7 +246,7 @@ func mergeInputCasesOS() []mergeInputCase {
 			},
 		},
 		{
-			msg:       "socket_path should be configuable by CLI flag",
+			msg:       "socket_path should be configurable by CLI flag",
 			fileInput: func(c *Config) {},
 			cliInput: func(c *agentConfig) {
 				c.SocketPath = "foo"
@@ -271,7 +280,9 @@ func mergeInputCasesOS() []mergeInputCase {
 	}
 }
 
-func newAgentConfigCasesOS() []newAgentConfigCase {
+func newAgentConfigCasesOS(t *testing.T) []newAgentConfigCase {
+	testDir := t.TempDir()
+
 	return []newAgentConfigCase{
 		{
 			msg: "socket_path should be correctly configured",
@@ -290,6 +301,20 @@ func newAgentConfigCasesOS() []newAgentConfigCase {
 			},
 			test: func(t *testing.T, c *agent.Config) {
 				require.Equal(t, "/foo", c.AdminBindAddress.String())
+				require.Equal(t, "unix", c.AdminBindAddress.Network())
+			},
+		},
+		{
+			msg: "admin_socket_path can share disabled public endpoint socket directory",
+			input: func(c *Config) {
+				c.Agent.SocketPath = "/tmp/workload.sock"
+				c.Agent.DisableWorkloadAPI = true
+				c.Agent.DisableSDSAPI = true
+				c.Agent.AdminSocketPath = "/tmp/admin.sock"
+			},
+			test: func(t *testing.T, c *agent.Config) {
+				require.Nil(t, c.BindAddress)
+				require.Equal(t, "/tmp/admin.sock", c.AdminBindAddress.String())
 				require.Equal(t, "unix", c.AdminBindAddress.Network())
 			},
 		},
@@ -329,6 +354,18 @@ func newAgentConfigCasesOS() []newAgentConfigCase {
 			},
 		},
 		{
+			msg:         "admin_socket_path same folder as socket_path when only workload API is disabled",
+			expectError: true,
+			input: func(c *Config) {
+				c.Agent.SocketPath = "/tmp/workload.sock"
+				c.Agent.DisableWorkloadAPI = true
+				c.Agent.AdminSocketPath = "/tmp/admin.sock"
+			},
+			test: func(t *testing.T, c *agent.Config) {
+				require.Nil(t, c)
+			},
+		},
+		{
 			msg:         "admin_socket_path configured with subfolder socket_path",
 			expectError: true,
 			input: func(c *Config) {
@@ -351,12 +388,47 @@ func newAgentConfigCasesOS() []newAgentConfigCase {
 			},
 		},
 		{
+			msg: "broker socket can share disabled public endpoint socket directory",
+			input: func(c *Config) {
+				c.Agent.SocketPath = "/tmp/workload.sock"
+				c.Agent.DisableWorkloadAPI = true
+				c.Agent.DisableSDSAPI = true
+				c.Agent.Experimental.Broker = &brokerHCLConfig{
+					SocketPath: "/tmp/broker.sock",
+					Brokers: []brokerHCLEntry{
+						{
+							ID: "spiffe://example.org/broker",
+							AllowedReferenceTypes: []brokerAllowedReferenceTypeHCLEntry{
+								{TypeURL: "type.googleapis.com/spiffe.broker.WorkloadPIDReference"},
+							},
+						},
+					},
+				}
+			},
+			test: func(t *testing.T, c *agent.Config) {
+				require.Nil(t, c.BindAddress)
+				require.Len(t, c.Broker.BindAddresses, 1)
+				require.Equal(t, "/tmp/broker.sock", c.Broker.BindAddresses[0].String())
+				require.Equal(t, "unix", c.Broker.BindAddresses[0].Network())
+			},
+		},
+		{
 			msg: "admin_socket_path not provided",
 			input: func(c *Config) {
 				c.Agent.AdminSocketPath = ""
 			},
 			test: func(t *testing.T, c *agent.Config) {
 				require.Nil(t, c.AdminBindAddress)
+			},
+		},
+		{
+			msg: "log_file allows to reopen",
+			input: func(c *Config) {
+				c.Agent.LogFile = path.Join(testDir, "foo")
+			},
+			test: func(t *testing.T, c *agent.Config) {
+				require.NotNil(t, c.Log)
+				require.NotNil(t, c.LogReopener)
 			},
 		},
 	}

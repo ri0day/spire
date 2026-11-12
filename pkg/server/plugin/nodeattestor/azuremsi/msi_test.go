@@ -5,6 +5,7 @@ import (
 	"crypto/rsa"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -12,10 +13,10 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute"
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork"
-	jose "github.com/go-jose/go-jose/v3"
-	"github.com/go-jose/go-jose/v3/jwt"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v9"
+	jose "github.com/go-jose/go-jose/v4"
+	"github.com/go-jose/go-jose/v4/jwt"
 	"github.com/sirupsen/logrus"
 	"github.com/sirupsen/logrus/hooks/test"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
@@ -148,9 +149,10 @@ func (s *MSIAttestorSuite) TestAttestFailsWithBadSignature() {
 func (s *MSIAttestorSuite) TestAttestFailsWithAlgorithmMismatch() {
 	// sign a token with a different key algorithm than that of the key in
 	// the key set.
+	key := testkey.MustEC256()
 	signer, err := jose.NewSigner(jose.SigningKey{
-		Algorithm: jose.HS256,
-		Key:       []byte("0123456789ABCDEF"),
+		Algorithm: jose.ES256,
+		Key:       key,
 	}, &jose.SignerOptions{
 		ExtraHeaders: map[jose.HeaderKey]any{
 			"kid": "KEYID",
@@ -158,7 +160,7 @@ func (s *MSIAttestorSuite) TestAttestFailsWithAlgorithmMismatch() {
 	})
 	s.Require().NoError(err)
 
-	token, err := jwt.Signed(signer).CompactSerialize()
+	token, err := jwt.Signed(signer).Serialize()
 	s.Require().NoError(err)
 
 	s.requireAttestError(s.T(), makeAttestPayload(token),
@@ -242,7 +244,7 @@ func (s *MSIAttestorSuite) TestAttestSuccessWithCustomSPIFFEIDTemplate() {
 
 	payload := s.signAttestPayload("KEYID", resourceID, "TENANTID", "PRINCIPALID")
 
-	selectorValues := append([]string{}, vmSelectors...)
+	selectorValues := slices.Clone(vmSelectors)
 	sort.Strings(selectorValues)
 
 	var expected []*common.Selector
@@ -258,11 +260,8 @@ func (s *MSIAttestorSuite) TestAttestSuccessWithCustomSPIFFEIDTemplate() {
 		tenants = {
 			"TENANTID" = {
 				resource_id = "https://example.org/app/"
-				use_msi = true
 			}
-			"TENANTID2" = {
-				use_msi = true
-			}
+			"TENANTID2" = { }
 		}
 		agent_path_template = "/{{ .PluginName }}/{{ .TenantID }}"
 	`)
@@ -458,7 +457,7 @@ func (s *MSIAttestorSuite) TestConfigure() {
 
 	s.T().Run("missing trust domain", func(t *testing.T) {
 		err := doConfig(t, catalog.CoreConfig{}, "", nil)
-		spiretest.RequireGRPCStatusContains(t, err, codes.InvalidArgument, "core configuration missing trust domain")
+		spiretest.RequireGRPCStatusContains(t, err, codes.InvalidArgument, "server core configuration must contain trust_domain")
 	})
 
 	s.T().Run("missing tenants", func(t *testing.T) {
@@ -483,7 +482,6 @@ func (s *MSIAttestorSuite) TestConfigure() {
 		tenants = {
 			"TENANTID" = {
 				resource_id = "https://example.org/app/"
-				use_msi = true
 			}
 		}
 		`, nil)
@@ -515,31 +513,11 @@ func (s *MSIAttestorSuite) TestConfigure() {
 				app_id = "APPID"
 				app_secret = "APPSECRET"
 			}
-			"TENANTID2" = {
-				use_msi = true
-			}
+			"TENANTID2" = {	}
 		}
 		`, nil)
 		require.NoError(t, err)
 		require.ElementsMatch(t, []string{"TENANTSUBSCRIPTIONID", "SUBSCRIPTIONID"}, clients)
-	})
-
-	s.T().Run("failure with both app creds and msi", func(t *testing.T) {
-		err := doConfig(t, coreConfig, `
-		tenants = {
-			"TENANTID" = {
-				resource_id = "https://example.org/app/"
-				use_msi = true
-				subscription_id = "TENANTSUBSCRIPTIONID"
-				app_id = "APPID"
-				app_secret = "APPSECRET"
-			}
-			"TENANTID2" = {
-				use_msi = true
-			}
-		}
-		`, nil)
-		spiretest.RequireGRPCStatusContains(t, err, codes.InvalidArgument, `misconfigured tenant "TENANTID": cannot use both MSI and app authentication`)
 	})
 
 	s.T().Run("failure with tenant missing subscription id", func(t *testing.T) {
@@ -610,7 +588,7 @@ func (s *MSIAttestorSuite) TestConfigure() {
 				},
 			},
 		)
-		spiretest.RequireGRPCStatusContains(t, err, codes.Internal, `unable to fetch client credential: some error`)
+		spiretest.RequireGRPCStatusContains(t, err, codes.InvalidArgument, `unable to fetch client credential: some error`)
 	})
 }
 
@@ -651,7 +629,7 @@ func (s *MSIAttestorSuite) signToken(keyID, audience, tenantID, principalID stri
 		})
 	}
 
-	token, err := builder.CompactSerialize()
+	token, err := builder.Serialize()
 	s.Require().NoError(err)
 	return token
 }
@@ -665,11 +643,8 @@ func (s *MSIAttestorSuite) loadPlugin(options ...plugintest.Option) nodeattestor
 		tenants = {
 			"TENANTID" = {
 				resource_id = "https://example.org/app/"
-				use_msi = true
 			}
-			"TENANTID2" = {
-				use_msi = true
-			}
+			"TENANTID2" = { }
 		}
 	`, options...)
 }
@@ -804,7 +779,7 @@ func (f *fakeAzureCredential) GetToken(context.Context, policy.TokenRequestOptio
 }
 
 func makeAttestPayload(token string) []byte {
-	return []byte(fmt.Sprintf(`{"token": %q}`, token))
+	return fmt.Appendf(nil, `{"token": %q}`, token)
 }
 
 func expectNoChallenge(context.Context, []byte) ([]byte, error) {

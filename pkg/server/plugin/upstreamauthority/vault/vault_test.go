@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/x509"
 	"fmt"
+	"os"
 	"testing"
 	"text/template"
 	"time"
@@ -16,7 +17,9 @@ import (
 
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/spire/pkg/common/catalog"
+	"github.com/spiffe/spire/pkg/common/coretypes/x509certificate"
 	"github.com/spiffe/spire/pkg/common/pemutil"
+	"github.com/spiffe/spire/pkg/server/common/vault"
 	"github.com/spiffe/spire/pkg/server/plugin/upstreamauthority"
 	"github.com/spiffe/spire/proto/spire/common"
 	"github.com/spiffe/spire/test/plugintest"
@@ -45,7 +48,7 @@ func TestConfigure(t *testing.T) {
 		plainConfig              string
 		expectMsgPrefix          string
 		expectCode               codes.Code
-		wantAuth                 AuthMethod
+		wantAuth                 vault.AuthMethod
 		wantNamespaceIsNotNil    bool
 		envKeyVal                map[string]string
 		expectToken              string
@@ -62,22 +65,22 @@ func TestConfigure(t *testing.T) {
 		{
 			name:        "Configure plugin with Client Certificate authentication params given in config file",
 			configTmpl:  testTokenAuthConfigTpl,
-			wantAuth:    TOKEN,
+			wantAuth:    vault.TOKEN,
 			expectToken: "test-token",
 		},
 		{
 			name:       "Configure plugin with Token authentication params given as environment variables",
 			configTmpl: testTokenAuthConfigWithEnvTpl,
 			envKeyVal: map[string]string{
-				envVaultToken: "test-token",
+				vault.EnvVaultToken: "test-token",
 			},
-			wantAuth:    TOKEN,
+			wantAuth:    vault.TOKEN,
 			expectToken: "test-token",
 		},
 		{
 			name:                     "Configure plugin with Client Certificate authentication params given in config file",
 			configTmpl:               testCertAuthConfigTpl,
-			wantAuth:                 CERT,
+			wantAuth:                 vault.CERT,
 			expectCertAuthMountPoint: "test-cert-auth",
 			expectClientCertPath:     "testdata/client-cert.pem",
 			expectClientKeyPath:      "testdata/client-key.pem",
@@ -86,10 +89,10 @@ func TestConfigure(t *testing.T) {
 			name:       "Configure plugin with Client Certificate authentication params given as environment variables",
 			configTmpl: testCertAuthConfigWithEnvTpl,
 			envKeyVal: map[string]string{
-				envVaultClientCert: "testdata/client-cert.pem",
-				envVaultClientKey:  testClientKey,
+				vault.EnvVaultClientCert: "testdata/client-cert.pem",
+				vault.EnvVaultClientKey:  testClientKey,
 			},
-			wantAuth:                 CERT,
+			wantAuth:                 vault.CERT,
 			expectCertAuthMountPoint: "test-cert-auth",
 			expectClientCertPath:     testClientCert,
 			expectClientKeyPath:      testClientKey,
@@ -97,7 +100,7 @@ func TestConfigure(t *testing.T) {
 		{
 			name:                  "Configure plugin with AppRole authenticate params given in config file",
 			configTmpl:            testAppRoleAuthConfigTpl,
-			wantAuth:              APPROLE,
+			wantAuth:              vault.APPROLE,
 			appRoleAuthMountPoint: "test-approle-auth",
 			appRoleID:             "test-approle-id",
 			appRoleSecretID:       "test-approle-secret-id",
@@ -106,10 +109,10 @@ func TestConfigure(t *testing.T) {
 			name:       "Configure plugin with AppRole authentication params given as environment variables",
 			configTmpl: testAppRoleAuthConfigWithEnvTpl,
 			envKeyVal: map[string]string{
-				envVaultAppRoleID:       "test-approle-id",
-				envVaultAppRoleSecretID: "test-approle-secret-id",
+				vault.EnvVaultAppRoleID:       "test-approle-id",
+				vault.EnvVaultAppRoleSecretID: "test-approle-secret-id",
 			},
-			wantAuth:              APPROLE,
+			wantAuth:              vault.APPROLE,
 			appRoleAuthMountPoint: "test-approle-auth",
 			appRoleID:             "test-approle-id",
 			appRoleSecretID:       "test-approle-secret-id",
@@ -117,7 +120,7 @@ func TestConfigure(t *testing.T) {
 		{
 			name:                    "Configure plugin with Kubernetes authentication params given in config file",
 			configTmpl:              testK8sAuthConfigTpl,
-			wantAuth:                K8S,
+			wantAuth:                vault.K8S,
 			expectK8sAuthMountPoint: "test-k8s-auth",
 			expectK8sAuthTokenPath:  "testdata/k8s/token",
 			expectK8sAuthRoleName:   "my-role",
@@ -132,15 +135,15 @@ func TestConfigure(t *testing.T) {
 			name:       "Pass VaultAddr via the environment variable",
 			configTmpl: testConfigWithVaultAddrEnvTpl,
 			envKeyVal: map[string]string{
-				envVaultAddr: fmt.Sprintf("https://%v/", addr),
+				vault.EnvVaultAddr: fmt.Sprintf("https://%v/", addr),
 			},
-			wantAuth:    TOKEN,
+			wantAuth:    vault.TOKEN,
 			expectToken: "test-token",
 		},
 		{
 			name:                  "Configure plugin with given namespace",
 			configTmpl:            testNamespaceConfigTpl,
-			wantAuth:              TOKEN,
+			wantAuth:              vault.TOKEN,
 			wantNamespaceIsNotNil: true,
 			expectToken:           "test-token",
 		},
@@ -148,24 +151,23 @@ func TestConfigure(t *testing.T) {
 			name:            "Malformed configuration",
 			plainConfig:     "invalid-config",
 			expectCode:      codes.InvalidArgument,
-			expectMsgPrefix: "unable to decode configuration:",
+			expectMsgPrefix: "plugin configuration is malformed",
 		},
 		{
 			name:            "Required parameters are not given / k8s_auth_role_name",
 			configTmpl:      testK8sAuthNoRoleNameTpl,
-			wantAuth:        K8S,
+			wantAuth:        vault.K8S,
 			expectCode:      codes.InvalidArgument,
 			expectMsgPrefix: "k8s_auth_role_name is required",
 		},
 		{
 			name:            "Required parameters are not given / token_path",
 			configTmpl:      testK8sAuthNoTokenPathTpl,
-			wantAuth:        K8S,
+			wantAuth:        vault.K8S,
 			expectCode:      codes.InvalidArgument,
 			expectMsgPrefix: "token_path is required",
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			var err error
 
@@ -178,7 +180,7 @@ func TestConfigure(t *testing.T) {
 				return v, ok
 			}
 
-			plainConfig := ""
+			var plainConfig string
 			if tt.plainConfig != "" {
 				plainConfig = tt.plainConfig
 			} else {
@@ -198,27 +200,27 @@ func TestConfigure(t *testing.T) {
 			}
 
 			require.NotNil(t, p.cc)
-			require.NotNil(t, p.cc.clientParams)
+			require.NotNil(t, p.cc.ClientParams)
 
 			switch tt.wantAuth {
 			case TOKEN:
-				require.Equal(t, tt.expectToken, p.cc.clientParams.Token)
+				require.Equal(t, tt.expectToken, p.cc.ClientParams.Token)
 			case CERT:
-				require.Equal(t, tt.expectCertAuthMountPoint, p.cc.clientParams.CertAuthMountPoint)
-				require.Equal(t, tt.expectClientCertPath, p.cc.clientParams.ClientCertPath)
-				require.Equal(t, tt.expectClientKeyPath, p.cc.clientParams.ClientKeyPath)
+				require.Equal(t, tt.expectCertAuthMountPoint, p.cc.ClientParams.CertAuthMountPoint)
+				require.Equal(t, tt.expectClientCertPath, p.cc.ClientParams.ClientCertPath)
+				require.Equal(t, tt.expectClientKeyPath, p.cc.ClientParams.ClientKeyPath)
 			case APPROLE:
-				require.NotNil(t, p.cc.clientParams.AppRoleAuthMountPoint)
-				require.NotNil(t, p.cc.clientParams.AppRoleID)
-				require.NotNil(t, p.cc.clientParams.AppRoleSecretID)
+				require.NotNil(t, p.cc.ClientParams.AppRoleAuthMountPoint)
+				require.NotNil(t, p.cc.ClientParams.AppRoleID)
+				require.NotNil(t, p.cc.ClientParams.AppRoleSecretID)
 			case K8S:
-				require.Equal(t, tt.expectK8sAuthMountPoint, p.cc.clientParams.K8sAuthMountPoint)
-				require.Equal(t, tt.expectK8sAuthRoleName, p.cc.clientParams.K8sAuthRoleName)
-				require.Equal(t, tt.expectK8sAuthTokenPath, p.cc.clientParams.K8sAuthTokenPath)
+				require.Equal(t, tt.expectK8sAuthMountPoint, p.cc.ClientParams.K8sAuthMountPoint)
+				require.Equal(t, tt.expectK8sAuthRoleName, p.cc.ClientParams.K8sAuthRoleName)
+				require.Equal(t, tt.expectK8sAuthTokenPath, p.cc.ClientParams.K8sAuthTokenPath)
 			}
 
 			if tt.wantNamespaceIsNotNil {
-				require.NotNil(t, p.cc.clientParams.Namespace)
+				require.NotNil(t, p.cc.ClientParams.Namespace)
 			}
 		})
 	}
@@ -345,8 +347,8 @@ func TestMintX509CA(t *testing.T) {
 			name: "Mint X509CA SVID with TLS cert authentication",
 			csr:  csr.Raw,
 			config: &Configuration{
-				CACertPath:    "testdata/root-cert.pem",
 				PKIMountPoint: "test-pki",
+				CACertPath:    "testdata/root-cert.pem",
 				CertAuth: &CertAuthConfig{
 					CertAuthMountPoint: "test-cert-auth",
 					CertAuthRoleName:   "test",
@@ -371,8 +373,8 @@ func TestMintX509CA(t *testing.T) {
 			name: "Mint X509CA SVID with AppRole authentication",
 			csr:  csr.Raw,
 			config: &Configuration{
-				CACertPath:    "testdata/root-cert.pem",
 				PKIMountPoint: "test-pki",
+				CACertPath:    "testdata/root-cert.pem",
 				AppRoleAuth: &AppRoleAuthConfig{
 					AppRoleMountPoint: "test-approle-auth",
 					RoleID:            "test-approle-id",
@@ -396,8 +398,8 @@ func TestMintX509CA(t *testing.T) {
 			name: "Mint X509CA SVID with Kubernetes authentication",
 			csr:  csr.Raw,
 			config: &Configuration{
-				CACertPath:    "testdata/root-cert.pem",
 				PKIMountPoint: "test-pki",
+				CACertPath:    "testdata/root-cert.pem",
 				K8sAuth: &K8sAuthConfig{
 					K8sAuthMountPoint: "test-k8s-auth",
 					K8sAuthRoleName:   "my-role",
@@ -420,8 +422,8 @@ func TestMintX509CA(t *testing.T) {
 			name: "Mint X509CA SVID with TLS cert authentication / Token is not renewable",
 			csr:  csr.Raw,
 			config: &Configuration{
-				CACertPath:    "testdata/root-cert.pem",
 				PKIMountPoint: "test-pki",
+				CACertPath:    "testdata/root-cert.pem",
 				CertAuth: &CertAuthConfig{
 					CertAuthMountPoint: "test-cert-auth",
 					CertAuthRoleName:   "test",
@@ -446,8 +448,8 @@ func TestMintX509CA(t *testing.T) {
 			name: "Mint X509CA SVID with AppRole authentication / Token is not renewable",
 			csr:  csr.Raw,
 			config: &Configuration{
-				CACertPath:    "testdata/root-cert.pem",
 				PKIMountPoint: "test-pki",
+				CACertPath:    "testdata/root-cert.pem",
 				AppRoleAuth: &AppRoleAuthConfig{
 					AppRoleMountPoint: "test-approle-auth",
 					RoleID:            "test-approle-id",
@@ -471,8 +473,8 @@ func TestMintX509CA(t *testing.T) {
 			name: "Mint X509CA SVID with Kubernetes authentication / Token is not renewable",
 			csr:  csr.Raw,
 			config: &Configuration{
-				CACertPath:    "testdata/root-cert.pem",
 				PKIMountPoint: "test-pki",
+				CACertPath:    "testdata/root-cert.pem",
 				K8sAuth: &K8sAuthConfig{
 					K8sAuthMountPoint: "test-k8s-auth",
 					K8sAuthRoleName:   "my-role",
@@ -495,8 +497,8 @@ func TestMintX509CA(t *testing.T) {
 			name: "Mint X509CA SVID with Namespace",
 			csr:  csr.Raw,
 			config: &Configuration{
-				Namespace:     "test-ns",
 				PKIMountPoint: "test-pki",
+				Namespace:     "test-ns",
 				CACertPath:    "testdata/root-cert.pem",
 				TokenAuth: &TokenAuthConfig{
 					Token: "test-token",
@@ -666,7 +668,6 @@ func TestMintX509CA(t *testing.T) {
 			expectMsgPrefix: "upstreamauthority(vault): failed to parse CSR data:",
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			fakeVaultServer := tt.fakeServer()
 
@@ -683,9 +684,10 @@ func TestMintX509CA(t *testing.T) {
 			}
 			if tt.config != nil {
 				tt.config.VaultAddr = fmt.Sprintf("https://%s", addr)
-				cp, err := p.genClientParams(tt.authMethod, tt.config)
+				cp, err := vault.GenClientParams(tt.authMethod, &tt.config.BaseConfiguration, os.LookupEnv)
 				require.NoError(t, err)
-				cc, err := NewClientConfig(cp, p.logger)
+				cp.PKIMountPoint = tt.config.PKIMountPoint
+				cc, err := vault.NewClientConfig(cp, p.logger)
 				require.NoError(t, err)
 				p.cc = cc
 				options = append(options, plugintest.ConfigureJSON(tt.config))
@@ -713,12 +715,12 @@ func TestMintX509CA(t *testing.T) {
 			x509CAIDs := certChainURIs(x509CA)
 			require.Equal(t, tt.expectX509CA, x509CAIDs)
 
-			x509AuthoritiesIDs := certChainURIs(x509Authorities)
+			x509AuthoritiesIDs := authChainURIs(x509Authorities)
 			require.Equal(t, tt.expectedX509Authorities, x509AuthoritiesIDs)
 
-			if p.cc.clientParams.Namespace != "" {
-				headers := p.vc.vaultClient.Headers()
-				require.Equal(t, p.cc.clientParams.Namespace, headers.Get(consts.NamespaceHeaderName))
+			if p.cc.ClientParams.Namespace != "" {
+				headers := p.vc.VaultClient().Headers()
+				require.Equal(t, p.cc.ClientParams.Namespace, headers.Get(consts.NamespaceHeaderName))
 			}
 		})
 	}
@@ -740,9 +742,9 @@ func TestMintX509CA_InvalidCSR(t *testing.T) {
 	v1 := new(upstreamauthority.V1)
 	plugintest.Load(t, builtin(p), v1,
 		plugintest.ConfigureJSON(&Configuration{
+			PKIMountPoint: "test-pki",
 			VaultAddr:     fmt.Sprintf("https://%v/", addr),
 			CACertPath:    testRootCert,
-			PKIMountPoint: "test-pki",
 			TokenAuth: &TokenAuthConfig{
 				Token: "test-token",
 			},
@@ -772,9 +774,9 @@ func TestPublishJWTKey(t *testing.T) {
 	ua := new(upstreamauthority.V1)
 	plugintest.Load(t, BuiltIn(), ua,
 		plugintest.ConfigureJSON(Configuration{
+			PKIMountPoint: "test-pki",
 			VaultAddr:     fmt.Sprintf("https://%v/", addr),
 			CACertPath:    testRootCert,
-			PKIMountPoint: "test-pki",
 			TokenAuth: &TokenAuthConfig{
 				Token: "test-token",
 			},
@@ -790,6 +792,11 @@ func TestPublishJWTKey(t *testing.T) {
 	spiretest.RequireGRPCStatus(t, err, codes.Unimplemented, "upstreamauthority(vault): publishing upstream is unsupported")
 	assert.Nil(t, jwtAuthorities)
 	assert.Nil(t, stream)
+
+	witAuthorities, witStream, err := ua.PublishWITKey(context.Background(), &common.PublicKey{Kid: "ID", PkixBytes: pkixBytes})
+	spiretest.RequireGRPCStatus(t, err, codes.Unimplemented, "upstreamauthority(vault): publishing upstream is unsupported")
+	assert.Nil(t, witAuthorities)
+	assert.Nil(t, witStream)
 }
 
 func getTestConfigureRequest(t *testing.T, addr string, tpl string) string {
@@ -838,6 +845,14 @@ func certChainURIs(chain []*x509.Certificate) []string {
 	var uris []string
 	for _, cert := range chain {
 		uris = append(uris, certURI(cert))
+	}
+	return uris
+}
+
+func authChainURIs(chain []*x509certificate.X509Authority) []string {
+	var uris []string
+	for _, authority := range chain {
+		uris = append(uris, certURI(authority.Certificate))
 	}
 	return uris
 }

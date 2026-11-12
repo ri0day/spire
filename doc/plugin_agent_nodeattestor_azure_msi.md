@@ -1,6 +1,6 @@
 # Agent plugin: NodeAttestor "azure_msi"
 
-*Must be used in conjunction with the server-side azure_msi plugin*
+*Must be used in conjunction with the [server-side azure_msi plugin](plugin_server_nodeattestor_azure_msi.md)*
 
 The `azure_msi` plugin attests nodes running in Microsoft Azure that have
 Managed Service Identity (MSI) enabled. Agent nodes acquire a signed MSI token
@@ -15,8 +15,8 @@ spiffe://<trust_domain>/spire/agent/azure_msi/<tenant_id>/<principal_id>
 The agent needs to be running in Azure, in a VM with MSI enabled, in order to
 use this method of node attestation.
 
-| Configuration | Description                                                                                                                       | Default                       |
-|---------------|-----------------------------------------------------------------------------------------------------------------------------------|-------------------------------|
+| Configuration | Description                                                                                                                       | Default                         |
+|---------------|-----------------------------------------------------------------------------------------------------------------------------------|---------------------------------|
 | `resource_id` | The resource ID (or audience) to request for the MSI token. The server will reject tokens with resource IDs it does not recognize | <https://management.azure.com/> |
 
 It is important to note that the resource ID MUST be for a well known Azure

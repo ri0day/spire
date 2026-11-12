@@ -33,6 +33,7 @@ type AttestedNode struct {
 	NewSerialNumber string
 	NewExpiresAt    *time.Time
 	CanReattest     bool
+	AgentVersion    string
 
 	Selectors []*NodeSelector
 }
@@ -52,19 +53,6 @@ type AttestedNodeEvent struct {
 // TableName gets table name for AttestedNodeEvent
 func (AttestedNodeEvent) TableName() string {
 	return "attested_node_entries_events"
-}
-
-type V3AttestedNode struct {
-	Model
-
-	SpiffeID     string `gorm:"unique_index"`
-	DataType     string
-	SerialNumber string
-	ExpiresAt    time.Time
-}
-
-func (V3AttestedNode) TableName() string {
-	return "attested_node_entries"
 }
 
 // NodeSelector holds a node selector by spiffe ID
@@ -112,6 +100,14 @@ type RegisteredEntry struct {
 
 	// TTL of JWT identities derived from this entry
 	JWTSvidTTL int32 `gorm:"column:jwt_svid_ttl"`
+
+	// TTL of WIT identities derived from this entry
+	WITSvidTTL int32 `gorm:"column:wit_svid_ttl"`
+
+	// AdditionalAttributes may contain a number of optional fields controlling
+	// the various aspects of the agent's behaviour with respect to a given
+	// registration entry
+	AdditionalAttributes []byte `gorm:"size:65535,column:additional_attributes"`
 }
 
 // RegisteredEntryEvent holds the entry id of a registered entry that had an event
@@ -176,7 +172,7 @@ type FederatedTrustDomain struct {
 	// is "https_spiffe"
 	EndpointSPIFFEID string
 
-	// Implicit indicates wether the trust domain automatically federates with
+	// Implicit indicates whether the trust domain automatically federates with
 	// all registration entries by default or not.
 	Implicit bool
 }
@@ -191,6 +187,10 @@ func (FederatedTrustDomain) TableName() string {
 // manage the rotation of the keys in each server.
 type CAJournal struct {
 	Model
+
+	// JournalID is reserved for a future externally exposed journal identifier.
+	// It is not used by the current datastore implementation.
+	JournalID string `gorm:"unique_index"`
 
 	// Information about X509 and JWT authorities of a single server.
 	Data []byte `gorm:"size:16777215"` // Make MySQL to use MEDIUMBLOB(max 16MB) - doesn't affect PostgreSQL/SQLite

@@ -2,12 +2,11 @@ package datastore
 
 import (
 	"context"
-	"crypto"
 	"net/url"
 	"time"
 
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
-	types "github.com/spiffe/spire-api-sdk/proto/spire/api/types"
+	"github.com/spiffe/spire-api-sdk/proto/spire/api/types"
 	"github.com/spiffe/spire/proto/spire/common"
 )
 
@@ -25,38 +24,39 @@ type DataStore interface {
 	UpdateBundle(context.Context, *common.Bundle, *common.BundleMask) (*common.Bundle, error)
 
 	// Keys
-	TaintX509CA(ctx context.Context, trustDomainID string, publicKeyToTaint crypto.PublicKey) error
-	RevokeX509CA(ctx context.Context, trustDomainID string, publicKeyToRevoke crypto.PublicKey) error
+	TaintX509CA(ctx context.Context, trustDomainID string, subjectKeyIDToTaint string) error
+	RevokeX509CA(ctx context.Context, trustDomainID string, subjectKeyIDToRevoke string) error
 	TaintJWTKey(ctx context.Context, trustDomainID string, authorityID string) (*common.PublicKey, error)
 	RevokeJWTKey(ctx context.Context, trustDomainID string, authorityID string) (*common.PublicKey, error)
 
 	// Entries
-	CountRegistrationEntries(context.Context) (int32, error)
+	CountRegistrationEntries(context.Context, *CountRegistrationEntriesRequest) (int32, error)
 	CreateRegistrationEntry(context.Context, *common.RegistrationEntry) (*common.RegistrationEntry, error)
 	CreateOrReturnRegistrationEntry(context.Context, *common.RegistrationEntry) (*common.RegistrationEntry, bool, error)
 	DeleteRegistrationEntry(ctx context.Context, entryID string) (*common.RegistrationEntry, error)
-	FetchRegistrationEntry(ctx context.Context, entryID string) (*common.RegistrationEntry, error)
+	FetchRegistrationEntries(ctx context.Context, entryIDs []string) (map[string]*common.RegistrationEntry, error)
 	ListRegistrationEntries(context.Context, *ListRegistrationEntriesRequest) (*ListRegistrationEntriesResponse, error)
 	PruneRegistrationEntries(ctx context.Context, expiresBefore time.Time) error
 	UpdateRegistrationEntry(context.Context, *common.RegistrationEntry, *common.RegistrationEntryMask) (*common.RegistrationEntry, error)
 
 	// Entries Events
-	ListRegistrationEntriesEvents(ctx context.Context, req *ListRegistrationEntriesEventsRequest) (*ListRegistrationEntriesEventsResponse, error)
-	PruneRegistrationEntriesEvents(ctx context.Context, olderThan time.Duration) error
-	GetLatestRegistrationEntryEventID(ctx context.Context) (uint, error)
+	ListRegistrationEntryEvents(ctx context.Context, req *ListRegistrationEntryEventsRequest) (*ListRegistrationEntryEventsResponse, error)
+	PruneRegistrationEntryEvents(ctx context.Context, olderThan time.Duration) error
+	FetchRegistrationEntryEvent(ctx context.Context, eventID uint) (*RegistrationEntryEvent, error)
 
 	// Nodes
-	CountAttestedNodes(context.Context) (int32, error)
+	CountAttestedNodes(context.Context, *CountAttestedNodesRequest) (int32, error)
 	CreateAttestedNode(context.Context, *common.AttestedNode) (*common.AttestedNode, error)
 	DeleteAttestedNode(ctx context.Context, spiffeID string) (*common.AttestedNode, error)
 	FetchAttestedNode(ctx context.Context, spiffeID string) (*common.AttestedNode, error)
 	ListAttestedNodes(context.Context, *ListAttestedNodesRequest) (*ListAttestedNodesResponse, error)
 	UpdateAttestedNode(context.Context, *common.AttestedNode, *common.AttestedNodeMask) (*common.AttestedNode, error)
+	PruneAttestedExpiredNodes(ctx context.Context, expiredBefore time.Time, includeNonReattestable bool, batchSize int) error
 
 	// Nodes Events
-	ListAttestedNodesEvents(ctx context.Context, req *ListAttestedNodesEventsRequest) (*ListAttestedNodesEventsResponse, error)
-	PruneAttestedNodesEvents(ctx context.Context, olderThan time.Duration) error
-	GetLatestAttestedNodeEventID(ctx context.Context) (uint, error)
+	ListAttestedNodeEvents(ctx context.Context, req *ListAttestedNodeEventsRequest) (*ListAttestedNodeEventsResponse, error)
+	PruneAttestedNodeEvents(ctx context.Context, olderThan time.Duration) error
+	FetchAttestedNodeEvent(ctx context.Context, eventID uint) (*AttestedNodeEvent, error)
 
 	// Node selectors
 	GetNodeSelectors(ctx context.Context, spiffeID string, dataConsistency DataConsistency) ([]*common.Selector, error)
@@ -80,6 +80,19 @@ type DataStore interface {
 	SetCAJournal(ctx context.Context, caJournal *CAJournal) (*CAJournal, error)
 	FetchCAJournal(ctx context.Context, activeX509AuthorityID string) (*CAJournal, error)
 	PruneCAJournals(ctx context.Context, allCAsExpireBefore int64) error
+}
+
+// TestableDataStore extends DataStore with helper methods that are only meant
+// to be used from tests. Implementations that back tests (the SQL plugin and
+// the fake datastore) satisfy this interface; production code should depend on
+// DataStore instead.
+type TestableDataStore interface {
+	DataStore
+
+	CreateRegistrationEntryEventForTesting(ctx context.Context, event *RegistrationEntryEvent) error
+	DeleteRegistrationEntryEventForTesting(ctx context.Context, eventID uint) error
+	CreateAttestedNodeEventForTesting(ctx context.Context, event *AttestedNodeEvent) error
+	DeleteAttestedNodeEventForTesting(ctx context.Context, eventID uint) error
 	ListCAJournalsForTesting(ctx context.Context) ([]*CAJournal, error)
 }
 
@@ -156,9 +169,11 @@ type ListAttestedNodesRequest struct {
 	ByBanned          *bool
 	ByExpiresBefore   time.Time
 	BySelectorMatch   *BySelectors
+	BySpiffeIDs       []string
 	FetchSelectors    bool
 	Pagination        *Pagination
 	ByCanReattest     *bool
+	ValidAt           time.Time
 }
 
 type ListAttestedNodesResponse struct {
@@ -166,8 +181,10 @@ type ListAttestedNodesResponse struct {
 	Pagination *Pagination
 }
 
-type ListAttestedNodesEventsRequest struct {
+type ListAttestedNodeEventsRequest struct {
+	DataConsistency    DataConsistency
 	GreaterThanEventID uint
+	LessThanEventID    uint
 }
 
 type AttestedNodeEvent struct {
@@ -175,9 +192,8 @@ type AttestedNodeEvent struct {
 	SpiffeID string
 }
 
-type ListAttestedNodesEventsResponse struct {
-	Events       []AttestedNodeEvent
-	FirstEventID uint
+type ListAttestedNodeEventsResponse struct {
+	Events []AttestedNodeEvent
 }
 
 type ListBundlesRequest struct {
@@ -206,6 +222,7 @@ type ListRegistrationEntriesRequest struct {
 	Pagination      *Pagination
 	ByFederatesWith *ByFederatesWith
 	ByHint          string
+	ByDownstream    *bool
 }
 
 type CAJournal struct {
@@ -219,8 +236,10 @@ type ListRegistrationEntriesResponse struct {
 	Pagination *Pagination
 }
 
-type ListRegistrationEntriesEventsRequest struct {
+type ListRegistrationEntryEventsRequest struct {
+	DataConsistency    DataConsistency
 	GreaterThanEventID uint
+	LessThanEventID    uint
 }
 
 type RegistrationEntryEvent struct {
@@ -228,9 +247,8 @@ type RegistrationEntryEvent struct {
 	EntryID string
 }
 
-type ListRegistrationEntriesEventsResponse struct {
-	Events       []RegistrationEntryEvent
-	FirstEventID uint
+type ListRegistrationEntryEventsResponse struct {
+	Events []RegistrationEntryEvent
 }
 
 type ListFederationRelationshipsRequest struct {
@@ -240,6 +258,25 @@ type ListFederationRelationshipsRequest struct {
 type ListFederationRelationshipsResponse struct {
 	FederationRelationships []*FederationRelationship
 	Pagination              *Pagination
+}
+
+type CountAttestedNodesRequest struct {
+	ByAttestationType string
+	ByBanned          *bool
+	ByExpiresBefore   time.Time
+	BySelectorMatch   *BySelectors
+	FetchSelectors    bool
+	ByCanReattest     *bool
+}
+
+type CountRegistrationEntriesRequest struct {
+	DataConsistency DataConsistency
+	ByParentID      string
+	BySelectors     *BySelectors
+	BySpiffeID      string
+	ByFederatesWith *ByFederatesWith
+	ByHint          string
+	ByDownstream    *bool
 }
 
 type BundleEndpointType string

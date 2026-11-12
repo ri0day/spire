@@ -2,13 +2,11 @@ package run
 
 import (
 	"context"
-	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net"
-	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
@@ -19,25 +17,31 @@ import (
 	"syscall"
 	"time"
 
+	"dario.cat/mergo"
 	"github.com/google/go-cmp/cmp"
 	"github.com/hashicorp/hcl"
 	"github.com/hashicorp/hcl/hcl/ast"
 	"github.com/hashicorp/hcl/hcl/token"
-	"github.com/imdario/mergo"
 	"github.com/mitchellh/cli"
 	"github.com/sirupsen/logrus"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"github.com/spiffe/go-spiffe/v2/workloadapi"
 	"github.com/spiffe/spire/pkg/agent"
+	"github.com/spiffe/spire/pkg/agent/broker"
+	"github.com/spiffe/spire/pkg/agent/client"
+	"github.com/spiffe/spire/pkg/agent/manager"
+	"github.com/spiffe/spire/pkg/agent/trustbundlesources"
 	"github.com/spiffe/spire/pkg/agent/workloadkey"
-	"github.com/spiffe/spire/pkg/common/bundleutil"
 	"github.com/spiffe/spire/pkg/common/catalog"
 	common_cli "github.com/spiffe/spire/pkg/common/cli"
+	"github.com/spiffe/spire/pkg/common/config"
+	"github.com/spiffe/spire/pkg/common/errorutil"
 	"github.com/spiffe/spire/pkg/common/fflag"
 	"github.com/spiffe/spire/pkg/common/health"
 	"github.com/spiffe/spire/pkg/common/idutil"
 	"github.com/spiffe/spire/pkg/common/log"
-	"github.com/spiffe/spire/pkg/common/pemutil"
 	"github.com/spiffe/spire/pkg/common/telemetry"
+	"github.com/spiffe/spire/pkg/common/tlspolicy"
 )
 
 const (
@@ -53,9 +57,6 @@ const (
 	defaultDefaultAllBundlesName       = "ALL"
 	defaultDisableSPIFFECertValidation = false
 
-	bundleFormatPEM    = "pem"
-	bundleFormatSPIFFE = "spiffe"
-
 	minimumAvailabilityTarget = 24 * time.Hour
 )
 
@@ -69,29 +70,41 @@ type Config struct {
 }
 
 type agentConfig struct {
-	DataDir                       string    `hcl:"data_dir"`
-	AdminSocketPath               string    `hcl:"admin_socket_path"`
-	InsecureBootstrap             bool      `hcl:"insecure_bootstrap"`
-	RetryBootstrap                bool      `hcl:"retry_bootstrap"`
-	JoinToken                     string    `hcl:"join_token"`
-	LogFile                       string    `hcl:"log_file"`
-	LogFormat                     string    `hcl:"log_format"`
-	LogLevel                      string    `hcl:"log_level"`
-	LogSourceLocation             bool      `hcl:"log_source_location"`
-	SDS                           sdsConfig `hcl:"sds"`
-	ServerAddress                 string    `hcl:"server_address"`
-	ServerPort                    int       `hcl:"server_port"`
-	SocketPath                    string    `hcl:"socket_path"`
-	WorkloadX509SVIDKeyType       string    `hcl:"workload_x509_svid_key_type"`
-	TrustBundleFormat             string    `hcl:"trust_bundle_format"`
-	TrustBundlePath               string    `hcl:"trust_bundle_path"`
-	TrustBundleURL                string    `hcl:"trust_bundle_url"`
-	TrustDomain                   string    `hcl:"trust_domain"`
-	AllowUnauthenticatedVerifiers bool      `hcl:"allow_unauthenticated_verifiers"`
-	AllowedForeignJWTClaims       []string  `hcl:"allowed_foreign_jwt_claims"`
-	AvailabilityTarget            string    `hcl:"availability_target"`
+	DataDir                       string              `hcl:"data_dir"`
+	AdminSocketPath               string              `hcl:"admin_socket_path"`
+	InsecureBootstrap             bool                `hcl:"insecure_bootstrap"`
+	RebootstrapMode               string              `hcl:"rebootstrap_mode"`
+	RebootstrapDelay              string              `hcl:"rebootstrap_delay"`
+	JoinToken                     string              `hcl:"join_token"`
+	JoinTokenFile                 string              `hcl:"join_token_file"`
+	LogFile                       string              `hcl:"log_file"`
+	LogFileRotation               *log.RotationConfig `hcl:"log_file_rotation"`
+	LogFormat                     string              `hcl:"log_format"`
+	LogLevel                      string              `hcl:"log_level"`
+	LogSelectors                  []string            `hcl:"log_selectors"`
+	LogSourceLocation             bool                `hcl:"log_source_location"`
+	SDS                           sdsConfig           `hcl:"sds"`
+	ServerAddress                 string              `hcl:"server_address"`
+	ServerPort                    int                 `hcl:"server_port"`
+	SocketPath                    string              `hcl:"socket_path"`
+	DisableWorkloadAPI            bool                `hcl:"disable_workload_api"`
+	DisableSDSAPI                 bool                `hcl:"disable_sds_api"`
+	WorkloadX509SVIDKeyType       string              `hcl:"workload_x509_svid_key_type"`
+	TrustBundleFormat             string              `hcl:"trust_bundle_format"`
+	TrustBundlePath               string              `hcl:"trust_bundle_path"`
+	TrustBundleSpiffeWorkloadAPI  string              `hcl:"trust_bundle_spiffe_workload_api"`
+	TrustBundleUnixSocket         string              `hcl:"trust_bundle_unix_socket"`
+	TrustBundleURL                string              `hcl:"trust_bundle_url"`
+	TrustDomain                   string              `hcl:"trust_domain"`
+	AllowUnauthenticatedVerifiers bool                `hcl:"allow_unauthenticated_verifiers"`
+	AllowedForeignJWTClaims       []string            `hcl:"allowed_foreign_jwt_claims"`
+	AvailabilityTarget            string              `hcl:"availability_target"`
+	X509SVIDCacheMaxSize          int                 `hcl:"x509_svid_cache_max_size"`
+	JWTSVIDCacheMaxSize           int                 `hcl:"jwt_svid_cache_max_size"`
 
 	AuthorizedDelegates []string `hcl:"authorized_delegates"`
+
+	TLSConfig *tlspolicy.TLSConfig `hcl:"tls_config"`
 
 	ConfigPath string
 	ExpandEnv  bool
@@ -104,9 +117,157 @@ type agentConfig struct {
 	Experimental     experimentalConfig `hcl:"experimental"`
 
 	UnusedKeyPositions map[string][]token.Pos `hcl:",unusedKeyPositions"`
+}
 
-	// Deprecated configurables
-	DisableReattestToRenew bool `hcl:"disable_reattest_to_renew"`
+// brokerHCLConfig is the HCL block for the SPIFFE Broker API endpoint:
+//
+//	broker {
+//	    # At least one of these MUST be set; both MAY be set to expose the
+//	    # broker endpoint over both transports simultaneously (e.g., UDS
+//	    # for a local sidecar broker AND TCP for a remote broker).
+//	    socket_path       = "/run/spire/agent/broker.sock"   # POSIX-only UDS
+//	    bind_address      = "0.0.0.0:8443"                   # TCP, both platforms
+//	    reattest_interval = "10m"                             # default
+//	    reattest_jitter   = 0.1                               # default
+//
+//	    brokers = [
+//	        {
+//	            id = "spiffe://example.org/some/broker"
+//	            allowed_reference_types = [
+//	                {
+//	                    type_url = "type.googleapis.com/spiffe.broker.KubernetesObjectReference"
+//	                    allow_over_tcp = true
+//	                },
+//	            ]
+//	        },
+//	    ]
+//	}
+type brokerHCLConfig struct {
+	// SocketPath binds the broker endpoint to a Unix domain socket at the
+	// given path. POSIX-only.
+	SocketPath string `hcl:"socket_path"`
+
+	// BindAddress binds the broker endpoint to a TCP address ("host:port").
+	// Works on both POSIX and Windows.
+	BindAddress string `hcl:"bind_address"`
+
+	// ReattestInterval is how often active X.509-SVID subscriptions re-attest
+	// their workload reference. Defaults to 10 minutes and must be at least
+	// 1 minute.
+	ReattestInterval string `hcl:"reattest_interval"`
+
+	// ReattestJitter is the fraction of ReattestInterval used to jitter each
+	// re-attestation interval. Defaults to 0.1.
+	ReattestJitter *float64 `hcl:"reattest_jitter"`
+
+	// Brokers enumerates the brokers authorized to talk to this agent's
+	// broker endpoint. Each entry's `id` is any valid SPIFFE ID; cross-
+	// trust-domain broker identities are allowed.
+	Brokers []brokerHCLEntry `hcl:"brokers"`
+
+	UnusedKeyPositions map[string][]token.Pos `hcl:",unusedKeyPositions"`
+}
+
+type brokerHCLEntry struct {
+	ID string `hcl:"id"`
+
+	// AllowedReferenceTypes restricts which WorkloadReference types this
+	// broker may use. Each entry's type_url is the verbatim protobuf type
+	// URL that the workload attestor plugin inspects. Use `"*"` to allow
+	// any reference type. Must list at least one entry.
+	AllowedReferenceTypes []brokerAllowedReferenceTypeHCLEntry `hcl:"allowed_reference_types"`
+
+	UnusedKeyPositions map[string][]token.Pos `hcl:",unusedKeyPositions"`
+}
+
+type brokerAllowedReferenceTypeHCLEntry struct {
+	// TypeURL is the verbatim protobuf type URL the workload attestor plugin
+	// inspects. The wildcard `"*"` allows any reference type.
+	TypeURL string `hcl:"type_url"`
+
+	// AllowOverTCP permits this reference type over the TCP listener. The
+	// default is false, so the reference type is only allowed over UDS.
+	AllowOverTCP bool `hcl:"allow_over_tcp"`
+
+	UnusedKeyPositions map[string][]token.Pos `hcl:",unusedKeyPositions"`
+}
+
+// brokerBindAddrs resolves the broker endpoint's listener addresses from
+// the HCL block. Returns one address per configured transport (TCP via
+// `bind_address`, UDS via `socket_path`). Both MAY be set; at least one
+// MUST be set. The TCP branch is platform-agnostic and resolved here; the
+// UDS branch delegates to `brokerSocketAddr` which is defined per platform
+// (POSIX has UDS support; Windows rejects with an error).
+func (c *agentConfig) brokerBindAddrs() ([]net.Addr, error) {
+	sp, ba := c.Experimental.Broker.SocketPath, c.Experimental.Broker.BindAddress
+	if sp == "" && ba == "" {
+		return nil, errors.New("experimental.broker requires socket_path, bind_address, or both")
+	}
+	var addrs []net.Addr
+	if sp != "" {
+		//nolint: staticcheck,nolintlint // staticcheck because brokerSocketAddr always returns an error on Windows, nolintlint because this lint does nothing on linux
+		uds, err := c.brokerSocketAddr()
+		//nolint: staticcheck,nolintlint // same here because the linter complains about both of these lines
+		if err != nil {
+			return nil, err
+		}
+		addrs = append(addrs, uds)
+	}
+	if ba != "" {
+		tcp, err := net.ResolveTCPAddr("tcp", ba)
+		if err != nil {
+			return nil, fmt.Errorf("invalid experimental.broker.bind_address %q: %w", ba, err)
+		}
+		addrs = append(addrs, tcp)
+	}
+	return addrs, nil
+}
+
+const minBrokerReattestInterval = time.Minute
+
+func brokerReattestIntervalFromHCL(in string) (time.Duration, error) {
+	if in == "" {
+		return 0, nil
+	}
+	interval, err := time.ParseDuration(in)
+	if err != nil {
+		return 0, fmt.Errorf("experimental.broker.reattest_interval: %w", err)
+	}
+	if interval < minBrokerReattestInterval {
+		return 0, fmt.Errorf("experimental.broker.reattest_interval must be at least %s", minBrokerReattestInterval)
+	}
+	return interval, nil
+}
+
+func brokerReattestJitterFromHCL(in *float64) (*float64, error) {
+	if in == nil {
+		return nil, nil
+	}
+	if *in < 0 || *in >= 1 {
+		return nil, fmt.Errorf("experimental.broker.reattest_jitter (%.2f) must be in the [0, 1) range", *in)
+	}
+	jitter := *in
+	return &jitter, nil
+}
+
+func brokerAllowedReferenceTypesFromHCL(brokerID string, in []brokerAllowedReferenceTypeHCLEntry) ([]broker.AllowedReferenceType, error) {
+	if len(in) == 0 {
+		return nil, fmt.Errorf("experimental.broker.brokers[%s].allowed_reference_types: must list at least one reference type URL", brokerID)
+	}
+	out := make([]broker.AllowedReferenceType, 0, len(in))
+	for i, allowed := range in {
+		if allowed.TypeURL == "" {
+			return nil, fmt.Errorf("experimental.broker.brokers[%s].allowed_reference_types[%d].type_url: must be specified", brokerID, i)
+		}
+		if allowed.TypeURL == "*" && len(in) != 1 {
+			return nil, fmt.Errorf("experimental.broker.brokers[%s].allowed_reference_types: wildcard \"*\" must be the only allowed reference type", brokerID)
+		}
+		out = append(out, broker.AllowedReferenceType{
+			TypeURL:      allowed.TypeURL,
+			AllowOverTCP: allowed.AllowOverTCP,
+		})
+	}
+	return out, nil
 }
 
 type sdsConfig struct {
@@ -116,17 +277,69 @@ type sdsConfig struct {
 	DisableSPIFFECertValidation bool   `hcl:"disable_spiffe_cert_validation"`
 }
 
+type workloadAPIRateLimitConfig struct {
+	FetchX509SVID    *int `hcl:"fetch_x509_svid"`
+	FetchJWTSVID     *int `hcl:"fetch_jwt_svid"`
+	FetchX509Bundles *int `hcl:"fetch_x509_bundles"`
+	FetchJWTBundles  *int `hcl:"fetch_jwt_bundles"`
+	FetchWITSVID     *int `hcl:"fetch_wit_svid"`
+	FetchWITBundles  *int `hcl:"fetch_wit_bundles"`
+	StreamSecrets    *int `hcl:"stream_secrets"`
+	FetchSecrets     *int `hcl:"fetch_secrets"`
+
+	UnusedKeyPositions map[string][]token.Pos `hcl:",unusedKeyPositions"`
+}
+
+type syncRetryBackoffConfig struct {
+	// MaxInterval is the upper limit of the interval between retries.
+	// Defaults to 48 times the sync interval, capped at 8 minutes.
+	MaxInterval string `hcl:"max_interval"`
+
+	// BackoffMultiplier is the factor the interval is multiplied by after
+	// each failed synchronization. Defaults to 1.5.
+	BackoffMultiplier *float64 `hcl:"backoff_multiplier"`
+
+	// Jitter is the fraction of the interval the interval is randomized by.
+	// Defaults to 0.10.
+	Jitter *float64 `hcl:"jitter"`
+
+	UnusedKeyPositions map[string][]token.Pos `hcl:",unusedKeyPositions"`
+}
+
 type experimentalConfig struct {
-	SyncInterval             string `hcl:"sync_interval"`
-	NamedPipeName            string `hcl:"named_pipe_name"`
-	AdminNamedPipeName       string `hcl:"admin_named_pipe_name"`
-	UseSyncAuthorizedEntries bool   `hcl:"use_sync_authorized_entries"`
+	SyncInterval              string `hcl:"sync_interval"`
+	JWTSVIDCacheHitTimeout    string `hcl:"jwt_svid_cache_hit_timeout"`
+	RPCTimeout                string `hcl:"rpc_timeout"`
+	MaxBundleWorkers          int    `hcl:"max_bundle_workers"`
+	NamedPipeName             string `hcl:"named_pipe_name"`
+	AdminNamedPipeName        string `hcl:"admin_named_pipe_name"`
+	RequirePQKEM              bool   `hcl:"require_pq_kem"`
+	ServerLoadBalancingConfig string `hcl:"server_load_balancing_config"`
+	EnableWITSVIDs            bool   `hcl:"enable_wit_svids"`
+	WITSVIDCacheMaxSize       int    `hcl:"wit_svid_cache_max_size"`
+
+	// SyncRetryBackoff holds the configuration of the exponential backoff
+	// applied between failed synchronizations with the server.
+	SyncRetryBackoff *syncRetryBackoffConfig `hcl:"sync_retry_backoff"`
+
+	// UseXDS resolves the SPIRE server through xDS instead of DNS.
+	// server_address becomes an xDS listener name (server_port must be unset) so
+	// an xDS management server can drive locality-aware routing and
+	// priority-based failover across the servers in the trust domain. The
+	// management server endpoint and this agent's node locality are configured
+	// out-of-band via the gRPC xDS bootstrap (GRPC_XDS_BOOTSTRAP /
+	// GRPC_XDS_BOOTSTRAP_CONFIG).
+	UseXDS bool `hcl:"use_xds"`
+
+	RateLimit workloadAPIRateLimitConfig `hcl:"ratelimit"`
+
+	// Broker holds the configuration for the SPIFFE Broker API endpoint
+	// (distinct from the Delegated Identity API's authorized_delegates).
+	// Kept under `experimental` while the spec stabilizes — breaking
+	// changes may land before this moves to the top-level config.
+	Broker *brokerHCLConfig `hcl:"broker"`
 
 	Flags fflag.RawConfig `hcl:"feature_flags"`
-
-	UnusedKeyPositions   map[string][]token.Pos `hcl:",unusedKeyPositions"`
-	X509SVIDCacheMaxSize int                    `hcl:"x509_svid_cache_max_size"`
-	DisableLRUCache      bool                   `hcl:"disable_lru_cache"`
 }
 
 type Command struct {
@@ -163,6 +376,16 @@ func Help(name string, writer io.Writer) string {
 }
 
 func LoadConfig(name string, args []string, logOptions []log.Option, output io.Writer, allowUnknownConfig bool) (*agent.Config, error) {
+	return loadConfig(name, args, logOptions, output, allowUnknownConfig, false)
+}
+
+// LoadConfigForValidation loads the configuration without opening log_file, so
+// that validating the config of a running agent does not touch its log.
+func LoadConfigForValidation(name string, args []string, logOptions []log.Option, output io.Writer) (*agent.Config, error) {
+	return loadConfig(name, args, logOptions, output, false, true)
+}
+
+func loadConfig(name string, args []string, logOptions []log.Option, output io.Writer, allowUnknownConfig, skipLogFile bool) (*agent.Config, error) {
 	// First parse the CLI flags so we can get the config
 	// file path, if set
 	cliInput, err := parseFlags(name, args, output)
@@ -187,7 +410,7 @@ func LoadConfig(name string, args []string, logOptions []log.Option, output io.W
 		return nil, fmt.Errorf("error loading feature flags: %w", err)
 	}
 
-	return NewAgentConfig(input, logOptions, allowUnknownConfig)
+	return newAgentConfig(input, logOptions, allowUnknownConfig, skipLogFile)
 }
 
 func (cmd *Command) Run(args []string) int {
@@ -212,7 +435,7 @@ func (cmd *Command) Run(args []string) int {
 	defer stop()
 
 	err = a.Run(ctx)
-	if err != nil {
+	if err != nil && !errorutil.IsCanceled(err) {
 		c.Log.WithError(err).Error("Agent crashed")
 		return 1
 	}
@@ -230,23 +453,63 @@ func (c *agentConfig) validate() error {
 		return errors.New("agent section must be configured")
 	}
 
+	// Validate join token configuration
+	if c.JoinToken != "" && c.JoinTokenFile != "" {
+		return errors.New("only one of join_token or join_token_file can be specified, not both")
+	}
+
 	if c.ServerAddress == "" {
 		return errors.New("server_address must be configured")
 	}
 
-	if c.ServerPort == 0 {
+	if c.ServerPort == 0 && !c.Experimental.UseXDS {
 		return errors.New("server_port must be configured")
+	}
+
+	if c.ServerPort != 0 && c.Experimental.UseXDS {
+		return errors.New("server_port cannot be used with use_xds; the port comes from the xDS server")
+	}
+
+	// xDS delivers its own service config, which overrides the default one.
+	if c.Experimental.UseXDS && c.Experimental.ServerLoadBalancingConfig != "" {
+		return errors.New("server_load_balancing_config cannot be used with use_xds")
 	}
 
 	if c.TrustDomain == "" {
 		return errors.New("trust_domain must be configured")
 	}
 
-	// If insecure_bootstrap is set, trust_bundle_path or trust_bundle_url cannot be set
+	if c.LogFileRotation != nil {
+		if c.LogFile == "" {
+			return errors.New("log_file must be configured to use log_file_rotation")
+		}
+		if err := c.LogFileRotation.Validate(); err != nil {
+			return fmt.Errorf("invalid log_file_rotation configuration: %w", err)
+		}
+	}
+
+	// If insecure_bootstrap is set, trust_bundle_path, trust_bundle_url, or trust_bundle_spiffe_workload_api cannot be set
 	// If trust_bundle_url is set, download the trust bundle using HTTP and parse it from memory
 	// If trust_bundle_path is set, parse the trust bundle file on disk
-	// Both cannot be set
+	// If trust_bundle_spiffe_workload_api is set, fetch the trust bundle from the specified SPIFFE Workload API endpoint
+	// Only one can be set
 	// The trust bundle URL must start with HTTPS
+	if c.TrustBundleSpiffeWorkloadAPI != "" {
+		switch {
+		case c.InsecureBootstrap:
+			return errors.New("only one of insecure_bootstrap or trust_bundle_spiffe_workload_api can be specified, not both")
+		case c.TrustBundleURL != "":
+			return errors.New("only one of trust_bundle_url or trust_bundle_spiffe_workload_api can be specified, not both")
+		case c.TrustBundlePath != "":
+			return errors.New("only one of trust_bundle_path or trust_bundle_spiffe_workload_api can be specified, not both")
+		case c.TrustBundleUnixSocket != "":
+			return errors.New("trust_bundle_unix_socket can not be used with trust_bundle_spiffe_workload_api")
+		}
+		if err := workloadapi.ValidateAddress(c.TrustBundleSpiffeWorkloadAPI); err != nil {
+			return fmt.Errorf("trust_bundle_spiffe_workload_api is not a valid SPIFFE Workload API endpoint address: %w", err)
+		}
+	}
+
 	if c.InsecureBootstrap {
 		switch {
 		case c.TrustBundleURL != "" && c.TrustBundlePath != "":
@@ -256,24 +519,40 @@ func (c *agentConfig) validate() error {
 		case c.TrustBundlePath != "":
 			return errors.New("only one of insecure_bootstrap or trust_bundle_path can be specified, not both")
 		}
-	} else if c.TrustBundlePath == "" && c.TrustBundleURL == "" {
-		return errors.New("trust_bundle_path or trust_bundle_url must be configured unless insecure_bootstrap is set")
+	} else if c.TrustBundlePath == "" && c.TrustBundleURL == "" && c.TrustBundleSpiffeWorkloadAPI == "" {
+		return errors.New("trust_bundle_path, trust_bundle_url, or trust_bundle_spiffe_workload_api must be configured unless insecure_bootstrap is set")
 	}
 
 	if c.TrustBundleURL != "" && c.TrustBundlePath != "" {
 		return errors.New("only one of trust_bundle_url or trust_bundle_path can be specified, not both")
 	}
 
-	if c.TrustBundleFormat != bundleFormatPEM && c.TrustBundleFormat != bundleFormatSPIFFE {
-		return fmt.Errorf("invalid value for trust_bundle_format, expected %q or %q", bundleFormatPEM, bundleFormatSPIFFE)
+	if c.TrustBundleFormat != trustbundlesources.BundleFormatPEM && c.TrustBundleFormat != trustbundlesources.BundleFormatSPIFFE {
+		return fmt.Errorf("invalid value for trust_bundle_format, expected %q or %q", trustbundlesources.BundleFormatPEM, trustbundlesources.BundleFormatSPIFFE)
 	}
 
+	if c.TrustBundleUnixSocket != "" && c.TrustBundleURL == "" {
+		return errors.New("if trust_bundle_unix_socket is specified, so must be trust_bundle_url")
+	}
 	if c.TrustBundleURL != "" {
 		u, err := url.Parse(c.TrustBundleURL)
 		if err != nil {
 			return fmt.Errorf("unable to parse trust bundle URL: %w", err)
 		}
-		if u.Scheme != "https" {
+		if c.TrustBundleUnixSocket != "" {
+			if u.Scheme != "http" {
+				return errors.New("trust bundle URL must start with http:// when used with trust bundle unix socket")
+			}
+			params := u.Query()
+			for key := range params {
+				if strings.HasPrefix(key, "spiffe-") {
+					return errors.New("trust_bundle_url query params can not start with spiffe-")
+				}
+				if strings.HasPrefix(key, "spire-") {
+					return errors.New("trust_bundle_url query params can not start with spire-")
+				}
+			}
+		} else if u.Scheme != "https" {
 			return errors.New("trust bundle URL must start with https://")
 		}
 	}
@@ -307,7 +586,7 @@ func ParseFile(path string, expandEnv bool) (*Config, error) {
 
 	// If envTemplate flag is passed, substitute $VARIABLES in configuration file
 	if expandEnv {
-		data = os.ExpandEnv(data)
+		data = config.ExpandEnv(data)
 	}
 
 	if err := hcl.Decode(&c, data); err != nil {
@@ -325,6 +604,7 @@ func parseFlags(name string, args []string, output io.Writer) (*agentConfig, err
 	flags.StringVar(&c.ConfigPath, "config", defaultConfigPath, "Path to a SPIRE config file")
 	flags.StringVar(&c.DataDir, "dataDir", "", "A directory the agent can use for its runtime data")
 	flags.StringVar(&c.JoinToken, "joinToken", "", "An optional token which has been generated by the SPIRE server")
+	flags.StringVar(&c.JoinTokenFile, "joinTokenFile", "", "Path to a file containing an optional join token which has been generated by the SPIRE server")
 	flags.StringVar(&c.LogFile, "logFile", "", "File to write logs to")
 	flags.StringVar(&c.LogFormat, "logFormat", "", "'text' or 'json'")
 	flags.StringVar(&c.LogLevel, "logLevel", "", "'debug', 'info', 'warn', or 'error'")
@@ -332,12 +612,15 @@ func parseFlags(name string, args []string, output io.Writer) (*agentConfig, err
 	flags.StringVar(&c.ServerAddress, "serverAddress", "", "IP address or DNS name of the SPIRE server")
 	flags.IntVar(&c.ServerPort, "serverPort", 0, "Port number of the SPIRE server")
 	flags.StringVar(&c.TrustDomain, "trustDomain", "", "The trust domain that this agent belongs to")
+	flags.BoolVar(&c.DisableWorkloadAPI, "disableWorkloadAPI", false, "Disable the SPIFFE Workload API")
+	flags.BoolVar(&c.DisableSDSAPI, "disableSDSAPI", false, "Disable the Envoy SDS API")
 	flags.StringVar(&c.TrustBundlePath, "trustBundle", "", "Path to the SPIRE server CA bundle")
 	flags.StringVar(&c.TrustBundleURL, "trustBundleUrl", "", "URL to download the SPIRE server CA bundle")
-	flags.StringVar(&c.TrustBundleFormat, "trustBundleFormat", "", fmt.Sprintf("Format of the bootstrap trust bundle, %q or %q", bundleFormatPEM, bundleFormatSPIFFE))
+	flags.StringVar(&c.TrustBundleFormat, "trustBundleFormat", "", fmt.Sprintf("Format of the bootstrap trust bundle, %q or %q", trustbundlesources.BundleFormatPEM, trustbundlesources.BundleFormatSPIFFE))
 	flags.BoolVar(&c.AllowUnauthenticatedVerifiers, "allowUnauthenticatedVerifiers", false, "If true, the agent permits the retrieval of X509 certificate bundles by unregistered clients")
 	flags.BoolVar(&c.InsecureBootstrap, "insecureBootstrap", false, "If true, the agent bootstraps without verifying the server's identity")
-	flags.BoolVar(&c.RetryBootstrap, "retryBootstrap", false, "If true, the agent retries bootstrap with backoff")
+	flags.StringVar(&c.RebootstrapMode, "rebootstrapMode", "", "Can be one of 'never', 'auto', or 'always'")
+	flags.StringVar(&c.RebootstrapDelay, "rebootstrapDelay", "", "The time to delay after seeing a x509 cert mismatch from the server before rebootstrapping")
 	flags.BoolVar(&c.ExpandEnv, "expandEnv", false, "Expand environment variables in SPIRE config file")
 
 	c.addOSFlags(flags)
@@ -372,95 +655,75 @@ func mergeInput(fileInput *Config, cliInput *agentConfig) (*Config, error) {
 	return c, nil
 }
 
-func parseTrustBundle(bundleBytes []byte, trustBundleContentType string) ([]*x509.Certificate, error) {
-	switch trustBundleContentType {
-	case bundleFormatPEM:
-		bundle, err := pemutil.ParseCertificates(bundleBytes)
-		if err != nil {
-			return nil, err
-		}
-		return bundle, nil
-	case bundleFormatSPIFFE:
-		bundle, err := bundleutil.Unmarshal(spiffeid.TrustDomain{}, bundleBytes)
-		if err != nil {
-			return nil, fmt.Errorf("unable to parse SPIFFE trust bundle: %w", err)
-		}
-		return bundle.X509Authorities(), nil
-	}
-
-	return nil, fmt.Errorf("unknown trust bundle format: %s", trustBundleContentType)
-}
-
-func downloadTrustBundle(trustBundleURL string) ([]byte, error) {
-	// Download the trust bundle URL from the user specified URL
-	// We use gosec -- the annotation below will disable a security check that URLs are not tainted
-	/* #nosec G107 */
-	resp, err := http.Get(trustBundleURL)
-	if err != nil {
-		return nil, fmt.Errorf("unable to fetch trust bundle URL %s: %w", trustBundleURL, err)
-	}
-
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("error downloading trust bundle: %s", resp.Status)
-	}
-	pemBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("unable to read from trust bundle URL %s: %w", trustBundleURL, err)
-	}
-
-	return pemBytes, nil
-}
-
-func setupTrustBundle(ac *agent.Config, c *Config) error {
-	// Either download the trust bundle if TrustBundleURL is set, or read it
-	// from disk if TrustBundlePath is set
-	ac.InsecureBootstrap = c.Agent.InsecureBootstrap
-
-	var bundleBytes []byte
-	var err error
-
-	switch {
-	case c.Agent.TrustBundleURL != "":
-		bundleBytes, err = downloadTrustBundle(c.Agent.TrustBundleURL)
-		if err != nil {
-			return err
-		}
-	case c.Agent.TrustBundlePath != "":
-		bundleBytes, err = loadTrustBundle(c.Agent.TrustBundlePath)
-		if err != nil {
-			return fmt.Errorf("could not parse trust bundle: %w", err)
-		}
-	default:
-		// If InsecureBootstrap is configured, the bundle is not required
-		if ac.InsecureBootstrap {
-			return nil
-		}
-	}
-
-	bundle, err := parseTrustBundle(bundleBytes, c.Agent.TrustBundleFormat)
-	if err != nil {
-		return err
-	}
-
-	if len(bundle) == 0 {
-		return errors.New("no certificates found in trust bundle")
-	}
-
-	ac.TrustBundle = bundle
-
-	return nil
+func (c *agentConfig) endpointEnabled() bool {
+	return !c.DisableWorkloadAPI || !c.DisableSDSAPI
 }
 
 func NewAgentConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool) (*agent.Config, error) {
+	return newAgentConfig(c, logOptions, allowUnknownConfig, false)
+}
+
+func parseSyncRetryBackoffConfig(c *syncRetryBackoffConfig, syncInterval time.Duration) (*manager.SyncRetryBackoffConfig, error) {
+	out := &manager.SyncRetryBackoffConfig{
+		Multiplier: c.BackoffMultiplier,
+		Jitter:     c.Jitter,
+	}
+
+	if c.MaxInterval != "" {
+		maxInterval, err := time.ParseDuration(c.MaxInterval)
+		if err != nil {
+			return nil, fmt.Errorf("could not parse sync_retry_backoff.max_interval: %w", err)
+		}
+		if maxInterval <= 0 {
+			return nil, fmt.Errorf("sync_retry_backoff.max_interval (%s) must be greater than 0", maxInterval)
+		}
+		out.MaxInterval = maxInterval
+	}
+
+	if maxInterval := manager.EffectiveSyncRetryMaxInterval(syncInterval, out); maxInterval < syncInterval {
+		return nil, fmt.Errorf("effective sync_retry_backoff.max_interval (%s) must not be less than the sync interval (%s)", maxInterval, syncInterval)
+	}
+
+	if c.BackoffMultiplier != nil && *c.BackoffMultiplier < 1 {
+		return nil, fmt.Errorf("sync_retry_backoff.backoff_multiplier (%.2f) must not be less than 1", *c.BackoffMultiplier)
+	}
+
+	if c.Jitter != nil && (*c.Jitter < 0 || *c.Jitter >= 1) {
+		return nil, fmt.Errorf("sync_retry_backoff.jitter (%.2f) must be in the [0, 1) range", *c.Jitter)
+	}
+
+	return out, nil
+}
+
+func newAgentConfig(c *Config, logOptions []log.Option, allowUnknownConfig, skipLogFile bool) (*agent.Config, error) {
 	ac := &agent.Config{}
 
 	if err := validateConfig(c); err != nil {
 		return nil, err
 	}
 
-	ac.RetryBootstrap = c.Agent.RetryBootstrap
+	ac.RebootstrapMode = c.Agent.RebootstrapMode
+	switch ac.RebootstrapMode {
+	case agent.RebootstrapNever:
+	case agent.RebootstrapAuto:
+	case agent.RebootstrapAlways:
+	case "":
+		ac.RebootstrapMode = agent.RebootstrapNever
+	default:
+		return nil, fmt.Errorf("unknown rebootstrap mode specified: %s", ac.RebootstrapMode)
+	}
+	if ac.RebootstrapMode != agent.RebootstrapNever && c.Agent.InsecureBootstrap {
+		return nil, errors.New("insecure_bootstrap option can not be used with rebootstrapping")
+	}
+
+	if c.Agent.RebootstrapDelay == "" {
+		c.Agent.RebootstrapDelay = "10m"
+	}
+	delay, err := time.ParseDuration(c.Agent.RebootstrapDelay)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing rebootstrap delay duration: %w", err)
+	}
+	ac.RebootstrapDelay = delay
 
 	if c.Agent.Experimental.SyncInterval != "" {
 		var err error
@@ -470,19 +733,25 @@ func NewAgentConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool)
 		}
 	}
 
-	if c.Agent.Experimental.X509SVIDCacheMaxSize < 0 {
-		return nil, errors.New("x509_svid_cache_max_size should not be negative")
+	if c.Agent.Experimental.UseXDS {
+		if err := client.ValidateXDSBootstrap(); err != nil {
+			return nil, fmt.Errorf("invalid xDS configuration: %w", err)
+		}
+		// With xDS the endpoint set (and port) is delivered by the management
+		// server via EDS, so server_address is used as the xDS listener name
+		// rather than a host:port.
+		ac.ServerAddress, err = client.XDSTarget(c.Agent.ServerAddress)
+		if err != nil {
+			return nil, fmt.Errorf("invalid server_address: %w", err)
+		}
+	} else {
+		ac.ServerAddress = fmt.Sprintf("dns:///%s", net.JoinHostPort(c.Agent.ServerAddress, strconv.Itoa(c.Agent.ServerPort)))
 	}
-	ac.UseSyncAuthorizedEntries = c.Agent.Experimental.UseSyncAuthorizedEntries
-	ac.X509SVIDCacheMaxSize = c.Agent.Experimental.X509SVIDCacheMaxSize
 
-	if c.Agent.Experimental.DisableLRUCache && ac.X509SVIDCacheMaxSize != 0 {
-		return nil, errors.New("x509_svid_cache_max_size should not be set when disable_lru_cache is set")
+	if err := client.ValidateLoadBalancingConfig(c.Agent.Experimental.ServerLoadBalancingConfig); err != nil {
+		return nil, fmt.Errorf("invalid server_load_balancing_config: %w", err)
 	}
-	ac.DisableLRUCache = c.Agent.Experimental.DisableLRUCache
-
-	serverHostPort := net.JoinHostPort(c.Agent.ServerAddress, strconv.Itoa(c.Agent.ServerPort))
-	ac.ServerAddress = fmt.Sprintf("dns:///%s", serverHostPort)
+	ac.ServerLoadBalancingConfig = c.Agent.Experimental.ServerLoadBalancingConfig
 
 	logOptions = append(logOptions,
 		log.WithLevel(c.Agent.LogLevel),
@@ -491,9 +760,10 @@ func NewAgentConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool)
 	if c.Agent.LogSourceLocation {
 		logOptions = append(logOptions, log.WithSourceLocation())
 	}
-	var reopenableFile *log.ReopenableFile
-	if c.Agent.LogFile != "" {
-		reopenableFile, err := log.NewReopenableFile(c.Agent.LogFile)
+	var reopenableFile log.ReopenableWriteCloser
+	if c.Agent.LogFile != "" && !skipLogFile {
+		var err error
+		reopenableFile, err = log.NewOutputFile(c.Agent.LogFile, c.Agent.LogFileRotation)
 		if err != nil {
 			return nil, err
 		}
@@ -505,9 +775,80 @@ func NewAgentConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool)
 		return nil, fmt.Errorf("could not start logger: %w", err)
 	}
 	ac.Log = logger
+
 	if reopenableFile != nil {
 		ac.LogReopener = log.ReopenOnSignal(logger, reopenableFile)
 	}
+
+	if c.Agent.Experimental.UseXDS {
+		logger.Warn("use_xds is experimental and may change or be removed in a future release")
+	}
+
+	if c.Agent.Experimental.JWTSVIDCacheHitTimeout != "" {
+		var err error
+		timeout, err := time.ParseDuration(c.Agent.Experimental.JWTSVIDCacheHitTimeout)
+		if err != nil {
+			return nil, fmt.Errorf("could not parse jwt_svid_cache_hit_timeout: %w", err)
+		}
+		if timeout < 5*time.Second {
+			return nil, fmt.Errorf("jwt_svid_cache_hit_timeout (%s) must be greater than %s", timeout, 5*time.Second)
+		}
+		if timeout >= 30*time.Second {
+			return nil, fmt.Errorf("jwt_svid_cache_hit_timeout (%s) must be less than %s", timeout, 30*time.Second)
+		}
+		client.SetJWTSVIDCacheHitTimeout(timeout)
+		logger.Warn("The use of 'jwt_svid_cache_hit_timeout' is experimental")
+	}
+
+	if c.Agent.Experimental.SyncRetryBackoff != nil {
+		syncInterval := ac.SyncInterval
+		if syncInterval == 0 {
+			syncInterval = manager.DefaultSyncInterval
+		}
+		syncRetryBackoff, err := parseSyncRetryBackoffConfig(c.Agent.Experimental.SyncRetryBackoff, syncInterval)
+		if err != nil {
+			return nil, err
+		}
+		ac.SyncRetryBackoff = syncRetryBackoff
+		logger.Warn("The use of 'sync_retry_backoff' is experimental")
+	}
+
+	if c.Agent.Experimental.RPCTimeout != "" {
+		timeout, err := time.ParseDuration(c.Agent.Experimental.RPCTimeout)
+		if err != nil {
+			return nil, fmt.Errorf("could not parse rpc_timeout: %w", err)
+		}
+		if timeout <= 0 {
+			return nil, fmt.Errorf("rpc_timeout (%s) must be greater than 0", timeout)
+		}
+		client.SetRPCTimeout(timeout)
+		logger.Warn("The use of 'rpc_timeout' is experimental")
+	}
+
+	if c.Agent.Experimental.MaxBundleWorkers != 0 {
+		if c.Agent.Experimental.MaxBundleWorkers < 1 {
+			return nil, fmt.Errorf("max_bundle_workers (%d) must be greater than 0", c.Agent.Experimental.MaxBundleWorkers)
+		}
+		client.SetMaxBundleWorkers(c.Agent.Experimental.MaxBundleWorkers)
+		logger.Warn("The use of 'max_bundle_workers' is experimental")
+	}
+
+	if c.Agent.X509SVIDCacheMaxSize < 0 {
+		return nil, errors.New("x509_svid_cache_max_size should not be negative")
+	}
+	ac.X509SVIDCacheMaxSize = c.Agent.X509SVIDCacheMaxSize
+
+	if c.Agent.JWTSVIDCacheMaxSize < 0 {
+		return nil, errors.New("jwt_svid_cache_max_size should not be negative")
+	}
+	ac.JWTSVIDCacheMaxSize = c.Agent.JWTSVIDCacheMaxSize
+
+	if c.Agent.Experimental.WITSVIDCacheMaxSize < 0 {
+		return nil, errors.New("experimental.wit_svid_cache_max_size should not be negative")
+	}
+	ac.WITSVIDCacheMaxSize = c.Agent.Experimental.WITSVIDCacheMaxSize
+
+	ac.EnableWITSVIDs = c.Agent.Experimental.EnableWITSVIDs
 
 	td, err := common_cli.ParseTrustDomain(c.Agent.TrustDomain, logger)
 	if err != nil {
@@ -515,11 +856,15 @@ func NewAgentConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool)
 	}
 	ac.TrustDomain = td
 
-	addr, err := c.Agent.getAddr()
-	if err != nil {
-		return nil, err
+	ac.DisableWorkloadAPI = c.Agent.DisableWorkloadAPI
+	ac.DisableSDSAPI = c.Agent.DisableSDSAPI
+	if c.Agent.endpointEnabled() {
+		addr, err := c.Agent.getAddr()
+		if err != nil {
+			return nil, err
+		}
+		ac.BindAddress = addr
 	}
-	ac.BindAddress = addr
 
 	if c.Agent.hasAdminAddr() {
 		adminAddr, err := c.Agent.getAdminAddr()
@@ -528,7 +873,21 @@ func NewAgentConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool)
 		}
 		ac.AdminBindAddress = adminAddr
 	}
-	ac.JoinToken = c.Agent.JoinToken
+
+	// Handle join token - read from file if specified
+	if c.Agent.JoinTokenFile != "" {
+		tokenBytes, err := os.ReadFile(c.Agent.JoinTokenFile)
+		if err != nil {
+			return nil, fmt.Errorf("unable to read join token file %q: %w", c.Agent.JoinTokenFile, err)
+		}
+		joinToken := strings.TrimSpace(string(tokenBytes))
+		if joinToken == "" {
+			return nil, errors.New("join token file is empty")
+		}
+		ac.JoinToken = joinToken
+	} else {
+		ac.JoinToken = c.Agent.JoinToken
+	}
 	ac.DataDir = c.Agent.DataDir
 	ac.DefaultSVIDName = c.Agent.SDS.DefaultSVIDName
 	ac.DefaultBundleName = c.Agent.SDS.DefaultBundleName
@@ -538,10 +897,19 @@ func NewAgentConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool)
 	}
 	ac.DisableSPIFFECertValidation = c.Agent.SDS.DisableSPIFFECertValidation
 
-	err = setupTrustBundle(ac, c)
-	if err != nil {
-		return nil, err
+	ts := &trustbundlesources.Config{
+		InsecureBootstrap:            c.Agent.InsecureBootstrap,
+		TrustBundleFormat:            c.Agent.TrustBundleFormat,
+		TrustBundlePath:              c.Agent.TrustBundlePath,
+		TrustBundleURL:               c.Agent.TrustBundleURL,
+		TrustBundleUnixSocket:        c.Agent.TrustBundleUnixSocket,
+		TrustBundleSpiffeWorkloadAPI: c.Agent.TrustBundleSpiffeWorkloadAPI,
+		TrustDomain:                  c.Agent.TrustDomain,
+		ServerAddress:                c.Agent.ServerAddress,
+		ServerPort:                   c.Agent.ServerPort,
 	}
+
+	ac.TrustBundleSources = trustbundlesources.New(ts, ac.Log.WithField("Logger", "TrustBundleSources"))
 
 	ac.WorkloadKeyType = workloadkey.ECP256
 	if c.Agent.WorkloadX509SVIDKeyType != "" {
@@ -556,6 +924,7 @@ func NewAgentConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool)
 	ac.ProfilingFreq = c.Agent.ProfilingFreq
 	ac.ProfilingNames = c.Agent.ProfilingNames
 
+	ac.LogSelectors = c.Agent.LogSelectors
 	ac.AllowedForeignJWTClaims = c.Agent.AllowedForeignJWTClaims
 
 	ac.PluginConfigs, err = catalog.PluginConfigsFromHCLNode(c.Plugins)
@@ -564,6 +933,9 @@ func NewAgentConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool)
 	}
 
 	ac.Telemetry = c.Telemetry
+	if err := c.HealthChecks.ParseCheckInterval(); err != nil {
+		return nil, err
+	}
 	ac.HealthChecks = c.HealthChecks
 
 	if !allowUnknownConfig {
@@ -582,6 +954,58 @@ func NewAgentConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool)
 
 	ac.AuthorizedDelegates = c.Agent.AuthorizedDelegates
 
+	if c.Agent.Experimental.Broker != nil {
+		bindAddrs, err := c.Agent.brokerBindAddrs()
+		if err != nil {
+			return nil, err
+		}
+		// Pass 1: validate every entry has a non-empty, unique ID. Doing
+		// this first means subsequent errors can reference brokers by ID
+		// instead of slice index — which is more helpful to operators
+		// since they wrote the IDs themselves.
+		seen := make(map[string]struct{}, len(c.Agent.Experimental.Broker.Brokers))
+		for i, b := range c.Agent.Experimental.Broker.Brokers {
+			if b.ID == "" {
+				return nil, fmt.Errorf("experimental.broker.brokers[%d].id: must be specified", i)
+			}
+			if _, dup := seen[b.ID]; dup {
+				return nil, fmt.Errorf("experimental.broker.brokers[%s].id: duplicate broker id", b.ID)
+			}
+			seen[b.ID] = struct{}{}
+		}
+
+		// Pass 2: per-broker field validation. ID is referenced in error
+		// messages now that we know it's set and unique.
+		brokers := make([]broker.Broker, 0, len(c.Agent.Experimental.Broker.Brokers))
+		for _, b := range c.Agent.Experimental.Broker.Brokers {
+			if _, err := spiffeid.FromString(b.ID); err != nil {
+				return nil, fmt.Errorf("experimental.broker.brokers[%s].id: %w", b.ID, err)
+			}
+			allowedReferenceTypes, err := brokerAllowedReferenceTypesFromHCL(b.ID, b.AllowedReferenceTypes)
+			if err != nil {
+				return nil, err
+			}
+			brokers = append(brokers, broker.Broker{
+				ID:                    b.ID,
+				AllowedReferenceTypes: allowedReferenceTypes,
+			})
+		}
+		reattestInterval, err := brokerReattestIntervalFromHCL(c.Agent.Experimental.Broker.ReattestInterval)
+		if err != nil {
+			return nil, err
+		}
+		reattestJitter, err := brokerReattestJitterFromHCL(c.Agent.Experimental.Broker.ReattestJitter)
+		if err != nil {
+			return nil, err
+		}
+		ac.Broker = agent.BrokerConfig{
+			BindAddresses:    bindAddrs,
+			Brokers:          brokers,
+			ReattestInterval: reattestInterval,
+			ReattestJitter:   reattestJitter,
+		}
+	}
+
 	if c.Agent.AvailabilityTarget != "" {
 		t, err := time.ParseDuration(c.Agent.AvailabilityTarget)
 		if err != nil {
@@ -593,17 +1017,62 @@ func NewAgentConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool)
 		ac.AvailabilityTarget = t
 	}
 
+	tlsPolicyLogger := log.NewHCLogAdapter(logger, "tlspolicy")
+
+	ac.TLSPolicy, err = tlspolicy.NewPolicy(c.Agent.Experimental.RequirePQKEM, c.Agent.TLSConfig, tlsPolicyLogger)
+	if err != nil {
+		return nil, fmt.Errorf("unable to parse configured TLS configuration: %w", err)
+	}
+
+	tlspolicy.LogPolicy(ac.TLSPolicy, tlsPolicyLogger)
+
+	intVal := func(p *int) int {
+		if p == nil {
+			return 0
+		}
+		return *p
+	}
+	ac.WorkloadAPIRateLimit = agent.WorkloadAPIRateLimitConfig{
+		FetchX509SVID:    intVal(c.Agent.Experimental.RateLimit.FetchX509SVID),
+		FetchJWTSVID:     intVal(c.Agent.Experimental.RateLimit.FetchJWTSVID),
+		FetchX509Bundles: intVal(c.Agent.Experimental.RateLimit.FetchX509Bundles),
+		FetchJWTBundles:  intVal(c.Agent.Experimental.RateLimit.FetchJWTBundles),
+		FetchWITSVID:     intVal(c.Agent.Experimental.RateLimit.FetchWITSVID),
+		FetchWITBundles:  intVal(c.Agent.Experimental.RateLimit.FetchWITBundles),
+		StreamSecrets:    intVal(c.Agent.Experimental.RateLimit.StreamSecrets),
+		FetchSecrets:     intVal(c.Agent.Experimental.RateLimit.FetchSecrets),
+	}
+	if ac.WorkloadAPIRateLimit.FetchX509SVID < 0 {
+		return nil, errors.New("experimental.ratelimit.fetch_x509_svid must not be negative")
+	}
+	if ac.WorkloadAPIRateLimit.FetchJWTSVID < 0 {
+		return nil, errors.New("experimental.ratelimit.fetch_jwt_svid must not be negative")
+	}
+	if ac.WorkloadAPIRateLimit.FetchX509Bundles < 0 {
+		return nil, errors.New("experimental.ratelimit.fetch_x509_bundles must not be negative")
+	}
+	if ac.WorkloadAPIRateLimit.FetchJWTBundles < 0 {
+		return nil, errors.New("experimental.ratelimit.fetch_jwt_bundles must not be negative")
+	}
+	if ac.WorkloadAPIRateLimit.FetchWITSVID < 0 {
+		return nil, errors.New("experimental.ratelimit.fetch_wit_svid must not be negative")
+	}
+	if ac.WorkloadAPIRateLimit.FetchWITBundles < 0 {
+		return nil, errors.New("experimental.ratelimit.fetch_wit_bundles must not be negative")
+	}
+	if ac.WorkloadAPIRateLimit.StreamSecrets < 0 {
+		return nil, errors.New("experimental.ratelimit.stream_secrets must not be negative")
+	}
+	if ac.WorkloadAPIRateLimit.FetchSecrets < 0 {
+		return nil, errors.New("experimental.ratelimit.fetch_secrets must not be negative")
+	}
+
 	if cmp.Diff(experimentalConfig{}, c.Agent.Experimental) != "" {
 		logger.Warn("Experimental features have been enabled. Please see doc/upgrading.md for upgrade and compatibility considerations for experimental features.")
 	}
 
 	for _, f := range c.Agent.Experimental.Flags {
 		logger.Warnf("Developer feature flag %q has been enabled", f)
-	}
-
-	ac.DisableReattestToRenew = c.Agent.DisableReattestToRenew
-	if c.Agent.DisableReattestToRenew {
-		logger.Warn("Disable reattest to renew flag will be removed in the next major release")
 	}
 
 	return ac, nil
@@ -638,6 +1107,30 @@ func checkForUnknownConfig(c *Config, l logrus.FieldLogger) (err error) {
 
 	if a := c.Agent; a != nil && len(a.UnusedKeyPositions) != 0 {
 		detectedUnknown("agent", a.UnusedKeyPositions)
+	}
+
+	if a := c.Agent; a != nil && a.LogFileRotation != nil && len(a.LogFileRotation.UnusedKeyPositions) != 0 {
+		detectedUnknown("log_file_rotation", a.LogFileRotation.UnusedKeyPositions)
+	}
+
+	if a := c.Agent; a != nil && a.Experimental.SyncRetryBackoff != nil && len(a.Experimental.SyncRetryBackoff.UnusedKeyPositions) != 0 {
+		detectedUnknown("experimental.sync_retry_backoff", a.Experimental.SyncRetryBackoff.UnusedKeyPositions)
+	}
+
+	if a := c.Agent; a != nil && a.Experimental.Broker != nil {
+		if len(a.Experimental.Broker.UnusedKeyPositions) != 0 {
+			detectedUnknown("experimental.broker", a.Experimental.Broker.UnusedKeyPositions)
+		}
+		for i, b := range a.Experimental.Broker.Brokers {
+			if len(b.UnusedKeyPositions) != 0 {
+				detectedUnknown(fmt.Sprintf("experimental.broker.brokers[%d]", i), b.UnusedKeyPositions)
+			}
+			for j, allowed := range b.AllowedReferenceTypes {
+				if len(allowed.UnusedKeyPositions) != 0 {
+					detectedUnknown(fmt.Sprintf("experimental.broker.brokers[%d].allowed_reference_types[%d]", i, j), allowed.UnusedKeyPositions)
+				}
+			}
+		}
 	}
 
 	// TODO: Re-enable unused key detection for telemetry. See
@@ -677,6 +1170,10 @@ func checkForUnknownConfig(c *Config, l logrus.FieldLogger) (err error) {
 		detectedUnknown("health check", c.HealthChecks.UnusedKeyPositions)
 	}
 
+	if a := c.Agent; a != nil && len(a.Experimental.RateLimit.UnusedKeyPositions) != 0 {
+		detectedUnknown("ratelimit", a.Experimental.RateLimit.UnusedKeyPositions)
+	}
+
 	return err
 }
 
@@ -686,7 +1183,7 @@ func defaultConfig() *Config {
 			DataDir:           defaultDataDir,
 			LogLevel:          defaultLogLevel,
 			LogFormat:         log.DefaultFormat,
-			TrustBundleFormat: bundleFormatPEM,
+			TrustBundleFormat: trustbundlesources.BundleFormatPEM,
 			SDS: sdsConfig{
 				DefaultBundleName:           defaultDefaultBundleName,
 				DefaultSVIDName:             defaultDefaultSVIDName,
@@ -698,13 +1195,4 @@ func defaultConfig() *Config {
 	c.Agent.setPlatformDefaults()
 
 	return c
-}
-
-func loadTrustBundle(path string) ([]byte, error) {
-	bundleBytes, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-
-	return bundleBytes, nil
 }

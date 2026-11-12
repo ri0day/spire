@@ -2,6 +2,9 @@ package health
 
 import (
 	"fmt"
+	"net"
+	"strings"
+	"time"
 
 	"github.com/hashicorp/hcl/hcl/token"
 )
@@ -17,6 +20,11 @@ type Config struct {
 	ReadyPath string `hcl:"ready_path"`
 	LivePath  string `hcl:"live_path"`
 
+	// How often a healthy subsystem is checked, defaulting to one minute.
+	// A failing subsystem is checked every second until it recovers.
+	CheckInterval    time.Duration `hcl:"-"`
+	RawCheckInterval string        `hcl:"check_interval"`
+
 	UnusedKeyPositions map[string][]token.Pos `hcl:",unusedKeyPositions"`
 }
 
@@ -24,7 +32,7 @@ type Config struct {
 func (c *Config) getAddress() string {
 	host := "localhost"
 	if c.BindAddress != "" {
-		host = c.BindAddress
+		host = strings.Trim(c.BindAddress, "[]")
 	}
 
 	port := "80"
@@ -32,7 +40,7 @@ func (c *Config) getAddress() string {
 		port = c.BindPort
 	}
 
-	return fmt.Sprintf("%s:%s", host, port)
+	return net.JoinHostPort(host, port)
 }
 
 // getReadyPath returns the configured value or a default
@@ -56,4 +64,21 @@ func (c *Config) getLivePath() string {
 // Details are additional data to be used when the system is ready
 type Details struct {
 	Message string `json:"message,omitempty"`
+}
+
+// ParseCheckInterval sets CheckInterval from RawCheckInterval.
+func (c *Config) ParseCheckInterval() error {
+	if c.RawCheckInterval == "" {
+		c.CheckInterval = readyCheckInterval
+		return nil
+	}
+	interval, err := time.ParseDuration(c.RawCheckInterval)
+	if err != nil {
+		return fmt.Errorf("could not parse check_interval: %w", err)
+	}
+	if interval <= readyCheckFailureInterval {
+		return fmt.Errorf("check_interval must be longer than %s", readyCheckFailureInterval)
+	}
+	c.CheckInterval = interval
+	return nil
 }

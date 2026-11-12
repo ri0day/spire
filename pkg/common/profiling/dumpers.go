@@ -6,8 +6,6 @@ import (
 	"runtime/pprof"
 	"runtime/trace"
 	"strings"
-
-	"github.com/zeebo/errs"
 )
 
 const (
@@ -34,11 +32,7 @@ type traceDumper struct {
 }
 
 func (d *dumper) Prepare() error {
-	err := createProfilesFolder()
-	if err != nil {
-		return err
-	}
-	return nil
+	return createProfilesFolder()
 }
 
 func (d *dumper) Dump(timestamp string, name string) error {
@@ -87,11 +81,7 @@ func (d *traceDumper) Prepare() error {
 		return err
 	}
 	d.data = f
-	err = trace.Start(d.data)
-	if err != nil {
-		return err
-	}
-	return nil
+	return trace.Start(d.data)
 }
 
 func (d *traceDumper) Dump(timestamp string, name string) error {
@@ -99,7 +89,7 @@ func (d *traceDumper) Dump(timestamp string, name string) error {
 	d.data.Close()
 	filename := getFilename(timestamp, d.c.Tag, name)
 	if err := os.Rename(getTempFilename(d.c.Tag, traceProfTmpFilename), filename); err != nil {
-		return errs.Wrap(err)
+		return err
 	}
 	return d.Prepare()
 }
@@ -133,7 +123,7 @@ func (d *cpuDumper) Dump(timestamp string, name string) error {
 	d.data.Close()
 	filename := getFilename(timestamp, d.c.Tag, name)
 	if err := os.Rename(getTempFilename(d.c.Tag, cpuProfTmpFilename), filename); err != nil {
-		return errs.Wrap(err)
+		return err
 	}
 	return d.Prepare()
 }

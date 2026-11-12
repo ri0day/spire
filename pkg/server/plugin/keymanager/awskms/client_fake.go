@@ -20,6 +20,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
 	"github.com/aws/aws-sdk-go-v2/service/kms/types"
+	"github.com/aws/aws-sdk-go-v2/service/resourcegroupstaggingapi"
+	rgtatypes "github.com/aws/aws-sdk-go-v2/service/resourcegroupstaggingapi/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/spiffe/spire/test/testkey"
 	"github.com/stretchr/testify/require"
@@ -28,21 +30,26 @@ import (
 )
 
 type kmsClientFake struct {
-	t                      *testing.T
-	store                  fakeStore
-	mu                     sync.RWMutex
-	testKeys               testkey.Keys
-	validAliasName         *regexp.Regexp
-	createKeyErr           error
-	describeKeyErr         error
-	getPublicKeyErr        error
-	listAliasesErr         error
-	createAliasErr         error
-	updateAliasErr         error
-	scheduleKeyDeletionErr error
-	signErr                error
-	listKeysErr            error
-	deleteAliasErr         error
+	t                        *testing.T
+	store                    fakeStore
+	mu                       sync.RWMutex
+	testKeys                 testkey.Keys
+	validAliasName           *regexp.Regexp
+	createKeyErr             error
+	describeKeyErr           error
+	describeKeyMalformed     bool
+	getPublicKeyErr          error
+	listAliasesErr           error
+	createAliasErr           error
+	updateAliasErr           error
+	scheduleKeyDeletionErr   error
+	signErr                  error
+	listKeysErr              error
+	deleteAliasErr           error
+	tagResourceErr           error
+	tagResourceCalls         []kms.TagResourceInput
+	createKeyCalls           []kms.CreateKeyInput
+	scheduleKeyDeletionCalls []string
 
 	expectedKeyPolicy *string
 }
@@ -53,6 +60,12 @@ type stsClientFake struct {
 	err     string
 }
 
+type taggingClientFake struct {
+	mu        sync.RWMutex
+	resources []rgtatypes.ResourceTagMapping
+	err       error
+}
+
 func newKMSClientFake(t *testing.T, c *clock.Mock) *kmsClientFake {
 	return &kmsClientFake{
 		t:     t,
@@ -60,12 +73,39 @@ func newKMSClientFake(t *testing.T, c *clock.Mock) *kmsClientFake {
 
 		// Valid KMS alias name must match the expression below:
 		// https://docs.aws.amazon.com/kms/latest/APIReference/API_CreateAlias.html#API_CreateAlias_RequestSyntax
-		validAliasName: regexp.MustCompile(`alias[a-zA-Z0-9/_-]+$`),
+		validAliasName: regexp.MustCompile(`^alias/[a-zA-Z0-9/_-]+$`),
 	}
 }
 
 func newSTSClientFake() *stsClientFake {
 	return &stsClientFake{}
+}
+
+func newTaggingClientFake() *taggingClientFake {
+	return &taggingClientFake{}
+}
+
+func (tc *taggingClientFake) GetResources(_ context.Context, _ *resourcegroupstaggingapi.GetResourcesInput, _ ...func(*resourcegroupstaggingapi.Options)) (*resourcegroupstaggingapi.GetResourcesOutput, error) {
+	tc.mu.RLock()
+	defer tc.mu.RUnlock()
+	if tc.err != nil {
+		return nil, tc.err
+	}
+	return &resourcegroupstaggingapi.GetResourcesOutput{
+		ResourceTagMappingList: tc.resources,
+	}, nil
+}
+
+func (tc *taggingClientFake) setResources(resources []rgtatypes.ResourceTagMapping) {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	tc.resources = resources
+}
+
+func (tc *taggingClientFake) setErr(err error) {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	tc.err = err
 }
 
 func (s *stsClientFake) GetCallerIdentity(context.Context, *sts.GetCallerIdentityInput, ...func(*sts.Options)) (*sts.GetCallerIdentityOutput, error) {
@@ -96,11 +136,13 @@ func (k *kmsClientFake) setExpectedKeyPolicy(keyPolicy *string) {
 }
 
 func (k *kmsClientFake) CreateKey(_ context.Context, input *kms.CreateKeyInput, _ ...func(*kms.Options)) (*kms.CreateKeyOutput, error) {
-	k.mu.RLock()
-	defer k.mu.RUnlock()
+	k.mu.Lock()
+	defer k.mu.Unlock()
 	if k.createKeyErr != nil {
 		return nil, k.createKeyErr
 	}
+
+	k.createKeyCalls = append(k.createKeyCalls, *input)
 
 	switch k.expectedKeyPolicy {
 	case nil:
@@ -110,17 +152,17 @@ func (k *kmsClientFake) CreateKey(_ context.Context, input *kms.CreateKeyInput, 
 	}
 
 	var privateKey crypto.Signer
-	switch input.CustomerMasterKeySpec { //nolint:staticcheck // not deprecated in a released version yet
-	case types.CustomerMasterKeySpecEccNistP256:
+	switch input.KeySpec {
+	case types.KeySpecEccNistP256:
 		privateKey = k.testKeys.NewEC256(k.t)
-	case types.CustomerMasterKeySpecEccNistP384:
+	case types.KeySpecEccNistP384:
 		privateKey = k.testKeys.NewEC384(k.t)
-	case types.CustomerMasterKeySpecRsa2048:
+	case types.KeySpecRsa2048:
 		privateKey = k.testKeys.NewRSA2048(k.t)
-	case types.CustomerMasterKeySpecRsa4096:
+	case types.KeySpecRsa4096:
 		privateKey = k.testKeys.NewRSA4096(k.t)
 	default:
-		return nil, fmt.Errorf("unknown key type %q", input.CustomerMasterKeySpec) //nolint:staticcheck // not deprecated in a released version yet
+		return nil, fmt.Errorf("unknown key type %q", input.KeySpec)
 	}
 
 	pkixData, err := x509.MarshalPKIXPublicKey(privateKey.Public())
@@ -133,7 +175,7 @@ func (k *kmsClientFake) CreateKey(_ context.Context, input *kms.CreateKeyInput, 
 		CreationDate: aws.Time(time.Unix(0, 0)),
 		PublicKey:    pkixData,
 		privateKey:   privateKey,
-		KeySpec:      input.CustomerMasterKeySpec, //nolint:staticcheck // not deprecated in a released version yet
+		KeySpec:      input.KeySpec,
 		Enabled:      true,
 	}
 
@@ -155,6 +197,9 @@ func (k *kmsClientFake) DescribeKey(_ context.Context, input *kms.DescribeKeyInp
 	if k.describeKeyErr != nil {
 		return nil, k.describeKeyErr
 	}
+	if k.describeKeyMalformed {
+		return &kms.DescribeKeyOutput{}, nil
+	}
 
 	keyEntry, err := k.store.FetchKeyEntry(*input.KeyId)
 	if err != nil {
@@ -163,12 +208,12 @@ func (k *kmsClientFake) DescribeKey(_ context.Context, input *kms.DescribeKeyInp
 
 	return &kms.DescribeKeyOutput{
 		KeyMetadata: &types.KeyMetadata{
-			KeyId:                 keyEntry.KeyID,
-			Arn:                   keyEntry.Arn,
-			CustomerMasterKeySpec: keyEntry.KeySpec,
-			Enabled:               keyEntry.Enabled,
-			Description:           keyEntry.Description,
-			CreationDate:          keyEntry.CreationDate,
+			KeyId:        keyEntry.KeyID,
+			Arn:          keyEntry.Arn,
+			KeySpec:      keyEntry.KeySpec,
+			Enabled:      keyEntry.Enabled,
+			Description:  keyEntry.Description,
+			CreationDate: keyEntry.CreationDate,
 		},
 	}, nil
 }
@@ -230,12 +275,13 @@ func (k *kmsClientFake) ListAliases(_ context.Context, input *kms.ListAliasesInp
 }
 
 func (k *kmsClientFake) ScheduleKeyDeletion(_ context.Context, input *kms.ScheduleKeyDeletionInput, _ ...func(*kms.Options)) (*kms.ScheduleKeyDeletionOutput, error) {
-	k.mu.RLock()
-	defer k.mu.RUnlock()
+	k.mu.Lock()
+	defer k.mu.Unlock()
 	if k.scheduleKeyDeletionErr != nil {
 		return nil, k.scheduleKeyDeletionErr
 	}
 
+	k.scheduleKeyDeletionCalls = append(k.scheduleKeyDeletionCalls, *input.KeyId)
 	k.store.DeleteKeyEntry(*input.KeyId)
 
 	return &kms.ScheduleKeyDeletionOutput{}, nil
@@ -399,6 +445,12 @@ func (k *kmsClientFake) setDescribeKeyErr(fakeError string) {
 	}
 }
 
+func (k *kmsClientFake) setDescribeKeyMalformed(malformed bool) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.describeKeyMalformed = malformed
+}
+
 func (k *kmsClientFake) setgetPublicKeyErr(fakeError string) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
@@ -463,6 +515,25 @@ func (k *kmsClientFake) setDeleteAliasErr(fakeError string) {
 	}
 }
 
+func (k *kmsClientFake) TagResource(_ context.Context, input *kms.TagResourceInput, _ ...func(*kms.Options)) (*kms.TagResourceOutput, error) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if k.tagResourceErr != nil {
+		return nil, k.tagResourceErr
+	}
+	call := *input
+	k.tagResourceCalls = append(k.tagResourceCalls, call)
+	return &kms.TagResourceOutput{}, nil
+}
+
+func (k *kmsClientFake) setTagResourceErr(fakeError string) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if fakeError != "" {
+		k.tagResourceErr = errors.New(fakeError)
+	}
+}
+
 const (
 	fakeKeyArnPrefix   = "arn:aws:kms:region:1234:key/"
 	fakeAliasArnPrefix = "arn:aws:kms:region:1234:"
@@ -494,7 +565,7 @@ type fakeKeyEntry struct {
 	PublicKey            []byte
 	privateKey           crypto.Signer
 	Enabled              bool
-	KeySpec              types.CustomerMasterKeySpec
+	KeySpec              types.KeySpec
 }
 
 type fakeAlias struct {

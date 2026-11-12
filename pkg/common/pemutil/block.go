@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 )
 
 var (
@@ -20,10 +21,6 @@ type Block struct {
 
 func LoadBlocks(path string) ([]Block, error) {
 	return loadBlocks(path, 0)
-}
-
-func ParseBlocks(pemBytes []byte) ([]Block, error) {
-	return parseBlocks(pemBytes, 0)
 }
 
 func loadBlock(path string, expectedTypes ...string) (*Block, error) {
@@ -51,7 +48,7 @@ func parseBlock(pemBytes []byte, expectedTypes ...string) (*Block, error) {
 }
 
 func parseBlocks(pemBytes []byte, expectedCount int, expectedTypes ...string) (blocks []Block, err error) {
-	for blockno := 1; ; blockno++ {
+	for blockNumber := 1; ; blockNumber++ {
 		var pemBlock *pem.Block
 		pemBlock, pemBytes = pem.Decode(pemBytes)
 		if pemBlock == nil {
@@ -70,14 +67,7 @@ func parseBlocks(pemBytes []byte, expectedCount int, expectedTypes ...string) (b
 		}
 
 		if len(expectedTypes) > 0 {
-			found := false
-			for _, expectedType := range expectedTypes {
-				if expectedType == pemBlock.Type {
-					found = true
-					break
-				}
-			}
-			if !found {
+			if !slices.Contains(expectedTypes, pemBlock.Type) {
 				var expectedTypeList any = expectedTypes
 				if len(expectedTypes) == 1 {
 					expectedTypeList = expectedTypes[0]
@@ -101,7 +91,7 @@ func parseBlocks(pemBytes []byte, expectedCount int, expectedTypes ...string) (b
 			block.Object, err = x509.ParsePKIXPublicKey(pemBlock.Bytes)
 		}
 		if err != nil {
-			return nil, fmt.Errorf("unable to parse %q PEM block %d: %w", pemBlock.Type, blockno, err)
+			return nil, fmt.Errorf("unable to parse %q PEM block %d: %w", pemBlock.Type, blockNumber, err)
 		}
 
 		blocks = append(blocks, block)

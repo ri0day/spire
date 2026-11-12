@@ -5,19 +5,21 @@ import (
 	"crypto/x509"
 	"errors"
 	"net"
+	"os"
 	"sync"
 	"testing"
 	"time"
 
+	"dario.cat/mergo"
 	core_v3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	tls_v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	discovery_v3 "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	secret_v3 "github.com/envoyproxy/go-control-plane/envoy/service/secret/v3"
 	envoy_type_v3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
-	"github.com/imdario/mergo"
 	"github.com/sirupsen/logrus/hooks/test"
 	"github.com/spiffe/go-spiffe/v2/bundle/spiffebundle"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"github.com/spiffe/spire/pkg/agent/api/rpccontext"
 	"github.com/spiffe/spire/pkg/agent/manager/cache"
 	"github.com/spiffe/spire/pkg/common/api/middleware"
 	"github.com/spiffe/spire/pkg/common/peertracker"
@@ -31,6 +33,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/structpb"
 )
@@ -252,6 +255,10 @@ MC2hK9d8Z5ENZc9lFW48vObdcHcHdHvAaA8z2GM02pDkTt5pgUvRHlsf
 			},
 		},
 	}
+
+	userAgentVersionTypeNoVersion = &core_v3.Node_UserAgentBuildVersion{
+		UserAgentBuildVersion: &core_v3.BuildVersion{},
+	}
 )
 
 func TestStreamSecrets(t *testing.T) {
@@ -273,6 +280,19 @@ func TestStreamSecrets(t *testing.T) {
 			expectSecrets: []*tls_v3.Secret{
 				tdValidationContext,
 				fedValidationContext,
+				workloadTLSCertificate1,
+			},
+		},
+		{
+			name: "All Secrets: build version without version",
+			req: &discovery_v3.DiscoveryRequest{
+				Node: &core_v3.Node{
+					UserAgentVersionType: userAgentVersionTypeNoVersion,
+				},
+			},
+			expectSecrets: []*tls_v3.Secret{
+				tdValidationContextSpiffeValidator,
+				fedValidationContextSpiffeValidator,
 				workloadTLSCertificate1,
 			},
 		},
@@ -850,7 +870,7 @@ func TestStreamSecretsBadNonce(t *testing.T) {
 	requireSecrets(t, resp, workloadTLSCertificate2)
 }
 
-func TestStreamSecretsErrInSubscribeToCacheChanges(t *testing.T) {
+func TestStreamSecretsErrInSubscribeToX509CacheChanges(t *testing.T) {
 	test := setupErrTest(t)
 	defer test.server.Stop()
 
@@ -885,6 +905,20 @@ func TestFetchSecrets(t *testing.T) {
 			expectSecrets: []*tls_v3.Secret{
 				tdValidationContext,
 				fedValidationContext,
+				workloadTLSCertificate1,
+			},
+		},
+		{
+			name: "Fetch all secrets: build version without version",
+			req: &discovery_v3.DiscoveryRequest{
+				TypeUrl: "TYPEURL",
+				Node: &core_v3.Node{
+					UserAgentVersionType: userAgentVersionTypeNoVersion,
+				},
+			},
+			expectSecrets: []*tls_v3.Secret{
+				tdValidationContextSpiffeValidator,
+				fedValidationContextSpiffeValidator,
 				workloadTLSCertificate1,
 			},
 		},
@@ -1198,26 +1232,122 @@ func TestFetchSecrets(t *testing.T) {
 	}
 }
 
-func DeltaSecretsTest(t *testing.T) {
-	test := setupTest(t)
+// fakeRateLimiter allows the first N calls per method and rejects the rest.
+type fakeRateLimiter struct {
+	mu    sync.Mutex
+	calls map[string]int
+	limit int
+}
+
+func newFakeRateLimiter(limit int) *fakeRateLimiter {
+	return &fakeRateLimiter{calls: make(map[string]int), limit: limit}
+}
+
+func (r *fakeRateLimiter) RateLimit(fullMethod string, _ []*common.Selector) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls[fullMethod]++
+	if r.calls[fullMethod] > r.limit {
+		return grpcstatus.Errorf(codes.Unavailable, "rate limit exceeded for %s", fullMethod)
+	}
+	return nil
+}
+
+// invoked reports whether RateLimit was called for any method.
+func (r *fakeRateLimiter) invoked() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.calls) > 0
+}
+
+func TestStreamSecretsRateLimit(t *testing.T) {
+	rl := newFakeRateLimiter(1)
+	// Use a caller PID that is not the agent's own so the agent exemption does
+	// not apply and rate limiting is actually enforced. In production the
+	// peertracker middleware always sets a caller PID.
+	test := setupTestWithConfigAsPID(t, Config{RateLimiter: rl}, os.Getpid()+1)
 	defer test.cleanup()
 
-	resp, err := test.handler.DeltaSecrets(context.Background())
-	spiretest.RequireGRPCStatus(t, err, codes.Unimplemented, "Method is not implemented")
-	require.Nil(t, resp)
+	// First stream open is within the limit.
+	stream, err := test.handler.StreamSecrets(context.Background())
+	require.NoError(t, err)
+	test.sendAndWait(stream, &discovery_v3.DiscoveryRequest{ResourceNames: []string{"default"}})
+	require.NoError(t, stream.CloseSend())
+	_, err = stream.Recv()
+	require.NoError(t, err)
+
+	// Second stream open exhausts the limit.
+	stream2, err := test.handler.StreamSecrets(context.Background())
+	require.NoError(t, err)
+	require.NoError(t, stream2.Send(&discovery_v3.DiscoveryRequest{}))
+	_, err = stream2.Recv()
+	require.Error(t, err)
+	spiretest.RequireGRPCStatusContains(t, err, codes.Unavailable, "rate limit exceeded")
+}
+
+func TestFetchSecretsRateLimit(t *testing.T) {
+	rl := newFakeRateLimiter(1)
+	// Use a caller PID that is not the agent's own so the agent exemption does
+	// not apply and rate limiting is actually enforced. In production the
+	// peertracker middleware always sets a caller PID.
+	test := setupTestWithConfigAsPID(t, Config{RateLimiter: rl}, os.Getpid()+1)
+	defer test.cleanup()
+
+	req := &discovery_v3.DiscoveryRequest{ResourceNames: []string{"default"}}
+
+	// First call is within the limit.
+	resp, err := test.handler.FetchSecrets(context.Background(), req)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+
+	// Second call exhausts the limit.
+	_, err = test.handler.FetchSecrets(context.Background(), req)
+	require.Error(t, err)
+	spiretest.RequireGRPCStatusContains(t, err, codes.Unavailable, "rate limit exceeded")
+}
+
+// TestRateLimitAgentExemption verifies that the SDS handlers skip rate limiting
+// when the caller PID matches the agent's own PID, mirroring the Workload API
+// behavior. A reject-all limiter with a configured limit of 0 would deny every
+// call if it were consulted.
+func TestRateLimitAgentExemption(t *testing.T) {
+	t.Run("StreamSecrets", func(t *testing.T) {
+		rl := newFakeRateLimiter(0)
+		test := setupTestWithConfigAsPID(t, Config{RateLimiter: rl}, os.Getpid())
+		defer test.cleanup()
+
+		stream, err := test.handler.StreamSecrets(context.Background())
+		require.NoError(t, err)
+		test.sendAndWait(stream, &discovery_v3.DiscoveryRequest{ResourceNames: []string{"default"}})
+		require.NoError(t, stream.CloseSend())
+		_, err = stream.Recv()
+		require.NoError(t, err)
+		require.False(t, rl.invoked(), "rate limiter must not be invoked for agent-self calls")
+	})
+
+	t.Run("FetchSecrets", func(t *testing.T) {
+		rl := newFakeRateLimiter(0)
+		test := setupTestWithConfigAsPID(t, Config{RateLimiter: rl}, os.Getpid())
+		defer test.cleanup()
+
+		resp, err := test.handler.FetchSecrets(context.Background(), &discovery_v3.DiscoveryRequest{ResourceNames: []string{"default"}})
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+		require.False(t, rl.invoked(), "rate limiter must not be invoked for agent-self calls")
+	})
 }
 
 func setupTest(t *testing.T) *handlerTest {
-	return setupTestWithManager(t, Config{}, NewFakeManager(t))
+	return setupTestWithManager(t, Config{}, NewFakeManager(t), 0)
 }
 
 func setupErrTest(t *testing.T) *handlerTest {
 	manager := NewFakeManager(t)
 	manager.err = errors.New("bad-error")
-	return setupTestWithManager(t, Config{}, manager)
+	return setupTestWithManager(t, Config{}, manager, 0)
 }
 
-func setupTestWithManager(t *testing.T, c Config, manager *FakeManager) *handlerTest {
+func setupTestWithManager(t *testing.T, c Config, manager *FakeManager, asPID int) *handlerTest {
 	defaultConfig := Config{
 		Manager:                     manager,
 		Attestor:                    FakeAttestor(workloadSelectors),
@@ -1235,10 +1365,19 @@ func setupTestWithManager(t *testing.T, c Config, manager *FakeManager) *handler
 	listener, err := net.Listen("tcp", "localhost:0")
 	require.NoError(t, err)
 
-	conn, err := grpc.Dial(listener.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(listener.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	require.NoError(t, err)
 	log, _ := test.NewNullLogger()
-	unaryInterceptor, streamInterceptor := middleware.Interceptors(middleware.WithLogger(log))
+	mw := middleware.WithLogger(log)
+	if asPID != 0 {
+		// Inject a caller PID into the request context, mirroring the
+		// production peertracker middleware, so the handler's isAgent check
+		// can be exercised.
+		mw = middleware.Chain(mw, middleware.Preprocess(func(ctx context.Context, _ string, _ any) (context.Context, error) {
+			return rpccontext.WithCallerPID(ctx, asPID), nil
+		}))
+	}
+	unaryInterceptor, streamInterceptor := middleware.Interceptors(mw)
 	server := grpc.NewServer(grpc.Creds(FakeCreds{}),
 		grpc.UnaryInterceptor(unaryInterceptor),
 		grpc.StreamInterceptor(streamInterceptor),
@@ -1261,7 +1400,12 @@ func setupTestWithManager(t *testing.T, c Config, manager *FakeManager) *handler
 
 func setupTestWithConfig(t *testing.T, c Config) *handlerTest {
 	manager := NewFakeManager(t)
-	return setupTestWithManager(t, c, manager)
+	return setupTestWithManager(t, c, manager, 0)
+}
+
+func setupTestWithConfigAsPID(t *testing.T, c Config, asPID int) *handlerTest {
+	manager := NewFakeManager(t)
+	return setupTestWithManager(t, c, manager, asPID)
 }
 
 type handlerTest struct {
@@ -1278,10 +1422,10 @@ func (h *handlerTest) cleanup() {
 }
 
 func (h *handlerTest) setWorkloadUpdate(workloadCert *x509.Certificate) {
-	var workloadUpdate *cache.WorkloadUpdate
+	var workloadUpdate *cache.X509WorkloadUpdate
 	if workloadCert != nil {
-		workloadUpdate = &cache.WorkloadUpdate{
-			Identities: []cache.Identity{
+		workloadUpdate = &cache.X509WorkloadUpdate{
+			Identities: []cache.X509Identity{
 				{
 					Entry: &common.RegistrationEntry{
 						SpiffeId: "spiffe://domain.test/workload",
@@ -1320,26 +1464,26 @@ type FakeManager struct {
 	t *testing.T
 
 	mu   sync.Mutex
-	upd  *cache.WorkloadUpdate
+	upd  *cache.X509WorkloadUpdate
 	next int
-	subs map[int]chan *cache.WorkloadUpdate
+	subs map[int]chan *cache.X509WorkloadUpdate
 	err  error
 }
 
 func NewFakeManager(t *testing.T) *FakeManager {
 	return &FakeManager{
 		t:    t,
-		subs: make(map[int]chan *cache.WorkloadUpdate),
+		subs: make(map[int]chan *cache.X509WorkloadUpdate),
 	}
 }
 
-func (m *FakeManager) SubscribeToCacheChanges(_ context.Context, selectors cache.Selectors) (cache.Subscriber, error) {
+func (m *FakeManager) SubscribeToX509CacheChanges(_ context.Context, selectors cache.Selectors) (cache.Subscriber[cache.X509WorkloadUpdate], error) {
 	if m.err != nil {
 		return nil, m.err
 	}
 	require.Equal(m.t, workloadSelectors, selectors)
 
-	updch := make(chan *cache.WorkloadUpdate, 1)
+	updch := make(chan *cache.X509WorkloadUpdate, 1)
 	if m.upd != nil {
 		updch <- m.upd
 	}
@@ -1355,13 +1499,13 @@ func (m *FakeManager) SubscribeToCacheChanges(_ context.Context, selectors cache
 	}), nil
 }
 
-func (m *FakeManager) FetchWorkloadUpdate([]*common.Selector) *cache.WorkloadUpdate {
+func (m *FakeManager) FetchWorkloadUpdate([]*common.Selector) *cache.X509WorkloadUpdate {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.upd
 }
 
-func (m *FakeManager) SetWorkloadUpdate(upd *cache.WorkloadUpdate) {
+func (m *FakeManager) SetWorkloadUpdate(upd *cache.X509WorkloadUpdate) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -1377,18 +1521,18 @@ func (m *FakeManager) SetWorkloadUpdate(upd *cache.WorkloadUpdate) {
 }
 
 type FakeSubscriber struct {
-	updch <-chan *cache.WorkloadUpdate
+	updch <-chan *cache.X509WorkloadUpdate
 	done  func()
 }
 
-func NewFakeSubscriber(updch <-chan *cache.WorkloadUpdate, done func()) *FakeSubscriber {
+func NewFakeSubscriber(updch <-chan *cache.X509WorkloadUpdate, done func()) *FakeSubscriber {
 	return &FakeSubscriber{
 		updch: updch,
 		done:  done,
 	}
 }
 
-func (s *FakeSubscriber) Updates() <-chan *cache.WorkloadUpdate {
+func (s *FakeSubscriber) Updates() <-chan *cache.X509WorkloadUpdate {
 	return s.updch
 }
 
@@ -1409,8 +1553,6 @@ func (c FakeCreds) ServerHandshake(conn net.Conn) (net.Conn, credentials.AuthInf
 func (c FakeCreds) Info() credentials.ProtocolInfo {
 	return credentials.ProtocolInfo{
 		SecurityProtocol: "fixed",
-		SecurityVersion:  "0.1",
-		ServerName:       "sds-handler-test",
 	}
 }
 
@@ -1434,7 +1576,7 @@ func requireSecrets(t *testing.T, resp *discovery_v3.DiscoveryResponse, expected
 	var actualSecrets []*tls_v3.Secret
 	for _, resource := range resp.Resources {
 		secret := new(tls_v3.Secret)
-		require.NoError(t, resource.UnmarshalTo(secret)) //nolint: scopelint // pointer to resource isn't held
+		require.NoError(t, resource.UnmarshalTo(secret))
 		actualSecrets = append(actualSecrets, secret)
 	}
 

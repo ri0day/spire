@@ -6,22 +6,31 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"runtime"
+	"strings"
 	"testing"
 
+	"github.com/spiffe/go-spiffe/v2/proto/spiffe/workload"
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/spire/pkg/agent/plugin/nodeattestor"
 	nodeattestortest "github.com/spiffe/spire/pkg/agent/plugin/nodeattestor/test"
+	"github.com/spiffe/spire/pkg/common/catalog"
 	"github.com/spiffe/spire/pkg/common/plugin/x509pop"
 	"github.com/spiffe/spire/pkg/common/util"
+	"github.com/spiffe/spire/test/fakes/fakeworkloadapi"
 	"github.com/spiffe/spire/test/fixture"
 	"github.com/spiffe/spire/test/plugintest"
 	"github.com/spiffe/spire/test/spiretest"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 var (
+	trustDomain      = "example.org"
 	leafKeyPath      = fixture.Join("nodeattestor", "x509pop", "leaf-key.pem")
 	leafCertPath     = fixture.Join("nodeattestor", "x509pop", "leaf-crt-bundle.pem")
 	intermediatePath = fixture.Join("nodeattestor", "x509pop", "intermediate.pem")
+	svidRegPath      = fixture.Join("nodeattestor", "x509pop", "svidreg.pem")
 
 	streamBuilder = nodeattestortest.ServerStream(pluginName)
 )
@@ -34,6 +43,7 @@ type Suite struct {
 	spiretest.Suite
 
 	leafCert                  *x509.Certificate
+	leafKey                   any
 	bundleWithoutIntermediate [][]byte
 	bundleWithIntermediate    [][]byte
 }
@@ -44,6 +54,7 @@ func (s *Suite) SetupSuite() {
 
 	s.leafCert, err = x509.ParseCertificate(kp.Certificate[0])
 	s.Require().NoError(err)
+	s.leafKey = kp.PrivateKey
 
 	s.bundleWithoutIntermediate = kp.Certificate
 
@@ -63,6 +74,92 @@ func (s *Suite) TestAttestSuccess() {
 func (s *Suite) TestAttestSuccessWithIntermediates() {
 	p := s.loadAndConfigurePlugin(true)
 	s.testAttestSuccess(p, s.bundleWithIntermediate)
+}
+
+func getTestAddress(path string) string {
+	if runtime.GOOS == "windows" {
+		return "npipe:" + strings.TrimPrefix(path, `\\.\pipe\`)
+	}
+	return "unix://" + path
+}
+
+func (s *Suite) TestAttestSuccessWithWorkloadAPI() {
+	certs, err := util.LoadCertificates(svidRegPath)
+	s.Require().NoError(err)
+
+	svidLeaf := certs[0]
+	var certArray [][]byte
+	var certBytes []byte
+	for _, c := range certs {
+		certArray = append(certArray, c.Raw)
+		certBytes = append(certBytes, c.Raw...)
+	}
+
+	keyBytes, err := x509.MarshalPKCS8PrivateKey(s.leafKey)
+	s.Require().NoError(err)
+
+	fakeRequest := &fakeworkloadapi.FakeRequest{
+		Req: &workload.X509SVIDRequest{},
+		Resp: &workload.X509SVIDResponse{
+			Svids: []*workload.X509SVID{
+				{
+					SpiffeId:    svidLeaf.URIs[0].String(),
+					X509Svid:    certBytes,
+					X509SvidKey: keyBytes,
+				},
+			},
+		},
+	}
+
+	wlAPI := fakeworkloadapi.New(s.T(), fakeRequest)
+	p := s.loadPlugin(
+		plugintest.CoreConfig(catalog.CoreConfig{
+			TrustDomain: spiffeid.RequireTrustDomainFromString(trustDomain),
+		}),
+		plugintest.Configure(fmt.Sprintf(`spiffe_endpoint_socket = "%s"`, getTestAddress(wlAPI.Addr().String()))),
+	)
+
+	expectPayload := s.marshal(x509pop.AttestationData{
+		Certificates: certArray,
+	})
+
+	challenge, err := x509pop.GenerateChallenge(svidLeaf)
+	s.Require().NoError(err)
+	challengeBytes := s.marshal(challenge)
+
+	err = p.Attest(context.Background(), streamBuilder.
+		ExpectThenChallenge(expectPayload, challengeBytes).
+		Handle(func(challengeResponse []byte) ([]byte, error) {
+			response := new(x509pop.Response)
+			if err := json.Unmarshal(challengeResponse, response); err != nil {
+				return nil, err
+			}
+			return nil, x509pop.VerifyChallengeResponse(svidLeaf.PublicKey, challenge, response)
+		}).Build())
+	s.Require().NoError(err)
+}
+
+func (s *Suite) TestAttestFailureWithWorkloadAPI() {
+	fakeRequest := &fakeworkloadapi.FakeRequest{
+		Req:  &workload.X509SVIDRequest{},
+		Resp: &workload.X509SVIDResponse{},
+		Err:  status.Error(codes.Unavailable, "workload api is down"),
+	}
+
+	wlAPI := fakeworkloadapi.New(s.T(), fakeRequest)
+
+	p := s.loadPlugin(
+		plugintest.CoreConfig(catalog.CoreConfig{
+			TrustDomain: spiffeid.RequireTrustDomainFromString(trustDomain),
+		}),
+		plugintest.Configure(fmt.Sprintf(`spiffe_endpoint_socket = "%s"`, getTestAddress(wlAPI.Addr().String()))),
+	)
+
+	err := p.Attest(context.Background(), streamBuilder.Build())
+
+	s.Require().Error(err)
+	s.RequireGRPCStatusContains(err, codes.Unavailable, "unable to fetch SVID from workload API")
+	s.RequireGRPCStatusContains(err, codes.Unavailable, "workload api is down")
 }
 
 func (s *Suite) TestAttestFailure() {
@@ -87,10 +184,13 @@ func (s *Suite) TestConfigure() {
 	// malformed
 	s.loadPlugin(plugintest.CaptureConfigureError(&err),
 		plugintest.Configure(`bad juju`))
-	s.RequireGRPCStatusContains(err, codes.InvalidArgument, "unable to decode configuration")
+	s.RequireGRPCStatusContains(err, codes.InvalidArgument, "server core configuration must contain trust_domain")
 
 	// missing private_key_path
 	s.loadPlugin(plugintest.CaptureConfigureError(&err),
+		plugintest.CoreConfig(catalog.CoreConfig{
+			TrustDomain: spiffeid.RequireTrustDomainFromString("example.org"),
+		}),
 		plugintest.Configure(`
 			certificate_path = "blah"
 		`),
@@ -99,6 +199,9 @@ func (s *Suite) TestConfigure() {
 
 	// missing certificate_path
 	s.loadPlugin(plugintest.CaptureConfigureError(&err),
+		plugintest.CoreConfig(catalog.CoreConfig{
+			TrustDomain: spiffeid.RequireTrustDomainFromString("example.org"),
+		}),
 		plugintest.Configure(`
 			private_key_path = "blah"
 		`),
@@ -107,6 +210,9 @@ func (s *Suite) TestConfigure() {
 
 	// cannot load keypair
 	s.loadPlugin(plugintest.CaptureConfigureError(&err),
+		plugintest.CoreConfig(catalog.CoreConfig{
+			TrustDomain: spiffeid.RequireTrustDomainFromString("example.org"),
+		}),
 		plugintest.Configure(`
 			private_key_path = "blah"
 			certificate_path = "blah"
@@ -116,6 +222,9 @@ func (s *Suite) TestConfigure() {
 
 	// cannot load intermediates
 	s.loadPlugin(plugintest.CaptureConfigureError(&err),
+		plugintest.CoreConfig(catalog.CoreConfig{
+			TrustDomain: spiffeid.RequireTrustDomainFromString("example.org"),
+		}),
 		plugintest.Configuref(`
 			private_key_path = %q
 			certificate_path = %q
@@ -138,7 +247,12 @@ func (s *Suite) loadAndConfigurePlugin(withIntermediate bool) nodeattestor.NodeA
 		config += fmt.Sprintf(`
 			intermediates_path = %q`, intermediatePath)
 	}
-	return s.loadPlugin(plugintest.Configure(config))
+	return s.loadPlugin(
+		plugintest.CoreConfig(catalog.CoreConfig{
+			TrustDomain: spiffeid.RequireTrustDomainFromString(trustDomain),
+		}),
+		plugintest.Configure(config),
+	)
 }
 
 func (s *Suite) testAttestSuccess(p nodeattestor.NodeAttestor, expectBundle [][]byte) {

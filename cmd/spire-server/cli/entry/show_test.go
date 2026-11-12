@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
 func TestShowHelp(t *testing.T) {
@@ -61,7 +62,9 @@ func TestShow(t *testing.T) {
 			name: "List all entries (empty filter)",
 			expListReq: &entryv1.ListEntriesRequest{
 				PageSize: listEntriesRequestPageSize,
-				Filter:   &entryv1.ListEntriesRequest_Filter{},
+				Filter: &entryv1.ListEntriesRequest_Filter{
+					ByDownstream: wrapperspb.Bool(false),
+				},
 			},
 			fakeListResp: fakeRespAll,
 			expOutPretty: fmt.Sprintf("Found 4 entries\n%s%s%s%s",
@@ -103,7 +106,8 @@ func TestShow(t *testing.T) {
 			expListReq: &entryv1.ListEntriesRequest{
 				PageSize: listEntriesRequestPageSize,
 				Filter: &entryv1.ListEntriesRequest_Filter{
-					ByParentId: &types.SPIFFEID{TrustDomain: "example.org", Path: "/father"},
+					ByParentId:   &types.SPIFFEID{TrustDomain: "example.org", Path: "/father"},
+					ByDownstream: wrapperspb.Bool(false),
 				},
 			},
 			fakeListResp: fakeRespFather,
@@ -124,7 +128,8 @@ func TestShow(t *testing.T) {
 			expListReq: &entryv1.ListEntriesRequest{
 				PageSize: listEntriesRequestPageSize,
 				Filter: &entryv1.ListEntriesRequest_Filter{
-					BySpiffeId: &types.SPIFFEID{TrustDomain: "example.org", Path: "/daughter"},
+					BySpiffeId:   &types.SPIFFEID{TrustDomain: "example.org", Path: "/daughter"},
+					ByDownstream: wrapperspb.Bool(false),
 				},
 			},
 			fakeListResp: fakeRespDaughter,
@@ -152,6 +157,7 @@ func TestShow(t *testing.T) {
 						},
 						Match: types.SelectorMatch_MATCH_SUPERSET,
 					},
+					ByDownstream: wrapperspb.Bool(false),
 				},
 			},
 			fakeListResp: fakeRespFatherDaughter,
@@ -173,6 +179,7 @@ func TestShow(t *testing.T) {
 						},
 						Match: types.SelectorMatch_MATCH_EXACT,
 					},
+					ByDownstream: wrapperspb.Bool(false),
 				},
 			},
 			fakeListResp: fakeRespFatherDaughter,
@@ -194,6 +201,7 @@ func TestShow(t *testing.T) {
 						},
 						Match: types.SelectorMatch_MATCH_SUPERSET,
 					},
+					ByDownstream: wrapperspb.Bool(false),
 				},
 			},
 			fakeListResp: fakeRespFatherDaughter,
@@ -215,6 +223,7 @@ func TestShow(t *testing.T) {
 						},
 						Match: types.SelectorMatch_MATCH_SUBSET,
 					},
+					ByDownstream: wrapperspb.Bool(false),
 				},
 			},
 			fakeListResp: fakeRespFatherDaughter,
@@ -236,6 +245,7 @@ func TestShow(t *testing.T) {
 						},
 						Match: types.SelectorMatch_MATCH_ANY,
 					},
+					ByDownstream: wrapperspb.Bool(false),
 				},
 			},
 			fakeListResp: fakeRespFatherDaughter,
@@ -260,7 +270,8 @@ func TestShow(t *testing.T) {
 			expListReq: &entryv1.ListEntriesRequest{
 				PageSize: listEntriesRequestPageSize,
 				Filter: &entryv1.ListEntriesRequest_Filter{
-					BySpiffeId: &types.SPIFFEID{TrustDomain: "example.org", Path: "/daughter"},
+					BySpiffeId:   &types.SPIFFEID{TrustDomain: "example.org", Path: "/daughter"},
+					ByDownstream: wrapperspb.Bool(false),
 				},
 			},
 			serverErr: status.Error(codes.Internal, "internal server error"),
@@ -276,6 +287,7 @@ func TestShow(t *testing.T) {
 						TrustDomains: []string{"spiffe://domain.test"},
 						Match:        types.FederatesWithMatch_MATCH_SUPERSET,
 					},
+					ByDownstream: wrapperspb.Bool(false),
 				},
 			},
 			fakeListResp: fakeRespMotherDaughter,
@@ -294,6 +306,7 @@ func TestShow(t *testing.T) {
 						TrustDomains: []string{"spiffe://domain.test"},
 						Match:        types.FederatesWithMatch_MATCH_EXACT,
 					},
+					ByDownstream: wrapperspb.Bool(false),
 				},
 			},
 			fakeListResp: fakeRespMotherDaughter,
@@ -312,6 +325,7 @@ func TestShow(t *testing.T) {
 						TrustDomains: []string{"spiffe://domain.test"},
 						Match:        types.FederatesWithMatch_MATCH_ANY,
 					},
+					ByDownstream: wrapperspb.Bool(false),
 				},
 			},
 			fakeListResp: fakeRespMotherDaughter,
@@ -330,6 +344,7 @@ func TestShow(t *testing.T) {
 						TrustDomains: []string{"spiffe://domain.test"},
 						Match:        types.FederatesWithMatch_MATCH_SUPERSET,
 					},
+					ByDownstream: wrapperspb.Bool(false),
 				},
 			},
 			fakeListResp: fakeRespMotherDaughter,
@@ -348,6 +363,7 @@ func TestShow(t *testing.T) {
 						TrustDomains: []string{"spiffe://domain.test"},
 						Match:        types.FederatesWithMatch_MATCH_SUBSET,
 					},
+					ByDownstream: wrapperspb.Bool(false),
 				},
 			},
 			fakeListResp: fakeRespMotherDaughter,
@@ -429,7 +445,7 @@ func getEntries(count int) []*types.Entry {
 	}
 
 	e := []*types.Entry{}
-	for i := 0; i < count; i++ {
+	for i := range count {
 		e = append(e, entries[i])
 	}
 
@@ -439,49 +455,49 @@ func getEntries(count int) []*types.Entry {
 func getPrettyPrintedEntry(idx int) string {
 	switch idx {
 	case 0:
-		return `Entry ID         : 00000000-0000-0000-0000-000000000000
-SPIFFE ID        : spiffe://example.org/son
-Parent ID        : spiffe://example.org/father
-Revision         : 0
-X509-SVID TTL    : default
-JWT-SVID TTL     : default
-Selector         : foo:bar
-Hint             : internal
+		return `Entry ID                : 00000000-0000-0000-0000-000000000000
+SPIFFE ID               : spiffe://example.org/son
+Parent ID               : spiffe://example.org/father
+Revision                : 0
+X509-SVID TTL           : default
+JWT-SVID TTL            : default
+Selector                : foo:bar
+Hint                    : internal
 
 `
 	case 1:
-		return `Entry ID         : 00000000-0000-0000-0000-000000000001
-SPIFFE ID        : spiffe://example.org/daughter
-Parent ID        : spiffe://example.org/father
-Revision         : 0
-X509-SVID TTL    : default
-JWT-SVID TTL     : default
-Selector         : bar:baz
-Selector         : foo:bar
-Hint             : external
+		return `Entry ID                : 00000000-0000-0000-0000-000000000001
+SPIFFE ID               : spiffe://example.org/daughter
+Parent ID               : spiffe://example.org/father
+Revision                : 0
+X509-SVID TTL           : default
+JWT-SVID TTL            : default
+Selector                : bar:baz
+Selector                : foo:bar
+Hint                    : external
 
 `
 	case 2:
-		return `Entry ID         : 00000000-0000-0000-0000-000000000002
-SPIFFE ID        : spiffe://example.org/daughter
-Parent ID        : spiffe://example.org/mother
-Revision         : 0
-X509-SVID TTL    : default
-JWT-SVID TTL     : default
-Selector         : bar:baz
-Selector         : baz:bat
-FederatesWith    : spiffe://domain.test
+		return `Entry ID                : 00000000-0000-0000-0000-000000000002
+SPIFFE ID               : spiffe://example.org/daughter
+Parent ID               : spiffe://example.org/mother
+Revision                : 0
+X509-SVID TTL           : default
+JWT-SVID TTL            : default
+Selector                : bar:baz
+Selector                : baz:bat
+FederatesWith           : spiffe://domain.test
 
 `
 	case 3:
-		return fmt.Sprintf(`Entry ID         : 00000000-0000-0000-0000-000000000003
-SPIFFE ID        : spiffe://example.org/son
-Parent ID        : spiffe://example.org/mother
-Revision         : 0
-X509-SVID TTL    : default
-JWT-SVID TTL     : default
-Expiration time  : %s
-Selector         : baz:bat
+		return fmt.Sprintf(`Entry ID                : 00000000-0000-0000-0000-000000000003
+SPIFFE ID               : spiffe://example.org/son
+Parent ID               : spiffe://example.org/mother
+Revision                : 0
+X509-SVID TTL           : default
+JWT-SVID TTL            : default
+Expiration time         : %s
+Selector                : baz:bat
 
 `, time.Unix(1552410266, 0).UTC())
 	default:
@@ -508,6 +524,7 @@ func getJSONPrintedEntry(idx int) string {
           "value": "bar"
         }
       ],
+      "wit_svid_ttl": 0,
       "x509_svid_ttl": 0,
       "federates_with": [],
       "hint": "internal",
@@ -541,6 +558,7 @@ func getJSONPrintedEntry(idx int) string {
           "value": "bar"
         }
       ],
+      "wit_svid_ttl": 0,
       "x509_svid_ttl": 0,
       "federates_with": [],
       "hint": "external",
@@ -574,6 +592,7 @@ func getJSONPrintedEntry(idx int) string {
           "value": "bat"
         }
       ],
+      "wit_svid_ttl": 0,
       "x509_svid_ttl": 0,
       "federates_with": [
         "spiffe://domain.test"
@@ -605,6 +624,7 @@ func getJSONPrintedEntry(idx int) string {
           "value": "bat"
         }
       ],
+      "wit_svid_ttl": 0,
       "x509_svid_ttl": 0,
       "federates_with": [],
       "hint": "",

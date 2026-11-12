@@ -11,9 +11,10 @@ import (
 	"log"
 	"net/url"
 	"reflect"
+	"strings"
 	"time"
 
-	"github.com/go-jose/go-jose/v3/jwt"
+	"github.com/go-jose/go-jose/v4/jwt"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	agentv1 "github.com/spiffe/spire-api-sdk/proto/spire/api/server/agent/v1"
 	bundlev1 "github.com/spiffe/spire-api-sdk/proto/spire/api/server/bundle/v1"
@@ -21,6 +22,7 @@ import (
 	svidv1 "github.com/spiffe/spire-api-sdk/proto/spire/api/server/svid/v1"
 	"github.com/spiffe/spire-api-sdk/proto/spire/api/server/trustdomain/v1"
 	"github.com/spiffe/spire-api-sdk/proto/spire/api/types"
+	"github.com/spiffe/spire/pkg/common/jwtsvid"
 	"github.com/spiffe/spire/pkg/common/pemutil"
 	"github.com/spiffe/spire/test/integration/setup/itclient"
 	"google.golang.org/grpc/codes"
@@ -64,6 +66,7 @@ func main() {
 	if msg := run(); msg != "" {
 		log.Fatal(msg)
 	}
+
 	log.Println("Admin client finished successfully")
 }
 
@@ -123,12 +126,12 @@ func run() string {
 	testRPC("ListFederationRelationships", listFederationRelationships)
 	testRPC("BatchDeleteFederationRelationship", batchDeleteFederationRelationship)
 
-	msg := ""
+	var msg strings.Builder
 	for _, failure := range failures {
-		msg += fmt.Sprintf("RPC %q: %v\n", failure.name, failure.err)
+		fmt.Fprintf(&msg, "RPC %q: %v\n", failure.name, failure.err)
 	}
 
-	return msg
+	return msg.String()
 }
 
 func mintX509SVID(ctx context.Context, c *itclient.Client) error {
@@ -204,7 +207,7 @@ func mintJWTSVID(ctx context.Context, c *itclient.Client) error {
 	}
 
 	// Parse token
-	token, err := jwt.ParseSigned(resp.Svid.Token)
+	token, err := jwt.ParseSigned(resp.Svid.Token, jwtsvid.AllowedSignatureAlgorithms)
 	if err != nil {
 		return fmt.Errorf("failed to parse token: %w", err)
 	}
@@ -735,11 +738,7 @@ func createJoinToken(ctx context.Context, c *itclient.Client) error {
 		return err
 	}
 	_, err = stream.Recv()
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return err
 }
 
 func countAgents(ctx context.Context, c *itclient.Client) error {
@@ -769,7 +768,7 @@ func listAgents(ctx context.Context, c *itclient.Client) error {
 	case err != nil:
 		return err
 	case len(resp.Agents) != 1:
-		return fmt.Errorf("only one agent is expected")
+		return errors.New("only one agent is expected")
 	}
 
 	// Validate agent

@@ -17,47 +17,21 @@ import (
 	"testing"
 	"time"
 
-	jose "github.com/go-jose/go-jose/v3"
-	"github.com/go-jose/go-jose/v3/jwt"
+	jose "github.com/go-jose/go-jose/v4"
+	"github.com/go-jose/go-jose/v4/jwt"
 	"github.com/google/go-cmp/cmp"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/spire/pkg/common/catalog"
-	"github.com/spiffe/spire/pkg/common/pemutil"
 	sat_common "github.com/spiffe/spire/pkg/common/plugin/k8s"
 	"github.com/spiffe/spire/pkg/server/plugin/nodeattestor"
 	"github.com/spiffe/spire/proto/spire/common"
 	"github.com/spiffe/spire/test/plugintest"
 	"github.com/spiffe/spire/test/spiretest"
+	"github.com/spiffe/spire/test/testkey"
 	"google.golang.org/grpc/codes"
 	authv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-)
-
-var (
-	fooKeyPEM = []byte(`-----BEGIN RSA PRIVATE KEY-----
-MIIBywIBAAJhAMB4gbT09H2RKXaxbu6IV9C3WY+pvkGAbrlQRIHLHwV3Xt1HchjX
-c08v1VEoTBN2YTjhZJlDb/VUsNMJsmBFBBted5geRcbrDtXFlUJ8tQoQx1dWM4Aa
-xcdULJ83A9ICKwIDAQABAmBR1asInrIphYQEtHJ/NzdnRd3tqHV9cjch0dAfA5dA
-Ar4yBYOsrkaX37WqWSDnkYgN4FWYBWn7WxeotCtA5UQ3SM5hLld67rUqAm2dLrs1
-z8va6SwLzrPTu2+rmRgovFECMQDpbfPBRex7FY/xWu1pYv6X9XZ26SrC2Wc6RIpO
-38AhKGjTFEMAPJQlud4e2+4I3KkCMQDTFLUvBSXokw2NvcNiM9Kqo5zCnCIkgc+C
-hM3EzSh2jh4gZvRzPOhXYvNKgLx8+LMCMQDL4meXlpV45Fp3eu4GsJqi65jvP7VD
-v1P0hs0vGyvbSkpUo0vqNv9G/FNQLNR6FRECMFXEMz5wxA91OOuf8HTFg9Lr+fUl
-RcY5rJxm48kUZ12Mr3cQ/kCYvftL7HkYR/4rewIxANdritlIPu4VziaEhYZg7dvz
-pG3eEhiqPxE++QHpwU78O+F1GznOPBvpZOB3GfyjNQ==
------END RSA PRIVATE KEY-----`)
-	barKeyPEM = []byte(`-----BEGIN PRIVATE KEY-----
-MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgOIAksqKX+ByhLcme
-T7MXn5Qz58BJCSvvAyRoz7+7jXGhRANCAATUWB+7Xo/JyFuh1KQ6umUbihP+AGzy
-da0ItHUJ/C5HElB5cSuyOAXDQbM5fuxJIefEVpodjqsQP6D0D8CPLJ5H
------END PRIVATE KEY-----`)
-	bazKeyPEM = []byte(`-----BEGIN PRIVATE KEY-----
-MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgpHVYFq6Z/LgGIG/X
-+i+PWZEFjGVEUpjrMzlz95tDl4yhRANCAAQAc/I3bBO9XhgTTbLBuNA6XJBSvds9
-c4gThKYxugN3V398Eieoo2HTO2L7BBjTp5yh+EUtHQD52bFseBCnZT3d
------END PRIVATE KEY-----`)
 )
 
 func TestAttestorPlugin(t *testing.T) {
@@ -90,24 +64,21 @@ type TokenData struct {
 
 func (s *AttestorSuite) SetupSuite() {
 	var err error
-	s.fooKey, err = pemutil.ParseRSAPrivateKey(fooKeyPEM)
-	s.Require().NoError(err)
+	s.fooKey = testkey.MustRSA2048()
 	s.fooSigner, err = jose.NewSigner(jose.SigningKey{
 		Algorithm: jose.RS256,
 		Key:       s.fooKey,
 	}, nil)
 	s.Require().NoError(err)
 
-	s.barKey, err = pemutil.ParseECPrivateKey(barKeyPEM)
-	s.Require().NoError(err)
+	s.barKey = testkey.MustEC256()
 	s.barSigner, err = jose.NewSigner(jose.SigningKey{
 		Algorithm: jose.ES256,
 		Key:       s.barKey,
 	}, nil)
 	s.Require().NoError(err)
 
-	bazKey, err := pemutil.ParseECPrivateKey(bazKeyPEM)
-	s.Require().NoError(err)
+	bazKey := testkey.MustEC256()
 	s.bazSigner, err = jose.NewSigner(jose.SigningKey{
 		Algorithm: jose.ES256,
 		Key:       bazKey,
@@ -191,7 +162,7 @@ func (s *AttestorSuite) TestAttestFailsWithMissingNamespaceClaim() {
 	s.apiServerClient.SetTokenStatus(token, createTokenStatus(tokenData, true, defaultAudience))
 	s.requireAttestError(makePayload("FOO", token),
 		codes.Internal,
-		"nodeattestor(k8s_psat): fail to parse username from token review status")
+		"nodeattestor(k8s_psat): failed to parse username from token review status")
 }
 
 func (s *AttestorSuite) TestAttestFailsWithMissingServiceAccountNameClaim() {
@@ -204,7 +175,7 @@ func (s *AttestorSuite) TestAttestFailsWithMissingServiceAccountNameClaim() {
 	s.apiServerClient.SetTokenStatus(token, createTokenStatus(tokenData, true, defaultAudience))
 	s.requireAttestError(makePayload("FOO", token),
 		codes.Internal,
-		"nodeattestor(k8s_psat): fail to parse username from token review status")
+		"nodeattestor(k8s_psat): failed to parse username from token review status")
 }
 
 func (s *AttestorSuite) TestAttestFailsWithMissingPodNameClaim() {
@@ -217,7 +188,7 @@ func (s *AttestorSuite) TestAttestFailsWithMissingPodNameClaim() {
 	s.apiServerClient.SetTokenStatus(token, createTokenStatus(tokenData, true, defaultAudience))
 	s.requireAttestError(makePayload("FOO", token),
 		codes.Internal,
-		"nodeattestor(k8s_psat): fail to get pod name from token review status")
+		"nodeattestor(k8s_psat): failed to get pod name from token review status")
 }
 
 func (s *AttestorSuite) TestAttestFailsWithMissingPodUIDClaim() {
@@ -230,7 +201,7 @@ func (s *AttestorSuite) TestAttestFailsWithMissingPodUIDClaim() {
 	s.apiServerClient.SetTokenStatus(token, createTokenStatus(tokenData, true, defaultAudience))
 	s.requireAttestError(makePayload("FOO", token),
 		codes.Internal,
-		"nodeattestor(k8s_psat): fail to get pod UID from token review status")
+		"nodeattestor(k8s_psat): failed to get pod UID from token review status")
 }
 
 func (s *AttestorSuite) TestAttestFailsIfServiceAccountNotAllowed() {
@@ -258,7 +229,7 @@ func (s *AttestorSuite) TestAttestFailsIfCannotGetPod() {
 	s.apiServerClient.SetTokenStatus(token, createTokenStatus(tokenData, true, defaultAudience))
 	s.requireAttestError(makePayload("FOO", token),
 		codes.Internal,
-		"nodeattestor(k8s_psat): fail to get pod from k8s API server")
+		"nodeattestor(k8s_psat): failed to get pod from k8s API server")
 }
 
 func (s *AttestorSuite) TestAttestFailsIfCannotGetNode() {
@@ -270,10 +241,10 @@ func (s *AttestorSuite) TestAttestFailsIfCannotGetNode() {
 	}
 	token := s.signToken(s.fooSigner, tokenData)
 	s.apiServerClient.SetTokenStatus(token, createTokenStatus(tokenData, true, defaultAudience))
-	s.apiServerClient.SetPod(createPod("NS1", "PODNAME", "NODENAME", "172.16.0.1"))
+	s.apiServerClient.SetPod(createPod("NS1", "PODNAME", "PODUID", "NODENAME", "172.16.0.1"))
 	s.requireAttestError(makePayload("FOO", token),
 		codes.Internal,
-		"nodeattestor(k8s_psat): fail to get node from k8s API server")
+		"nodeattestor(k8s_psat): failed to get node from k8s API server")
 }
 
 func (s *AttestorSuite) TestAttestFailsIfNodeUIDIsEmpty() {
@@ -285,11 +256,26 @@ func (s *AttestorSuite) TestAttestFailsIfNodeUIDIsEmpty() {
 	}
 	token := s.signToken(s.fooSigner, tokenData)
 	s.apiServerClient.SetTokenStatus(token, createTokenStatus(tokenData, true, defaultAudience))
-	s.apiServerClient.SetPod(createPod("NS1", "PODNAME", "NODENAME", "172.16.0.1"))
+	s.apiServerClient.SetPod(createPod("NS1", "PODNAME", "PODUID", "NODENAME", "172.16.0.1"))
 	s.apiServerClient.SetNode(createNode("NODENAME", ""))
 	s.requireAttestError(makePayload("FOO", token),
 		codes.Internal,
 		"node UID is empty")
+}
+
+func (s *AttestorSuite) TestAttestFailsIfPodUIDDoesNotMatchTokenStatus() {
+	tokenData := &TokenData{
+		namespace:          "NS1",
+		serviceAccountName: "SA1",
+		podName:            "PODNAME",
+		podUID:             "PODUID",
+	}
+	token := s.signToken(s.fooSigner, tokenData)
+	s.apiServerClient.SetTokenStatus(token, createTokenStatus(tokenData, true, defaultAudience))
+	s.apiServerClient.SetPod(createPod("NS1", "PODNAME", "OTHER-PODUID", "NODENAME", "172.16.0.1"))
+	s.requireAttestError(makePayload("FOO", token),
+		codes.PermissionDenied,
+		`pod UID mismatch for pod "PODNAME" in cluster "FOO": token bound to pod UID "PODUID"`)
 }
 
 func (s *AttestorSuite) TestAttestSuccess() {
@@ -302,7 +288,7 @@ func (s *AttestorSuite) TestAttestSuccess() {
 	}
 	token := s.signToken(s.fooSigner, tokenData)
 	s.apiServerClient.SetTokenStatus(token, createTokenStatus(tokenData, true, defaultAudience))
-	s.apiServerClient.SetPod(createPod("NS1", "PODNAME-1", "NODENAME-1", "172.16.10.1"))
+	s.apiServerClient.SetPod(createPod("NS1", "PODNAME-1", "PODUID-1", "NODENAME-1", "172.16.10.1"))
 	s.apiServerClient.SetNode(createNode("NODENAME-1", "NODEUID-1"))
 
 	result, err := s.attestor.Attest(context.Background(), makePayload("FOO", token), expectNoChallenge)
@@ -331,7 +317,7 @@ func (s *AttestorSuite) TestAttestSuccess() {
 	}
 	token = s.signToken(s.barSigner, tokenData)
 	s.apiServerClient.SetTokenStatus(token, createTokenStatus(tokenData, true, []string{"AUDIENCE"}))
-	s.apiServerClient.SetPod(createPod("NS2", "PODNAME-2", "NODENAME-2", "172.16.10.2"))
+	s.apiServerClient.SetPod(createPod("NS2", "PODNAME-2", "PODUID-2", "NODENAME-2", "172.16.10.2"))
 	s.apiServerClient.SetNode(createNode("NODENAME-2", "NODEUID-2"))
 
 	// Success with BAR signed token
@@ -348,6 +334,34 @@ func (s *AttestorSuite) TestAttestSuccess() {
 		{Type: "k8s_psat", Value: "agent_node_ip:172.16.10.2"},
 		{Type: "k8s_psat", Value: "agent_node_name:NODENAME-2"},
 		{Type: "k8s_psat", Value: "agent_node_uid:NODEUID-2"},
+	}, result.Selectors)
+}
+
+func (s *AttestorSuite) TestAttestSuccessWithPodUIDAgentID() {
+	tokenData := &TokenData{
+		namespace:          "NS1",
+		serviceAccountName: "SA1",
+		podName:            "PODNAME-3",
+		podUID:             "PODUID-3",
+	}
+	token := s.signToken(s.fooSigner, tokenData)
+	s.apiServerClient.SetTokenStatus(token, createTokenStatus(tokenData, true, defaultAudience))
+	s.apiServerClient.SetPod(createPod("NS1", "PODNAME-3", "PODUID-3", "NODENAME-3", "172.16.10.3"))
+	s.apiServerClient.SetNode(createNode("NODENAME-3", "NODEUID-3"))
+
+	result, err := s.attestor.Attest(context.Background(), makePayload("POD", token), expectNoChallenge)
+	s.Require().NoError(err)
+	s.Require().NotNil(result)
+	s.Require().Equal("spiffe://example.org/spire/agent/k8s_psat/POD/pod/PODUID-3", result.AgentID)
+	s.RequireProtoListEqual([]*common.Selector{
+		{Type: "k8s_psat", Value: "cluster:POD"},
+		{Type: "k8s_psat", Value: "agent_ns:NS1"},
+		{Type: "k8s_psat", Value: "agent_sa:SA1"},
+		{Type: "k8s_psat", Value: "agent_pod_name:PODNAME-3"},
+		{Type: "k8s_psat", Value: "agent_pod_uid:PODUID-3"},
+		{Type: "k8s_psat", Value: "agent_node_ip:172.16.10.3"},
+		{Type: "k8s_psat", Value: "agent_node_name:NODENAME-3"},
+		{Type: "k8s_psat", Value: "agent_node_uid:NODEUID-3"},
 	}, result.Selectors)
 }
 
@@ -368,15 +382,15 @@ func (s *AttestorSuite) TestConfigure() {
 
 	// malformed configuration
 	err := doConfig(coreConfig, "blah")
-	s.RequireGRPCStatusContains(err, codes.InvalidArgument, "unable to decode configuration")
+	s.RequireGRPCStatusContains(err, codes.InvalidArgument, "plugin configuration is malformed")
 
 	// missing trust domain
 	err = doConfig(catalog.CoreConfig{}, "")
-	s.RequireGRPCStatus(err, codes.InvalidArgument, "core configuration missing trust domain")
+	s.RequireGRPCStatus(err, codes.InvalidArgument, "server core configuration must contain trust_domain")
 
 	// missing clusters
 	err = doConfig(coreConfig, "")
-	s.RequireGRPCStatus(err, codes.InvalidArgument, "configuration must have at least one cluster")
+	s.Require().NoError(err)
 
 	// cluster missing service account allow list
 	err = doConfig(coreConfig, `clusters = {
@@ -395,11 +409,11 @@ func (s *AttestorSuite) signToken(signer jose.Signer, tokenData *TokenData) stri
 	}
 
 	// build up standard claims
-	claims := sat_common.PSATClaims{}
-	claims.Issuer = tokenData.issuer
-	claims.NotBefore = jwt.NewNumericDate(tokenData.notBefore)
-	claims.Expiry = jwt.NewNumericDate(tokenData.expiry)
-	claims.Audience = tokenData.audience
+	claims := sat_common.PSATClaims{
+		Issuer:    tokenData.issuer,
+		NotBefore: jwt.NewNumericDate(tokenData.notBefore),
+		Expiry:    jwt.NewNumericDate(tokenData.expiry),
+		Audience:  tokenData.audience}
 
 	// build up psat claims
 	claims.K8s.Namespace = tokenData.namespace
@@ -410,7 +424,7 @@ func (s *AttestorSuite) signToken(signer jose.Signer, tokenData *TokenData) stri
 	builder := jwt.Signed(signer)
 	builder = builder.Claims(claims)
 
-	token, err := builder.CompactSerialize()
+	token, err := builder.Serialize()
 	s.Require().NoError(err)
 	return token
 }
@@ -431,6 +445,11 @@ func (s *AttestorSuite) loadPlugin() nodeattestor.NodeAttestor {
 				kube_config_file= ""
 				audience = ["AUDIENCE"]
 			}
+			"POD" = {
+				service_account_allow_list = ["NS1:SA1"]
+				kube_config_file = ""
+				use_pod_uid_for_agent_id = true
+			}
 		}
 	`), plugintest.CoreConfig(catalog.CoreConfig{
 		TrustDomain: spiffeid.RequireTrustDomainFromString("example.org"),
@@ -440,6 +459,7 @@ func (s *AttestorSuite) loadPlugin() nodeattestor.NodeAttestor {
 	s.apiServerClient = newFakeAPIServerClient()
 	attestor.config.clusters["FOO"].client = s.apiServerClient
 	attestor.config.clusters["BAR"].client = s.apiServerClient
+	attestor.config.clusters["POD"].client = s.apiServerClient
 	return v1
 }
 
@@ -458,7 +478,7 @@ func (s *AttestorSuite) requireAttestError(payload []byte, expectCode codes.Code
 }
 
 func makePayload(cluster, token string) []byte {
-	return []byte(fmt.Sprintf(`{"cluster": %q, "token": %q}`, cluster, token))
+	return fmt.Appendf(nil, `{"cluster": %q, "token": %q}`, cluster, token)
 }
 
 func createAndWriteSelfSignedCert(cn string, signer crypto.Signer, path string) error {
@@ -473,7 +493,7 @@ func createAndWriteSelfSignedCert(cn string, signer crypto.Signer, path string) 
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER}), 0600)
+	return os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER}), 0o600)
 }
 
 func createTokenStatus(tokenData *TokenData, authenticated bool, audience []string) *authv1.TokenReviewStatus {
@@ -490,15 +510,14 @@ func createTokenStatus(tokenData *TokenData, authenticated bool, audience []stri
 	}
 }
 
-func createPod(namespace, podName, nodeName string, hostIP string) *corev1.Pod {
+func createPod(namespace, podName, podUID, nodeName, hostIP string) *corev1.Pod {
 	return &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: namespace,
-			Name:      podName,
-			Labels: map[string]string{
-				"PODLABEL-A": "A",
-				"PODLABEL-B": "B",
-			},
+		Namespace: namespace,
+		Name:      podName,
+		UID:       types.UID(podUID),
+		Labels: map[string]string{
+			"PODLABEL-A": "A",
+			"PODLABEL-B": "B",
 		},
 		Spec: corev1.PodSpec{
 			NodeName: nodeName,
@@ -511,13 +530,11 @@ func createPod(namespace, podName, nodeName string, hostIP string) *corev1.Pod {
 
 func createNode(nodeName, nodeUID string) *corev1.Node {
 	return &corev1.Node{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: nodeName,
-			UID:  types.UID(nodeUID),
-			Labels: map[string]string{
-				"NODELABEL-A": "A",
-				"NODELABEL-B": "B",
-			},
+		Name: nodeName,
+		UID:  types.UID(nodeUID),
+		Labels: map[string]string{
+			"NODELABEL-A": "A",
+			"NODELABEL-B": "B",
 		},
 	}
 }

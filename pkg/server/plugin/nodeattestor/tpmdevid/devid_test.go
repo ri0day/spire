@@ -4,12 +4,17 @@ package tpmdevid_test
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/google/go-tpm/legacy/tpm2"
@@ -88,40 +93,40 @@ func TestConfigure(t *testing.T) {
 	}{
 		{
 			name:   "Configure fails if core config is not provided",
-			expErr: "rpc error: code = InvalidArgument desc = core configuration is missing",
+			expErr: "rpc error: code = InvalidArgument desc = server core configuration is required",
 		},
 		{
 			name:     "Configure fails if trust domain is empty",
-			expErr:   "rpc error: code = InvalidArgument desc = trust_domain is required",
+			expErr:   "rpc error: code = InvalidArgument desc = server core configuration must contain trust_domain",
 			coreConf: &configv1.CoreConfiguration{},
 		},
 		{
 			name:     "Configure fails if HCL config cannot be decoded",
-			expErr:   "rpc error: code = InvalidArgument desc = unable to decode configuration",
+			expErr:   "rpc error: code = InvalidArgument desc = plugin configuration is malformed",
 			coreConf: &configv1.CoreConfiguration{TrustDomain: "example.org"},
 			hclConf:  "not an HCL configuration",
 		},
 		{
 			name:     "Configure fails if devid_ca_path is not provided",
-			expErr:   "rpc error: code = InvalidArgument desc = invalid configuration: devid_ca_path is required",
+			expErr:   "rpc error: code = InvalidArgument desc = devid_ca_path is required",
 			coreConf: &configv1.CoreConfiguration{TrustDomain: "example.org"},
 		},
 		{
 			name:     "Configure fails if endorsement_ca_path is not provided",
-			expErr:   "rpc error: code = InvalidArgument desc = invalid configuration: endorsement_ca_path is required",
+			expErr:   "rpc error: code = InvalidArgument desc = endorsement_ca_path is required",
 			coreConf: &configv1.CoreConfiguration{TrustDomain: "example.org"},
 			hclConf:  `devid_ca_path = "non-existent/devid/bundle/path"`,
 		},
 		{
 			name:     "Configure fails if DevID trust bundle cannot be loaded",
-			expErr:   "rpc error: code = Internal desc = unable to load DevID trust bundle: open non-existent/devid/bundle/path:",
+			expErr:   "rpc error: code = InvalidArgument desc = unable to load DevID trust bundle: open non-existent/devid/bundle/path:",
 			coreConf: &configv1.CoreConfiguration{TrustDomain: "example.org"},
 			hclConf: `devid_ca_path = "non-existent/devid/bundle/path"
 					  endorsement_ca_path = "non-existent/endorsement/bundle/path"`,
 		},
 		{
 			name:     "Configure fails if endorsement trust bundle cannot be opened",
-			expErr:   "rpc error: code = Internal desc = unable to load endorsement trust bundle: open non-existent/endorsement/bundle/path:",
+			expErr:   "rpc error: code = InvalidArgument desc = unable to load endorsement trust bundle: open non-existent/endorsement/bundle/path:",
 			coreConf: &configv1.CoreConfiguration{TrustDomain: "example.org"},
 			hclConf: fmt.Sprintf(`devid_ca_path = %q
 								endorsement_ca_path = "non-existent/endorsement/bundle/path"`,
@@ -138,7 +143,6 @@ func TestConfigure(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			plugin := tpmdevid.New()
 			resp, err := plugin.Configure(context.Background(), &configv1.ConfigureRequest{
@@ -494,7 +498,6 @@ func TestAttestFailiures(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			plugin := loadPlugin(t, tt.hclConf)
 			result, err := plugin.Attest(context.Background(), tt.payload, tt.challengeFn)
@@ -521,6 +524,27 @@ func TestAttestSucceeds(t *testing.T) {
 	devIDRSA, err := sim.GenerateDevID(provisioningCA, tpmsimulator.RSA, tpmPasswords.DevIDKey)
 	require.NoError(t, err)
 	devIDECC, err := sim.GenerateDevID(provisioningCA, tpmsimulator.ECC, tpmPasswords.DevIDKey)
+	require.NoError(t, err)
+
+	// Reissue the ECC certificate with standard and custom subject attributes.
+	devIDECC.Certificate.Subject.SerialNumber = "server-123"
+	devIDECC.Certificate.Subject.ExtraNames = []pkix.AttributeTypeAndValue{
+		{Type: asn1.ObjectIdentifier{1, 2, 3, 4}, Value: "rack-a"},
+		{Type: asn1.ObjectIdentifier{1, 2, 3, 4}, Value: "rack-a"},
+		{Type: asn1.ObjectIdentifier{1, 2, 3, 4}, Value: " Rack:B "},
+		{Type: asn1.ObjectIdentifier{1, 2, 3, 5}, Value: ""},
+		{Type: asn1.ObjectIdentifier{1, 2, 3, 6}, Value: 42},
+		// The prefix is 20 characters: these selectors are 255 and 256 characters.
+		{Type: asn1.ObjectIdentifier{1, 2, 3, 7}, Value: strings.Repeat("a", 235)},
+		{Type: asn1.ObjectIdentifier{1, 2, 3, 7}, Value: strings.Repeat("a", 236)},
+		{Type: asn1.ObjectIdentifier{1, 2, 3, 8}, Value: strings.Repeat("é", 235)},
+		{Type: asn1.ObjectIdentifier{1, 2, 3, 8}, Value: strings.Repeat("é", 236)},
+	}
+	devIDECC.Certificate.RawSubject = nil
+	certDER, err := x509.CreateCertificate(rand.Reader, devIDECC.Certificate,
+		provisioningCA.IntermediateCert, devIDECC.Certificate.PublicKey, provisioningCA.IntermediateKey)
+	require.NoError(t, err)
+	devIDECC.Certificate, err = x509.ParseCertificate(certDER)
 	require.NoError(t, err)
 
 	// Generate DevIDs with no intermediate certificates
@@ -552,6 +576,10 @@ func TestAttestSucceeds(t *testing.T) {
 				},
 				{
 					Type:  "tpm_devid",
+					Value: "subject:oid:2.5.4.3:devid-leaf",
+				},
+				{
+					Type:  "tpm_devid",
 					Value: "issuer:cn:intermediate",
 				},
 				{
@@ -565,7 +593,7 @@ func TestAttestSucceeds(t *testing.T) {
 			},
 		},
 		{
-			name:  "Attest succeeds for ECC DevID",
+			name:  "Attest succeeds for ECC DevID with standard and custom subject attributes",
 			devID: devIDECC,
 			expectedAgentID: fmt.Sprintf("spiffe://example.org/spire/agent/tpm_devid/%v",
 				tpmdevid.Fingerprint(devIDECC.Certificate)),
@@ -573,6 +601,30 @@ func TestAttestSucceeds(t *testing.T) {
 				{
 					Type:  "tpm_devid",
 					Value: "subject:cn:devid-leaf",
+				},
+				{
+					Type:  "tpm_devid",
+					Value: "subject:oid:2.5.4.3:devid-leaf",
+				},
+				{
+					Type:  "tpm_devid",
+					Value: "subject:oid:2.5.4.5:server-123",
+				},
+				{
+					Type:  "tpm_devid",
+					Value: "subject:oid:1.2.3.4:rack-a",
+				},
+				{
+					Type:  "tpm_devid",
+					Value: "subject:oid:1.2.3.4: Rack:B ",
+				},
+				{
+					Type:  "tpm_devid",
+					Value: "subject:oid:1.2.3.7:" + strings.Repeat("a", 235),
+				},
+				{
+					Type:  "tpm_devid",
+					Value: "subject:oid:1.2.3.8:" + strings.Repeat("é", 235),
 				},
 				{
 					Type:  "tpm_devid",
@@ -600,6 +652,10 @@ func TestAttestSucceeds(t *testing.T) {
 				},
 				{
 					Type:  "tpm_devid",
+					Value: "subject:oid:2.5.4.3:devid-leaf",
+				},
+				{
+					Type:  "tpm_devid",
 					Value: "issuer:cn:root",
 				},
 				{
@@ -611,7 +667,6 @@ func TestAttestSucceeds(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			// Create a TPM session to generate payload and challenge response data
 			session, err := tpmutil.NewSession(&tpmutil.SessionConfig{

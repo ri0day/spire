@@ -82,6 +82,7 @@ func TestConfigure(t *testing.T) {
 
 	for _, tt := range []struct {
 		name            string
+		trustDomain     string
 		envs            map[string]string
 		accessKeyID     string
 		secretAccessKey string
@@ -94,6 +95,7 @@ func TestConfigure(t *testing.T) {
 	}{
 		{
 			name:            "access key and secret from config",
+			trustDomain:     "example.org",
 			envs:            envs,
 			accessKeyID:     "ACCESS_KEY",
 			secretAccessKey: "ID",
@@ -105,9 +107,10 @@ func TestConfigure(t *testing.T) {
 			},
 		},
 		{
-			name:   "access key and secret from env vars",
-			envs:   envs,
-			region: "r1",
+			name:        "access key and secret from env vars",
+			trustDomain: "example.org",
+			envs:        envs,
+			region:      "r1",
 			expectConfig: &Configuration{
 				AccessKeyID:     "foh",
 				SecretAccessKey: "bar",
@@ -116,12 +119,14 @@ func TestConfigure(t *testing.T) {
 		},
 		{
 			name:            "no region provided",
+			trustDomain:     "example.org",
 			envs:            envs,
 			expectCode:      codes.InvalidArgument,
 			expectMsgPrefix: "region is required",
 		},
 		{
 			name:            "new client fails",
+			trustDomain:     "example.org",
 			envs:            envs,
 			region:          "r1",
 			expectClientErr: errors.New("oh no"),
@@ -130,6 +135,7 @@ func TestConfigure(t *testing.T) {
 		},
 		{
 			name:            "malformed configuration",
+			trustDomain:     "example.org",
 			envs:            envs,
 			region:          "r1",
 			customConfig:    "{ not a config }",
@@ -142,6 +148,9 @@ func TestConfigure(t *testing.T) {
 			options := []plugintest.Option{
 				plugintest.CaptureConfigureError(&err),
 			}
+			options = append(options, plugintest.CoreConfig(catalog.CoreConfig{
+				TrustDomain: spiffeid.RequireTrustDomainFromString(tt.trustDomain),
+			}))
 
 			if tt.customConfig != "" {
 				options = append(options, plugintest.Configure(tt.customConfig))
@@ -176,7 +185,7 @@ func TestConfigure(t *testing.T) {
 
 			plugintest.Load(t, builtin(p), nil, options...)
 			spiretest.RequireGRPCStatusHasPrefix(t, err, tt.expectCode, tt.expectMsgPrefix)
-			// Expect no client unsuccess calls
+			// Expect no client unsuccessful calls
 			switch tt.expectCode {
 			case codes.OK:
 				require.NotNil(t, p.smClient)
@@ -254,6 +263,82 @@ func TestPutX509SVID(t *testing.T) {
 					Bundle:      x509BundlePem,
 					FederatedBundles: map[string]string{
 						"federated1": x509FederatedBundlePem,
+					},
+				}
+				secretBinary, err := json.Marshal(secret)
+				assert.NoError(t, err)
+
+				return &secretsmanager.PutSecretValueInput{
+					SecretId:     aws.String("secret1-arn"),
+					SecretBinary: secretBinary,
+				}
+			},
+			smConfig: &smConfig{},
+		},
+		{
+			name: "Put SVID with multiple roots in the federated bundle",
+			req: &svidstore.X509SVID{
+				SVID: &svidstore.SVID{
+					SPIFFEID:   spiffeid.RequireFromString("spiffe://example.org/lambda"),
+					CertChain:  []*x509.Certificate{x509Cert},
+					PrivateKey: x509Key,
+					Bundle:     []*x509.Certificate{x509Bundle},
+					ExpiresAt:  expiresAt,
+				},
+				Metadata: []string{"arn:secret1"},
+				FederatedBundles: map[string][]*x509.Certificate{
+					"federated1": {federatedBundle, x509Bundle},
+				},
+			},
+			expectDescribeInput: &secretsmanager.DescribeSecretInput{
+				SecretId: aws.String("secret1"),
+			},
+			expectPutSecretInput: func(t *testing.T) *secretsmanager.PutSecretValueInput {
+				secret := &svidstore.Data{
+					SPIFFEID:    "spiffe://example.org/lambda",
+					X509SVID:    x509CertPem,
+					X509SVIDKey: x509KeyPem,
+					Bundle:      x509BundlePem,
+					FederatedBundles: map[string]string{
+						"federated1": x509FederatedBundlePem + x509BundlePem,
+					},
+				}
+				secretBinary, err := json.Marshal(secret)
+				assert.NoError(t, err)
+
+				return &secretsmanager.PutSecretValueInput{
+					SecretId:     aws.String("secret1-arn"),
+					SecretBinary: secretBinary,
+				}
+			},
+			smConfig: &smConfig{},
+		},
+		{
+			name: "Put SVID with an empty federated bundle",
+			req: &svidstore.X509SVID{
+				SVID: &svidstore.SVID{
+					SPIFFEID:   spiffeid.RequireFromString("spiffe://example.org/lambda"),
+					CertChain:  []*x509.Certificate{x509Cert},
+					PrivateKey: x509Key,
+					Bundle:     []*x509.Certificate{x509Bundle},
+					ExpiresAt:  expiresAt,
+				},
+				Metadata: []string{"arn:secret1"},
+				FederatedBundles: map[string][]*x509.Certificate{
+					"federated1": {},
+				},
+			},
+			expectDescribeInput: &secretsmanager.DescribeSecretInput{
+				SecretId: aws.String("secret1"),
+			},
+			expectPutSecretInput: func(t *testing.T) *secretsmanager.PutSecretValueInput {
+				secret := &svidstore.Data{
+					SPIFFEID:    "spiffe://example.org/lambda",
+					X509SVID:    x509CertPem,
+					X509SVIDKey: x509KeyPem,
+					Bundle:      x509BundlePem,
+					FederatedBundles: map[string]string{
+						"federated1": "",
 					},
 				}
 				secretBinary, err := json.Marshal(secret)
@@ -349,7 +434,7 @@ func TestPutX509SVID(t *testing.T) {
 			expectMsg:  "svidstore(aws_secretsmanager): failed to parse request: failed to parse CertChain: x509: malformed certificate",
 		},
 		{
-			name:       "unnexpected aws error when describe secret",
+			name:       "unexpected aws error when describe secret",
 			req:        successReq,
 			expectCode: codes.Internal,
 			expectMsg:  "svidstore(aws_secretsmanager): failed to describe secret: InvalidParameterException: failed to describe secret",
@@ -537,7 +622,7 @@ func TestPutX509SVID(t *testing.T) {
 			require.Equal(t, putSecretInput, sm.putSecretInput)
 
 			require.Equal(t, tt.expectDeleteSecretInput, sm.deleteSecretInput)
-			require.Equal(t, tt.expectDescribeInput, sm.drescribeSecretInput)
+			require.Equal(t, tt.expectDescribeInput, sm.describeSecretInput)
 			require.Equal(t, tt.expectRestoreSecretInput, sm.restoreSecretInput)
 		})
 	}
@@ -665,7 +750,7 @@ func TestDeleteX509SVID(t *testing.T) {
 			require.NoError(t, err)
 
 			require.Equal(t, tt.expectDeleteSecretInput, sm.deleteSecretInput)
-			require.Equal(t, tt.expectDescribeInput, sm.drescribeSecretInput)
+			require.Equal(t, tt.expectDescribeInput, sm.describeSecretInput)
 		})
 	}
 }
@@ -685,12 +770,12 @@ type smConfig struct {
 type fakeSecretsManagerClient struct {
 	t testing.TB
 
-	drescribeSecretInput *secretsmanager.DescribeSecretInput
-	createSecretInput    *secretsmanager.CreateSecretInput
-	putSecretInput       *secretsmanager.PutSecretValueInput
-	deleteSecretInput    *secretsmanager.DeleteSecretInput
-	restoreSecretInput   *secretsmanager.RestoreSecretInput
-	c                    *smConfig
+	describeSecretInput *secretsmanager.DescribeSecretInput
+	createSecretInput   *secretsmanager.CreateSecretInput
+	putSecretInput      *secretsmanager.PutSecretValueInput
+	deleteSecretInput   *secretsmanager.DeleteSecretInput
+	restoreSecretInput  *secretsmanager.RestoreSecretInput
+	c                   *smConfig
 }
 
 func (sm *fakeSecretsManagerClient) createTestClient(_ context.Context, _, _, region string) (SecretsManagerClient, error) {
@@ -720,7 +805,7 @@ func (sm *fakeSecretsManagerClient) DescribeSecret(_ context.Context, input *sec
 		resp.DeletedDate = aws.Time(time.Now())
 	}
 
-	sm.drescribeSecretInput = input
+	sm.describeSecretInput = input
 	return resp, nil
 }
 

@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"crypto/tls"
+
 	"github.com/hashicorp/hcl"
 	"github.com/hashicorp/hcl/hcl/ast"
 	"github.com/sirupsen/logrus"
@@ -16,6 +18,8 @@ import (
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/spire/pkg/common/catalog"
 	"github.com/spiffe/spire/pkg/common/log"
+	"github.com/spiffe/spire/pkg/common/telemetry"
+	"github.com/spiffe/spire/pkg/common/tlspolicy"
 	"github.com/spiffe/spire/pkg/server"
 	bundleClient "github.com/spiffe/spire/pkg/server/bundle/client"
 	"github.com/spiffe/spire/pkg/server/credtemplate"
@@ -64,6 +68,9 @@ func TestParseConfigGood(t *testing.T) {
 	_, ok := trustDomainConfig.EndpointProfile.(bundleClient.HTTPSWebProfile)
 	assert.True(t, ok)
 	assert.True(t, c.Server.AuditLogEnabled)
+	assert.True(t, c.Server.AuditLogExcludeAgentSync)
+	assert.Equal(t, []string{"10.0.0.0/8", "172.16.0.0/12"}, c.Server.ProxyProtocolTrustedCIDRs)
+	assert.True(t, c.Server.Experimental.RequirePQKEM)
 	testParseConfigGoodOS(t, c)
 
 	// Parse/reprint cycle trims outer whitespace
@@ -72,28 +79,28 @@ func TestParseConfigGood(t *testing.T) {
 	// Check for plugins configurations
 	expectedPluginConfigs := catalog.PluginConfigs{
 		{
-			Type:     "plugin_type_server",
-			Name:     "plugin_name_server",
-			Path:     "./pluginServerCmd",
-			Checksum: "pluginServerChecksum",
-			Data:     data,
-			Disabled: false,
+			Type:       "plugin_type_server",
+			Name:       "plugin_name_server",
+			Path:       "./pluginServerCmd",
+			Checksum:   "pluginServerChecksum",
+			DataSource: catalog.FixedData(data),
+			Disabled:   false,
 		},
 		{
-			Type:     "plugin_type_server",
-			Name:     "plugin_disabled",
-			Path:     "./pluginServerCmd",
-			Checksum: "pluginServerChecksum",
-			Data:     data,
-			Disabled: true,
+			Type:       "plugin_type_server",
+			Name:       "plugin_disabled",
+			Path:       "./pluginServerCmd",
+			Checksum:   "pluginServerChecksum",
+			DataSource: catalog.FixedData(data),
+			Disabled:   true,
 		},
 		{
-			Type:     "plugin_type_server",
-			Name:     "plugin_enabled",
-			Path:     "./pluginServerCmd",
-			Checksum: "pluginServerChecksum",
-			Data:     data,
-			Disabled: false,
+			Type:       "plugin_type_server",
+			Name:       "plugin_enabled",
+			Path:       "./pluginServerCmd",
+			Checksum:   "pluginServerChecksum",
+			DataSource: catalog.FileData("plugin.conf"),
+			Disabled:   false,
 		},
 	}
 
@@ -243,6 +250,16 @@ func TestMergeInput(t *testing.T) {
 			},
 		},
 		{
+			msg: "disable_jwt_svids should be configurable by file",
+			fileInput: func(c *Config) {
+				c.Server.DisableJWTSVIDs = true
+			},
+			cliFlags: []string{},
+			test: func(t *testing.T, c *Config) {
+				require.Equal(t, true, c.Server.DisableJWTSVIDs)
+			},
+		},
+		{
 			msg: "jwt_issuer should be configurable by file",
 			fileInput: func(c *Config) {
 				c.Server.JWTIssuer = "ISSUER"
@@ -250,6 +267,26 @@ func TestMergeInput(t *testing.T) {
 			cliFlags: []string{},
 			test: func(t *testing.T, c *Config) {
 				require.Equal(t, "ISSUER", c.Server.JWTIssuer)
+			},
+		},
+		{
+			msg: "wit_issuer should be configurable by file",
+			fileInput: func(c *Config) {
+				c.Server.Experimental.WITIssuer = "WIT_ISSUER"
+			},
+			cliFlags: []string{},
+			test: func(t *testing.T, c *Config) {
+				require.Equal(t, "WIT_ISSUER", c.Server.Experimental.WITIssuer)
+			},
+		},
+		{
+			msg: "default_wit_svid_ttl should be configurable by file",
+			fileInput: func(c *Config) {
+				c.Server.Experimental.DefaultWITSVIDTTL = "4h"
+			},
+			cliFlags: []string{},
+			test: func(t *testing.T, c *Config) {
+				require.Equal(t, "4h", c.Server.Experimental.DefaultWITSVIDTTL)
 			},
 		},
 		{
@@ -455,12 +492,30 @@ func TestMergeInput(t *testing.T) {
 				require.True(t, c.Server.AuditLogEnabled)
 			},
 		},
+		{
+			msg: "proxy_protocol_trusted_cidrs should be configurable by file",
+			fileInput: func(c *Config) {
+				c.Server.ProxyProtocolTrustedCIDRs = []string{"10.0.0.0/8"}
+			},
+			cliFlags: []string{},
+			test: func(t *testing.T, c *Config) {
+				require.Equal(t, []string{"10.0.0.0/8"}, c.Server.ProxyProtocolTrustedCIDRs)
+			},
+		},
+		{
+			msg: "require_pq_kem should be configurable by file",
+			fileInput: func(c *Config) {
+				c.Server.Experimental.RequirePQKEM = true
+			},
+			cliFlags: []string{},
+			test: func(t *testing.T, c *Config) {
+				require.True(t, c.Server.Experimental.RequirePQKEM)
+			},
+		},
 	}
 	cases = append(cases, mergeInputCasesOS(t)...)
 
 	for _, testCase := range cases {
-		testCase := testCase
-
 		fileInput := &Config{Server: &serverConfig{}}
 
 		testCase.fileInput(fileInput)
@@ -494,6 +549,49 @@ func TestNewServerConfig(t *testing.T) {
 
 	cases := []newServerConfigCase{
 		{
+			msg: "incompatible TTL includes lifetime alert fields",
+			input: func(c *Config) {
+				c.Server.CATTL = "1h"
+				c.Server.DefaultX509SVIDTTL = "20m"
+			},
+			logOptions: assertLogsContainEntries([]spiretest.LogEntry{
+				{
+					Level:   logrus.WarnLevel,
+					Message: "default_x509_svid_ttl is too high for the configured ca_ttl value. SVIDs with shorter lifetimes may be issued. Please set default_x509_svid_ttl to 10m or less, or the ca_ttl to 2h or more, to guarantee the full default_x509_svid_ttl lifetime when CA rotations are scheduled.",
+					Data: logrus.Fields{
+						telemetry.Alert:        "true",
+						telemetry.AlertType:    telemetry.ShortenedLifetimeAlertType,
+						telemetry.TTLName:      "default_x509_svid_ttl",
+						telemetry.RequestedTTL: "1200",
+						telemetry.MaxTTL:       "600",
+						telemetry.CATTL:        "3600",
+					},
+				},
+			}),
+			test: func(t *testing.T, c *server.Config) {
+				require.Equal(t, time.Hour, c.CATTL)
+			},
+		},
+		{
+			msg: "prune_attested_nodes_batch_size should be correctly parsed",
+			input: func(c *Config) {
+				c.Server.PruneAttestedNodesExpiredFor = "1h"
+				c.Server.PruneAttestedNodesBatchSize = 5000
+			},
+			test: func(t *testing.T, c *server.Config) {
+				require.Equal(t, 5000, c.PruneAttestedNodesBatchSize)
+			},
+		},
+		{
+			msg: "prune_attested_nodes_batch_size is left unset for the datastore to default",
+			input: func(c *Config) {
+				c.Server.PruneAttestedNodesExpiredFor = "1h"
+			},
+			test: func(t *testing.T, c *server.Config) {
+				require.Equal(t, 0, c.PruneAttestedNodesBatchSize)
+			},
+		},
+		{
 			msg: "bind_address and bind_port should be correctly parsed",
 			input: func(c *Config) {
 				c.Server.BindAddress = "192.168.1.1"
@@ -501,6 +599,28 @@ func TestNewServerConfig(t *testing.T) {
 			},
 			test: func(t *testing.T, c *server.Config) {
 				require.Equal(t, "192.168.1.1", c.BindAddress.IP.String())
+				require.Equal(t, 1337, c.BindAddress.Port)
+			},
+		},
+		{
+			msg: "IPv6 bind_address in square brackets and bind_port should be correctly parsed",
+			input: func(c *Config) {
+				c.Server.BindAddress = "[2001:101::]"
+				c.Server.BindPort = 1337
+			},
+			test: func(t *testing.T, c *server.Config) {
+				require.Equal(t, "2001:101::", c.BindAddress.IP.String())
+				require.Equal(t, 1337, c.BindAddress.Port)
+			},
+		},
+		{
+			msg: "IPv6 bind_address without square brackets and bind_port should be correctly parsed",
+			input: func(c *Config) {
+				c.Server.BindAddress = "2001:101::"
+				c.Server.BindPort = 1337
+			},
+			test: func(t *testing.T, c *server.Config) {
+				require.Equal(t, "2001:101::", c.BindAddress.IP.String())
 				require.Equal(t, 1337, c.BindAddress.Port)
 			},
 		},
@@ -564,12 +684,47 @@ func TestNewServerConfig(t *testing.T) {
 			},
 		},
 		{
+			msg: "disable_jwt_svids is correctly configured",
+			input: func(c *Config) {
+				c.Server.DisableJWTSVIDs = true
+			},
+			test: func(t *testing.T, c *server.Config) {
+				require.Equal(t, true, c.DisableJWTSVIDs)
+			},
+		},
+		{
 			msg: "jwt_issuer is correctly configured",
 			input: func(c *Config) {
 				c.Server.JWTIssuer = "ISSUER"
 			},
 			test: func(t *testing.T, c *server.Config) {
 				require.Equal(t, "ISSUER", c.JWTIssuer)
+			},
+		},
+		{
+			msg: "wit_issuer is correctly configured",
+			input: func(c *Config) {
+				c.Server.Experimental.WITIssuer = "WIT_ISSUER"
+			},
+			test: func(t *testing.T, c *server.Config) {
+				require.Equal(t, "WIT_ISSUER", c.WITIssuer)
+			},
+		},
+		{
+			msg: "allow_nonconforming_agent_ids defaults to false",
+			input: func(c *Config) {
+			},
+			test: func(t *testing.T, c *server.Config) {
+				require.False(t, c.Experimental.AllowNonconformingAgentIDs)
+			},
+		},
+		{
+			msg: "allow_nonconforming_agent_ids is correctly configured",
+			input: func(c *Config) {
+				c.Server.Experimental.AllowNonconformingAgentIDs = true
+			},
+			test: func(t *testing.T, c *server.Config) {
+				require.True(t, c.Experimental.AllowNonconformingAgentIDs)
 			},
 		},
 		{
@@ -621,6 +776,45 @@ func TestNewServerConfig(t *testing.T) {
 			},
 		},
 		{
+			// not an OS specific case: unlike the signal based reopen, in
+			// process rotation works on every platform
+			msg: "log_file_rotation configures a self rotating log file",
+			input: func(c *Config) {
+				c.Server.LogFile = filepath.Join(spiretest.TempDir(t), "server.log")
+				c.Server.LogFileRotation = &log.RotationConfig{MaxSizeMB: new(10), MaxFiles: new(3)}
+			},
+			test: func(t *testing.T, c *server.Config) {
+				require.NotNil(t, c.Log)
+				require.NotNil(t, c.LogReopener)
+
+				l := c.Log.(*log.Logger)
+				// the temp dir cannot be removed on Windows while the log
+				// file is still open
+				t.Cleanup(func() { _ = l.Close() })
+
+				rotatable, ok := l.Out.(*log.RotatableFile)
+				require.True(t, ok, "expected a RotatableFile, got %T", l.Out)
+				require.FileExists(t, rotatable.Name())
+			},
+		},
+		{
+			msg: "log_file without log_file_rotation stays reopenable",
+			input: func(c *Config) {
+				c.Server.LogFile = filepath.Join(spiretest.TempDir(t), "server.log")
+			},
+			test: func(t *testing.T, c *server.Config) {
+				require.NotNil(t, c.Log)
+				require.NotNil(t, c.LogReopener)
+
+				l := c.Log.(*log.Logger)
+				// the temp dir cannot be removed on Windows while the log
+				// file is still open
+				t.Cleanup(func() { _ = l.Close() })
+
+				require.IsType(t, &log.ReopenableFile{}, l.Out)
+			},
+		},
+		{
 			msg: "bundle endpoint is parsed and configured correctly",
 			input: func(c *Config) {
 				c.Server.Federation = &federationConfig{
@@ -631,6 +825,16 @@ func TestNewServerConfig(t *testing.T) {
 					},
 				}
 			},
+			logOptions: assertLogsContainEntries([]spiretest.LogEntry{
+				{
+					Level:   logrus.WarnLevel,
+					Message: "Bundle endpoint is configured but has no profile set, using https_spiffe as default; please configure a profile explicitly. This will be fatal in a future release.",
+					Data: logrus.Fields{
+						telemetry.Alert:     "true",
+						telemetry.AlertType: telemetry.DeprecatedConfigAlertType,
+					},
+				},
+			}),
 			test: func(t *testing.T, c *server.Config) {
 				require.Equal(t, "192.168.1.1", c.Federation.BundleEndpoint.Address.IP.String())
 				require.Equal(t, 1337, c.Federation.BundleEndpoint.Address.Port)
@@ -648,6 +852,27 @@ func TestNewServerConfig(t *testing.T) {
 							Email:        "mail@example.org",
 							ToSAccepted:  true,
 						},
+					},
+				}
+			},
+			logOptions: func(t *testing.T) []log.Option {
+				return []log.Option{
+					func(logger *log.Logger) error {
+						logger.SetOutput(io.Discard)
+						hook := test.NewLocal(logger.Logger)
+						t.Cleanup(func() {
+							spiretest.AssertLogsContainEntries(t, hook.AllEntries(), []spiretest.LogEntry{
+								{
+									Level:   logrus.WarnLevel,
+									Message: "ACME configuration within the bundle_endpoint is deprecated. Please use ACME configuration as part of the https_web profile instead.",
+									Data: logrus.Fields{
+										telemetry.Alert:     "true",
+										telemetry.AlertType: telemetry.DeprecatedConfigAlertType,
+									},
+								},
+							})
+						})
+						return nil
 					},
 				}
 			},
@@ -680,7 +905,7 @@ func TestNewServerConfig(t *testing.T) {
 			msg: "bundle endpoint has web profile",
 			input: func(c *Config) {
 				c.Server.Federation = &federationConfig{
-					BundleEndpoint: bundleEndpointProfileHTTPSWebTest(t),
+					BundleEndpoint: bundleEndpointProfileHTTPSWebACMETest(t),
 				}
 			},
 			test: func(t *testing.T, c *server.Config) {
@@ -694,6 +919,23 @@ func TestNewServerConfig(t *testing.T) {
 					CacheDir:   "bundle-acme",
 				}
 				require.Equal(t, expectACME, c.Federation.BundleEndpoint.ACME)
+				require.Nil(t, c.Federation.BundleEndpoint.DiskCertManager)
+			},
+		},
+		{
+			msg: "bundle endpoint has web profile with certs on disk",
+			input: func(c *Config) {
+				c.Server.Federation = &federationConfig{
+					BundleEndpoint: bundleEndpointProfileHTTPSWebServingCertFileTest(t),
+				}
+			},
+			test: func(t *testing.T, c *server.Config) {
+				require.Equal(t, "0.0.0.0", c.Federation.BundleEndpoint.Address.IP.String())
+				require.Equal(t, 8443, c.Federation.BundleEndpoint.Address.Port)
+				require.Equal(t, 10*time.Minute, c.Federation.BundleEndpoint.RefreshHint)
+
+				require.Nil(t, c.Federation.BundleEndpoint.ACME)
+				require.NotNil(t, c.Federation.BundleEndpoint.DiskCertManager)
 			},
 		},
 		{
@@ -774,6 +1016,88 @@ func TestNewServerConfig(t *testing.T) {
 			},
 		},
 		{
+			msg: "federates_with bootstrap_bundle_path is parsed for https_spiffe",
+			input: func(c *Config) {
+				cfg := httpsSPIFFEConfigTest(t)
+				cfg.BootstrapBundlePath = "/etc/spire/domain1.pem"
+				c.Server.Federation = &federationConfig{
+					FederatesWith: map[string]federatesWithConfig{
+						"domain1.test": cfg,
+					},
+				}
+			},
+			test: func(t *testing.T, c *server.Config) {
+				got := c.Federation.FederatesWith[spiffeid.RequireTrustDomainFromString("domain1.test")]
+				require.Equal(t, "/etc/spire/domain1.pem", got.BootstrapBundlePath)
+				require.Equal(t, bundleClient.BootstrapBundleFormatPEM, got.BootstrapBundleFormat)
+			},
+		},
+		{
+			msg: "federates_with bootstrap_bundle_path is rejected for https_web",
+			input: func(c *Config) {
+				cfg := webPKIConfigTest(t)
+				cfg.BootstrapBundlePath = "/etc/spire/domain2.pem"
+				c.Server.Federation = &federationConfig{
+					FederatesWith: map[string]federatesWithConfig{
+						"domain2.test": cfg,
+					},
+				}
+			},
+			expectError: true,
+			test: func(t *testing.T, c *server.Config) {
+				require.Nil(t, c)
+			},
+		},
+		{
+			msg: "federates_with bootstrap_bundle_path is rejected for a non-self-serving endpoint",
+			input: func(c *Config) {
+				cfg := httpsSPIFFEConfigTest(t)
+				cfg.BootstrapBundlePath = "/etc/spire/domain1.pem"
+				c.Server.Federation = &federationConfig{
+					FederatesWith: map[string]federatesWithConfig{
+						"other.test": cfg,
+					},
+				}
+			},
+			expectError: true,
+			test: func(t *testing.T, c *server.Config) {
+				require.Nil(t, c)
+			},
+		},
+		{
+			msg: "federates_with bootstrap_bundle_format without path is rejected",
+			input: func(c *Config) {
+				cfg := httpsSPIFFEConfigTest(t)
+				cfg.BootstrapBundleFormat = bundleClient.BootstrapBundleFormatSPIFFE
+				c.Server.Federation = &federationConfig{
+					FederatesWith: map[string]federatesWithConfig{
+						"domain1.test": cfg,
+					},
+				}
+			},
+			expectError: true,
+			test: func(t *testing.T, c *server.Config) {
+				require.Nil(t, c)
+			},
+		},
+		{
+			msg: "federates_with bootstrap_bundle_format must be pem or spiffe",
+			input: func(c *Config) {
+				cfg := httpsSPIFFEConfigTest(t)
+				cfg.BootstrapBundlePath = "/etc/spire/domain1.pem"
+				cfg.BootstrapBundleFormat = "der"
+				c.Server.Federation = &federationConfig{
+					FederatesWith: map[string]federatesWithConfig{
+						"domain1.test": cfg,
+					},
+				}
+			},
+			expectError: true,
+			test: func(t *testing.T, c *server.Config) {
+				require.Nil(t, c)
+			},
+		},
+		{
 			msg: "default_x509_svid_ttl is correctly parsed",
 			input: func(c *Config) {
 				c.Server.DefaultX509SVIDTTL = "2m"
@@ -792,6 +1116,38 @@ func TestNewServerConfig(t *testing.T) {
 			},
 		},
 		{
+			msg: "default_wit_svid_ttl is correctly parsed",
+			input: func(c *Config) {
+				c.Server.Experimental.DefaultWITSVIDTTL = "4m"
+			},
+			test: func(t *testing.T, c *server.Config) {
+				require.Equal(t, 4*time.Minute, c.WITSVIDTTL)
+			},
+		},
+		{
+			msg:   "default_wit_svid_ttl defaults when unset",
+			input: func(c *Config) {},
+			test: func(t *testing.T, c *server.Config) {
+				require.Equal(t, credtemplate.DefaultWITSVIDTTL, c.WITSVIDTTL)
+			},
+		},
+		{
+			msg:   "WIT-SVIDs are disabled by default",
+			input: func(c *Config) {},
+			test: func(t *testing.T, c *server.Config) {
+				require.True(t, c.DisableWITSVIDs)
+			},
+		},
+		{
+			msg: "enable_wit_svids enables WIT-SVIDs",
+			input: func(c *Config) {
+				c.Server.Experimental.EnableWITSVIDs = true
+			},
+			test: func(t *testing.T, c *server.Config) {
+				require.False(t, c.DisableWITSVIDs)
+			},
+		},
+		{
 			msg:         "invalid default_x509_svid_ttl returns an error",
 			expectError: true,
 			input: func(c *Config) {
@@ -806,6 +1162,16 @@ func TestNewServerConfig(t *testing.T) {
 			expectError: true,
 			input: func(c *Config) {
 				c.Server.DefaultJWTSVIDTTL = "b"
+			},
+			test: func(t *testing.T, c *server.Config) {
+				require.Nil(t, c)
+			},
+		},
+		{
+			msg:         "invalid default_wit_svid_ttl returns an error",
+			expectError: true,
+			input: func(c *Config) {
+				c.Server.Experimental.DefaultWITSVIDTTL = "b"
 			},
 			test: func(t *testing.T, c *server.Config) {
 				require.Nil(t, c)
@@ -1059,6 +1425,25 @@ func TestNewServerConfig(t *testing.T) {
 			},
 		},
 		{
+			msg: "health_checks check_interval is correctly parsed",
+			input: func(c *Config) {
+				c.HealthChecks.RawCheckInterval = "30s"
+			},
+			test: func(t *testing.T, c *server.Config) {
+				require.Equal(t, 30*time.Second, c.HealthChecks.CheckInterval)
+			},
+		},
+		{
+			msg:         "invalid health_checks check_interval returns an error",
+			expectError: true,
+			input: func(c *Config) {
+				c.HealthChecks.RawCheckInterval = "b"
+			},
+			test: func(t *testing.T, c *server.Config) {
+				require.Nil(t, c)
+			},
+		},
+		{
 			msg: "cache_reload_interval is correctly parsed",
 			input: func(c *Config) {
 				c.Server.Experimental.CacheReloadInterval = "1m"
@@ -1072,6 +1457,25 @@ func TestNewServerConfig(t *testing.T) {
 			expectError: true,
 			input: func(c *Config) {
 				c.Server.Experimental.CacheReloadInterval = "b"
+			},
+			test: func(t *testing.T, c *server.Config) {
+				require.Nil(t, c)
+			},
+		},
+		{
+			msg: "full_cache_reload_interval is correctly parsed",
+			input: func(c *Config) {
+				c.Server.Experimental.FullCacheReloadInterval = "1h"
+			},
+			test: func(t *testing.T, c *server.Config) {
+				require.Equal(t, time.Hour, c.FullCacheReloadInterval)
+			},
+		},
+		{
+			msg:         "invalid full_cache_reload_interval returns an error",
+			expectError: true,
+			input: func(c *Config) {
+				c.Server.Experimental.FullCacheReloadInterval = "c"
 			},
 			test: func(t *testing.T, c *server.Config) {
 				require.Nil(t, c)
@@ -1097,6 +1501,61 @@ func TestNewServerConfig(t *testing.T) {
 			},
 		},
 		{
+			msg: "sql_transaction_timeout is correctly parsed",
+			input: func(c *Config) {
+				c.Server.Experimental.SQLTransactionTimeout = "1m"
+			},
+			logOptions: func(t *testing.T) []log.Option {
+				return []log.Option{
+					func(logger *log.Logger) error {
+						logger.SetOutput(io.Discard)
+						hook := test.NewLocal(logger.Logger)
+						t.Cleanup(func() {
+							spiretest.AssertLogsContainEntries(t, hook.AllEntries(), []spiretest.LogEntry{
+								{
+									Level:   logrus.WarnLevel,
+									Message: "experimental.sql_transaction_timeout is deprecated, use experimental.event_timeout instead",
+									Data: logrus.Fields{
+										telemetry.Alert:     "true",
+										telemetry.AlertType: telemetry.DeprecatedConfigAlertType,
+									},
+								},
+							})
+						})
+						return nil
+					},
+				}
+			},
+			test: func(t *testing.T, c *server.Config) {
+				require.Equal(t, time.Minute, c.EventTimeout)
+			},
+		},
+		{
+			msg: "event_timeout is correctly parsed",
+			input: func(c *Config) {
+				c.Server.Experimental.EventTimeout = "1m"
+			},
+			test: func(t *testing.T, c *server.Config) {
+				require.Equal(t, time.Minute, c.EventTimeout)
+			},
+		},
+		{
+			msg: "agent sync audit filtering is enabled",
+			input: func(c *Config) {
+				c.Server.AuditLogExcludeAgentSync = true
+			},
+			test: func(t *testing.T, c *server.Config) {
+				require.True(t, c.AuditLogExcludeAgentSync)
+			},
+		},
+		{
+			msg:   "agent sync audit filtering is disabled by default",
+			input: func(*Config) {},
+			test: func(t *testing.T, c *server.Config) {
+				require.False(t, c.AuditLogExcludeAgentSync)
+			},
+		},
+		{
 			msg: "audit_log_enabled is enabled",
 			input: func(c *Config) {
 				c.Server.AuditLogEnabled = true
@@ -1112,6 +1571,24 @@ func TestNewServerConfig(t *testing.T) {
 			},
 			test: func(t *testing.T, c *server.Config) {
 				require.False(t, c.AuditLogEnabled)
+			},
+		},
+		{
+			msg: "proxy_protocol_trusted_cidrs is set",
+			input: func(c *Config) {
+				c.Server.ProxyProtocolTrustedCIDRs = []string{"10.0.0.0/8", "172.16.0.0/12"}
+			},
+			test: func(t *testing.T, c *server.Config) {
+				require.Equal(t, []string{"10.0.0.0/8", "172.16.0.0/12"}, c.ProxyProtocolTrustedCIDRs)
+			},
+		},
+		{
+			msg: "proxy_protocol_trusted_cidrs is empty",
+			input: func(c *Config) {
+				c.Server.ProxyProtocolTrustedCIDRs = nil
+			},
+			test: func(t *testing.T, c *server.Config) {
+				require.Empty(t, c.ProxyProtocolTrustedCIDRs)
 			},
 		},
 		{
@@ -1143,12 +1620,52 @@ func TestNewServerConfig(t *testing.T) {
 				}, c.AdminIDs)
 			},
 		},
+		{
+			msg:   "require PQ KEM is disabled (default)",
+			input: func(c *Config) {},
+			test: func(t *testing.T, c *server.Config) {
+				require.Equal(t, false, c.TLSPolicy.RequirePQKEM)
+			},
+		},
+		{
+			msg: "require PQ KEM is enabled",
+			input: func(c *Config) {
+				c.Server.Experimental.RequirePQKEM = true
+			},
+			test: func(t *testing.T, c *server.Config) {
+				require.Equal(t, true, c.TLSPolicy.RequirePQKEM)
+			},
+		},
+		{
+			msg:   "TLS config is omitted by default",
+			input: func(c *Config) {},
+			test: func(t *testing.T, c *server.Config) {
+				require.Nil(t, c.TLSPolicy.TLSCfg)
+			},
+		},
+		{
+			msg: "TLS config is configured",
+			input: func(c *Config) {
+				c.Server.TLSConfig = &tlspolicy.TLSConfig{
+					MinTLSVersion:    "VersionTLS13",
+					CipherSuites:     []string{"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"},
+					CurvePreferences: []string{"X25519", "secp256r1"},
+				}
+			},
+			test: func(t *testing.T, c *server.Config) {
+				require.NotNil(t, c.TLSPolicy.TLSCfg)
+				require.Equal(t, uint16(tls.VersionTLS13), c.TLSPolicy.TLSCfg.MinTLSVersion)
+				require.Nil(t, c.TLSPolicy.TLSCfg.CipherSuites)
+				require.Equal(t, []tls.CurveID{
+					tls.X25519,
+					tls.CurveP256,
+				}, c.TLSPolicy.TLSCfg.CurvePreferences)
+			},
+		},
 	}
-	cases = append(cases, newServerConfigCasesOS()...)
+	cases = append(cases, newServerConfigCasesOS(t)...)
 
 	for _, testCase := range cases {
-		testCase := testCase
-
 		input := defaultValidConfig()
 
 		testCase.input(input)
@@ -1169,6 +1686,53 @@ func TestNewServerConfig(t *testing.T) {
 			testCase.test(t, sc)
 		})
 	}
+}
+
+func TestParseTLSConfigFromHCL(t *testing.T) {
+	const configString = `
+server {
+    bind_address = "0.0.0.0"
+    bind_port = "8081"
+    trust_domain = "example.org"
+    data_dir = "."
+    log_level = "INFO"
+    tls_config {
+        min_tls_version = "VersionTLS13"
+        cipher_suites = [
+            "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+            "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+        ]
+        curve_preferences = [
+            "X25519MLKEM768",
+            "X25519",
+            "secp256r1",
+        ]
+    }
+    experimental {
+        require_pq_kem = true
+    }
+}
+plugins {}
+`
+	c := &Config{}
+	require.NoError(t, hcl.Decode(c, configString))
+
+	require.NotNil(t, c.Server.TLSConfig)
+	require.Equal(t, "VersionTLS13", c.Server.TLSConfig.MinTLSVersion)
+	require.Equal(t, []string{
+		"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+		"TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+	}, c.Server.TLSConfig.CipherSuites)
+	require.Equal(t, []string{"X25519MLKEM768", "X25519", "secp256r1"}, c.Server.TLSConfig.CurvePreferences)
+	require.True(t, c.Server.Experimental.RequirePQKEM)
+
+	sc, err := NewServerConfig(c, nil, false)
+	require.NoError(t, err)
+	require.True(t, sc.TLSPolicy.RequirePQKEM)
+	require.NotNil(t, sc.TLSPolicy.TLSCfg)
+	require.Equal(t, uint16(tls.VersionTLS13), sc.TLSPolicy.TLSCfg.MinTLSVersion)
+	require.Nil(t, sc.TLSPolicy.TLSCfg.CipherSuites)
+	require.Equal(t, []tls.CurveID{tls.X25519MLKEM768, tls.X25519, tls.CurveP256}, sc.TLSPolicy.TLSCfg.CurvePreferences)
 }
 
 // defaultValidConfig returns the bare minimum config required to
@@ -1221,6 +1785,29 @@ func TestValidateConfig(t *testing.T) {
 			expectedErr: "plugins section must be configured",
 		},
 		{
+			name: "log_file_rotation requires log_file",
+			applyConf: func(c *Config) {
+				c.Server.LogFileRotation = &log.RotationConfig{MaxSizeMB: new(10)}
+			},
+			expectedErr: "log_file must be configured to use log_file_rotation",
+		},
+		{
+			name: "log_file_rotation max_size_mb must not be negative",
+			applyConf: func(c *Config) {
+				c.Server.LogFile = "foo"
+				c.Server.LogFileRotation = &log.RotationConfig{MaxSizeMB: new(-1)}
+			},
+			expectedErr: "invalid log_file_rotation configuration: max_size_mb (-1) must not be negative",
+		},
+		{
+			name: "log_file_rotation max_files must not be negative",
+			applyConf: func(c *Config) {
+				c.Server.LogFile = "foo"
+				c.Server.LogFileRotation = &log.RotationConfig{MaxFiles: new(-1)}
+			},
+			expectedErr: "invalid log_file_rotation configuration: max_files (-1) must not be negative",
+		},
+		{
 			name: "if ACME is used, federation.bundle_endpoint.acme.domain_name must be configured",
 			applyConf: func(c *Config) {
 				c.Server.Federation = &federationConfig{
@@ -1268,10 +1855,17 @@ func TestValidateConfig(t *testing.T) {
 			},
 			expectedErr: `federation.federates_with["domain.test"].bundle_endpoint_url must use the HTTPS protocol; URL found: "http://example.org/test"`,
 		},
+		{
+			name: "can't set both sql_transaction_timeout and event_timeout",
+			applyConf: func(c *Config) {
+				c.Server.Experimental.EventTimeout = "1h"
+				c.Server.Experimental.SQLTransactionTimeout = "1h"
+			},
+			expectedErr: "both experimental sql_transaction_timeout and event_timeout set, only set event_timeout",
+		},
 	}
 
 	for _, testCase := range testCases {
-		testCase := testCase
 		t.Run(testCase.name, func(t *testing.T) {
 			conf := defaultValidConfig()
 			testCase.applyConf(conf)
@@ -1315,6 +1909,16 @@ func TestWarnOnUnknownConfig(t *testing.T) {
 			expectedLogEntries: []logEntry{
 				{
 					section: "server",
+					keys:    "unknown_option1,unknown_option2",
+				},
+			},
+		},
+		{
+			msg:      "in nested log_file_rotation block",
+			confFile: "server_bad_nested_log_file_rotation_block.conf",
+			expectedLogEntries: []logEntry{
+				{
+					section: "log_file_rotation",
 					keys:    "unknown_option1,unknown_option2",
 				},
 			},
@@ -1484,8 +2088,6 @@ func TestWarnOnUnknownConfig(t *testing.T) {
 	}
 
 	for _, testCase := range cases {
-		testCase := testCase
-
 		c, err := ParseFile(filepath.Join(testFileDir, testCase.confFile), false)
 		require.NoError(t, err)
 
@@ -1676,7 +2278,7 @@ func TestHasCompatibleTTLs(t *testing.T) {
 			msg:                      "default_jwt_svid_ttl is small enough for the configured CA TTL but larger than the max",
 			caTTL:                    time.Hour * 24 * 7 * 4 * 6, // Six months
 			x509SvidTTL:              0,
-			jwtSvidTTL:               time.Hour * 24 * 7 * 2, // Two weeks,,
+			jwtSvidTTL:               time.Hour * 24 * 7 * 2, // Two weeks
 			hasCompatibleSvidTTL:     true,
 			hasCompatibleX509SvidTTL: true,
 			hasCompatibleJwtSvidTTL:  false,
@@ -1693,7 +2295,6 @@ func TestHasCompatibleTTLs(t *testing.T) {
 	}
 
 	for _, testCase := range cases {
-		testCase := testCase
 		if testCase.caTTL == 0 {
 			testCase.caTTL = credtemplate.DefaultX509CATTL
 		}
@@ -1899,7 +2500,24 @@ func bundleEndpointProfileACMEAndProfileTest(t *testing.T) *bundleEndpointConfig
 	return config
 }
 
-func bundleEndpointProfileHTTPSWebTest(t *testing.T) *bundleEndpointConfig {
+func bundleEndpointProfileHTTPSWebServingCertFileTest(t *testing.T) *bundleEndpointConfig {
+	configString := `address = "0.0.0.0"
+        port = 8443
+        refresh_hint = "10m"
+        profile "https_web" {
+        	serving_cert_file {
+        		cert_file_path = "../../../../test/fixture/certs/svid.pem"
+        		key_file_path = "../../../../test/fixture/certs/svid_key.pem"
+        		file_sync_interval = "5m"
+        	}
+        }`
+	config := new(bundleEndpointConfig)
+	require.NoError(t, hcl.Decode(config, configString))
+
+	return config
+}
+
+func bundleEndpointProfileHTTPSWebACMETest(t *testing.T) *bundleEndpointConfig {
 	configString := `address = "0.0.0.0"
         port = 8443
         refresh_hint = "10m"
@@ -1947,6 +2565,73 @@ func bundleEndpointProfileUnknownTest(t *testing.T) *bundleEndpointConfig {
 	require.NoError(t, hcl.Decode(config, configString))
 
 	return config
+}
+
+type unknownEndpointProfile struct{}
+
+func (unknownEndpointProfile) Name() string { return "unknown" }
+
+func TestValidateFederatesWithBootstrap(t *testing.T) {
+	td := spiffeid.RequireTrustDomainFromString("domain1.test")
+	spiffeCfg := &bundleClient.TrustDomainConfig{
+		EndpointURL: "https://192.168.1.1:1337",
+		EndpointProfile: bundleClient.HTTPSSPIFFEProfile{
+			EndpointSPIFFEID: spiffeid.RequireFromString("spiffe://domain1.test/bundle/endpoint"),
+		},
+	}
+
+	t.Run("ok", func(t *testing.T) {
+		cfg := *spiffeCfg
+		cfg.BootstrapBundlePath = "/etc/spire/domain1.pem"
+		cfg.BootstrapBundleFormat = bundleClient.BootstrapBundleFormatPEM
+		require.NoError(t, validateFederatesWithBootstrap(td, &cfg))
+	})
+
+	t.Run("https_web", func(t *testing.T) {
+		cfg := &bundleClient.TrustDomainConfig{
+			EndpointURL:           "https://192.168.1.1:1337",
+			EndpointProfile:       bundleClient.HTTPSWebProfile{},
+			BootstrapBundlePath:   "/etc/spire/domain1.pem",
+			BootstrapBundleFormat: bundleClient.BootstrapBundleFormatPEM,
+		}
+		require.EqualError(t, validateFederatesWithBootstrap(td, cfg),
+			"bootstrap_bundle_path is only supported with the https_spiffe bundle endpoint profile")
+	})
+
+	t.Run("unknown profile", func(t *testing.T) {
+		cfg := &bundleClient.TrustDomainConfig{
+			EndpointURL:           "https://192.168.1.1:1337",
+			EndpointProfile:       unknownEndpointProfile{},
+			BootstrapBundlePath:   "/etc/spire/domain1.pem",
+			BootstrapBundleFormat: bundleClient.BootstrapBundleFormatPEM,
+		}
+		require.EqualError(t, validateFederatesWithBootstrap(td, cfg),
+			"bootstrap_bundle_path is only supported with the https_spiffe bundle endpoint profile")
+	})
+
+	t.Run("non-self-serving", func(t *testing.T) {
+		cfg := *spiffeCfg
+		cfg.BootstrapBundlePath = "/etc/spire/domain1.pem"
+		cfg.BootstrapBundleFormat = bundleClient.BootstrapBundleFormatPEM
+		other := spiffeid.RequireTrustDomainFromString("other.test")
+		require.EqualError(t, validateFederatesWithBootstrap(other, &cfg),
+			"bootstrap_bundle_path is only supported when the endpoint SPIFFE ID is in the federated trust domain")
+	})
+
+	t.Run("format without path", func(t *testing.T) {
+		cfg := *spiffeCfg
+		cfg.BootstrapBundleFormat = bundleClient.BootstrapBundleFormatSPIFFE
+		require.EqualError(t, validateFederatesWithBootstrap(td, &cfg),
+			"bootstrap_bundle_format is set but bootstrap_bundle_path is empty")
+	})
+
+	t.Run("bad format", func(t *testing.T) {
+		cfg := *spiffeCfg
+		cfg.BootstrapBundlePath = "/etc/spire/domain1.pem"
+		cfg.BootstrapBundleFormat = "der"
+		require.EqualError(t, validateFederatesWithBootstrap(td, &cfg),
+			`bootstrap_bundle_format must be "pem" or "spiffe"`)
+	})
 }
 
 func httpsSPIFFEConfigTest(t *testing.T) federatesWithConfig {

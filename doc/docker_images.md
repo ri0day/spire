@@ -30,7 +30,7 @@ $ docker run \
     --user 1000:1000 \
     -p 8081:8081 \
     -v /path/to/server/config:/etc/spire/server \
-    ghcr.io/spiffe/spire-server:v1.6.0 \
+    ghcr.io/spiffe/spire-server:1.6.1 \
     -config /etc/spire/server/server.conf
 ```
 
@@ -46,6 +46,12 @@ If you want to use configure SPIRE to use paths that are not used by the example
 1. Build your own custom container images based on the SPIRE release images with whatever customizations you may require.
 
 If you want to run SPIRE as a non-root user that is not uid `1000`, you will need to build your own custom container images that set up permissions correctly for your dedicated user.
+
+### Kubernetes environments
+
+In Kubernetes, SPIRE Agent is normally deployed as DaemonSet to run one Workload API server instance per host, and it is necessary to inject the Workload API socket into each pod.
+The [SPIFFE CSI Driver](https://github.com/spiffe/spiffe-csi) can be used to avoid the use of hostPath volumes in workload containers, but the use of a hostPath volume in the SPIRE Agent container is still needed.
+For that reason, the SPIRE Agent container image is built to run as root by default.
 
 ## Directories available in release images
 

@@ -1,10 +1,11 @@
 package catalog
 
 import (
+	"errors"
 	"io"
+	"slices"
 	"time"
 
-	"github.com/zeebo/errs"
 	"google.golang.org/grpc"
 )
 
@@ -12,11 +13,12 @@ type closerGroup []io.Closer
 
 func (cs closerGroup) Close() error {
 	// Close in reverse order.
-	var errs errs.Group
-	for i := len(cs) - 1; i >= 0; i-- {
-		errs.Add(cs[i].Close())
+	var errs error
+	for _, c := range slices.Backward(cs) {
+		errs = errors.Join(errs, c.Close())
 	}
-	return errs.Err()
+
+	return errs
 }
 
 type closerFunc func()

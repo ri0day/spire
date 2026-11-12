@@ -14,7 +14,6 @@ import (
 	"github.com/spiffe/spire-plugin-sdk/pluginsdk"
 	"github.com/spiffe/spire-plugin-sdk/private"
 	"github.com/spiffe/spire/pkg/common/log"
-	"github.com/zeebo/errs"
 	"google.golang.org/grpc"
 )
 
@@ -73,12 +72,10 @@ func loadExternal(ctx context.Context, config externalConfig) (*pluginImpl, erro
 
 	// Start the external plugin.
 	pluginClient := goplugin.NewClient(&goplugin.ClientConfig{
-		HandshakeConfig: goplugin.HandshakeConfig{
-			ProtocolVersion:  1,
-			MagicCookieKey:   config.Type,
-			MagicCookieValue: config.Type,
-		},
-		Cmd: cmd,
+		ProtocolVersion:  1,
+		MagicCookieKey:   config.Type,
+		MagicCookieValue: config.Type,
+		Cmd:              cmd,
 		// TODO: Enable AutoMTLS if it is fixed to work with brokering.
 		// See https://github.com/hashicorp/go-plugin/issues/109
 		AutoMTLS:         false,
@@ -154,30 +151,26 @@ func (p *hcClientPlugin) GRPCClient(ctx context.Context, b *goplugin.GRPCBroker,
 	// does not work yet anyway, so it is a moot point.
 	listener, err := b.Accept(private.HostServiceProviderID)
 	if err != nil {
-		return nil, errs.Wrap(err)
+		return nil, err
 	}
 
-	server := newHostServer(p.config.Name, p.config.HostServices)
+	server := newHostServer(p.config.Log, p.config.Name, p.config.HostServices)
 
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		if err := server.Serve(listener); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
 			p.config.Log.WithError(err).Error("Host services server failed")
 			c.Close()
 		}
-	}()
+	})
 
 	ctx, cancel := context.WithCancel(ctx)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		<-ctx.Done()
 		if !gracefulStopWithTimeout(server) {
 			p.config.Log.Warn("Forced timed-out host service server to stop")
 		}
-	}()
+	})
 
 	return &hcPlugin{
 		conn:    c,

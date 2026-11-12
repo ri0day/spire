@@ -12,6 +12,7 @@ import (
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	trustdomainv1 "github.com/spiffe/spire-api-sdk/proto/spire/api/server/trustdomain/v1"
 	"github.com/spiffe/spire-api-sdk/proto/spire/api/types"
+	commonapi "github.com/spiffe/spire/pkg/common/api"
 	"github.com/spiffe/spire/pkg/common/telemetry"
 	"github.com/spiffe/spire/pkg/server/api"
 	"github.com/spiffe/spire/pkg/server/api/middleware"
@@ -119,7 +120,6 @@ func TestGetFederationRelationship(t *testing.T) {
 			},
 		},
 		{
-
 			name:        "malformed trust domain",
 			trustDomain: "https://foot.test",
 			err:         "failed to parse trust domain: scheme is missing or invalid",
@@ -196,7 +196,6 @@ func TestGetFederationRelationship(t *testing.T) {
 			},
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			ds := newFakeDS(t)
 			test := setupServiceTest(t, ds)
@@ -408,7 +407,6 @@ func TestListFederationRelationships(t *testing.T) {
 			},
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			test.logHook.Reset()
 
@@ -552,7 +550,7 @@ func TestBatchCreateFederationRelationship(t *testing.T) {
 			},
 			expectResults: []*trustdomainv1.BatchCreateFederationRelationshipResponse_Result{
 				{
-					Status: api.OK(),
+					Status: commonapi.OK(),
 					FederationRelationship: &types.FederationRelationship{
 						TrustDomain:           "domain.test",
 						BundleEndpointUrl:     "https://federated-td-web.org/bundleendpoint",
@@ -560,7 +558,7 @@ func TestBatchCreateFederationRelationship(t *testing.T) {
 					},
 				},
 				{
-					Status: api.OK(),
+					Status: commonapi.OK(),
 					FederationRelationship: &types.FederationRelationship{
 						TrustDomain:           "domain2.test",
 						BundleEndpointUrl:     "https://federated-td-web.org/bundleendpoint2",
@@ -613,7 +611,7 @@ func TestBatchCreateFederationRelationship(t *testing.T) {
 			},
 			expectResults: []*trustdomainv1.BatchCreateFederationRelationshipResponse_Result{
 				{
-					Status: api.OK(),
+					Status: commonapi.OK(),
 					FederationRelationship: &types.FederationRelationship{
 						TrustDomain:       "domain.test",
 						BundleEndpointUrl: "https://federated-td-web.org/bundleendpoint",
@@ -725,7 +723,7 @@ func TestBatchCreateFederationRelationship(t *testing.T) {
 			},
 			expectResults: []*trustdomainv1.BatchCreateFederationRelationshipResponse_Result{
 				{
-					Status: api.OK(),
+					Status: commonapi.OK(),
 					FederationRelationship: &types.FederationRelationship{
 						TrustDomain:       "domain.test",
 						BundleEndpointUrl: "https://federated-td-web.org/bundleendpoint",
@@ -771,7 +769,7 @@ func TestBatchCreateFederationRelationship(t *testing.T) {
 			},
 			expectResults: []*trustdomainv1.BatchCreateFederationRelationshipResponse_Result{
 				{
-					Status: api.OK(),
+					Status: commonapi.OK(),
 					FederationRelationship: &types.FederationRelationship{
 						TrustDomain: "domain.test",
 					},
@@ -1090,7 +1088,7 @@ func TestBatchDeleteFederationRelationship(t *testing.T) {
 			expectDs:        []string{fooFR.TrustDomain.Name()},
 			expectResults: []*trustdomainv1.BatchDeleteFederationRelationshipResponse_Result{
 				{
-					Status:      api.OK(),
+					Status:      commonapi.OK(),
 					TrustDomain: "bar.test",
 				},
 				{
@@ -1101,7 +1099,7 @@ func TestBatchDeleteFederationRelationship(t *testing.T) {
 					TrustDomain: "not.found",
 				},
 				{
-					Status:      api.OK(),
+					Status:      commonapi.OK(),
 					TrustDomain: "baz.test",
 				},
 			},
@@ -1159,7 +1157,6 @@ func TestBatchDeleteFederationRelationship(t *testing.T) {
 			},
 		},
 		{
-
 			name:            "empty trust domain",
 			reqTrustDomains: []string{""},
 			expectDs:        allRelationships,
@@ -1191,7 +1188,6 @@ func TestBatchDeleteFederationRelationship(t *testing.T) {
 			},
 		},
 		{
-
 			name:            "malformed trust domain",
 			reqTrustDomains: []string{"https://foot.test"},
 			expectDs:        allRelationships,
@@ -1446,7 +1442,7 @@ func TestBatchUpdateFederationRelationship(t *testing.T) {
 			},
 			expectResults: []*trustdomainv1.BatchUpdateFederationRelationshipResponse_Result{
 				{
-					Status: api.OK(),
+					Status: commonapi.OK(),
 					FederationRelationship: &types.FederationRelationship{
 						TrustDomain:           "foo.test",
 						BundleEndpointUrl:     "https://foo.test/newpath",
@@ -1460,7 +1456,7 @@ func TestBatchUpdateFederationRelationship(t *testing.T) {
 					},
 				},
 				{
-					Status: api.OK(),
+					Status: commonapi.OK(),
 					FederationRelationship: &types.FederationRelationship{
 						TrustDomain:       "bar.test",
 						BundleEndpointUrl: "https://bar.test/newpath",
@@ -1566,7 +1562,7 @@ func TestBatchUpdateFederationRelationship(t *testing.T) {
 			},
 			expectResults: []*trustdomainv1.BatchUpdateFederationRelationshipResponse_Result{
 				{
-					Status: api.OK(),
+					Status: commonapi.OK(),
 					FederationRelationship: &types.FederationRelationship{
 						TrustDomain:           "bar.test",
 						BundleEndpointUrl:     "https://bar.test/newpath",
@@ -1678,7 +1674,7 @@ func TestBatchUpdateFederationRelationship(t *testing.T) {
 			},
 			expectResults: []*trustdomainv1.BatchUpdateFederationRelationshipResponse_Result{
 				{
-					Status: api.OK(),
+					Status: commonapi.OK(),
 					FederationRelationship: &types.FederationRelationship{
 						TrustDomain:       "foo.test",
 						BundleEndpointUrl: "https://foo.test/newpath",
@@ -1757,7 +1753,7 @@ func TestBatchUpdateFederationRelationship(t *testing.T) {
 			inputMask: &types.FederationRelationshipMask{},
 			expectResults: []*trustdomainv1.BatchUpdateFederationRelationshipResponse_Result{
 				{
-					Status: api.OK(),
+					Status: commonapi.OK(),
 					FederationRelationship: &types.FederationRelationship{
 						TrustDomain:       "bar.test",
 						BundleEndpointUrl: "https://bar.test/path",
@@ -1829,7 +1825,7 @@ func TestBatchUpdateFederationRelationship(t *testing.T) {
 			outputMask: &types.FederationRelationshipMask{},
 			expectResults: []*trustdomainv1.BatchUpdateFederationRelationshipResponse_Result{
 				{
-					Status: api.OK(),
+					Status: commonapi.OK(),
 					FederationRelationship: &types.FederationRelationship{
 						TrustDomain: "bar.test",
 					},
@@ -2211,10 +2207,10 @@ func setupServiceTest(t *testing.T, ds datastore.DataStore) *serviceTest {
 		trustdomain.RegisterService(s, service)
 	},
 		grpctest.OverrideContext(overrideContext),
-		grpctest.Middleware(middleware.WithAuditLog(false)),
+		grpctest.Middleware(middleware.WithAuditLog(false, false)),
 	)
 
-	conn := server.Dial(t)
+	conn := server.NewGRPCClient(t)
 
 	test.client = trustdomainv1.NewTrustDomainClient(conn)
 	test.done = server.Stop

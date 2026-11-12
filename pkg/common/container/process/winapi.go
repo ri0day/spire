@@ -6,6 +6,7 @@ import (
 	"syscall"
 	"unsafe"
 
+	"github.com/spiffe/spire/pkg/common/util"
 	"golang.org/x/sys/windows"
 )
 
@@ -67,8 +68,7 @@ type API interface {
 	Process32Next(snapshot windows.Handle, procEntry *windows.ProcessEntry32) error
 }
 
-type api struct {
-}
+type api struct{}
 
 func (a *api) IsProcessInJob(procHandle windows.Handle, jobHandle windows.Handle, result *bool) error {
 	if procIsProcessInJobErr != nil {
@@ -90,7 +90,7 @@ func (a *api) GetObjectType(handle windows.Handle) (string, error) {
 	length := uint32(0)
 
 	status := ntQueryObject(handle, ObjectTypeInformationClass,
-		&buffer[0], uint32(len(buffer)), &length)
+		&buffer[0], util.MustCast[uint32](len(buffer)), &length)
 	if status != windows.STATUS_SUCCESS {
 		return "", status
 	}
@@ -104,7 +104,7 @@ func (a *api) GetObjectName(handle windows.Handle) (string, error) {
 	var length uint32
 
 	status := ntQueryObject(handle, ObjectNameInformationClass,
-		&buffer[0], uint32(len(buffer)), &length)
+		&buffer[0], util.MustCast[uint32](len(buffer)), &length)
 	if status != windows.STATUS_SUCCESS {
 		return "", status
 	}
@@ -121,7 +121,7 @@ func (a *api) QuerySystemExtendedHandleInformation() ([]SystemHandleInformationE
 		status = ntQuerySystemInformation(
 			windows.SystemExtendedHandleInformation,
 			unsafe.Pointer(&buffer[0]),
-			uint32(len(buffer)),
+			util.MustCast[uint32](len(buffer)),
 			&retLen,
 		)
 
@@ -145,7 +145,7 @@ func (a *api) QuerySystemExtendedHandleInformation() ([]SystemHandleInformationE
 		handlesList := (*SystemExtendedHandleInformation)(unsafe.Pointer(&buffer[0]))
 		handles := unsafe.Slice(&handlesList.Handles[0], int(handlesList.NumberOfHandles))
 
-		return handles, nil
+		return handles, nil //nolint:nilerr
 	}
 
 	return nil, status
@@ -227,25 +227,31 @@ func (u UnicodeString) String() string {
 	return windows.UTF16ToString(data)
 }
 
-func ntQueryObject(handle windows.Handle, objectInformationClass uint32, objectInformation *byte, objectInformationLength uint32, returnLength *uint32) (ntStatus windows.NTStatus) {
+func ntQueryObject(handle windows.Handle, objectInformationClass uint32, objectInformation *byte, objectInformationLength uint32, returnLength *uint32) windows.NTStatus {
 	if procNtQueryObjectErr != nil {
 		return windows.STATUS_PROCEDURE_NOT_FOUND
 	}
 	r0, _, _ := syscall.SyscallN(procNtQueryObject.Addr(), uintptr(handle), uintptr(objectInformationClass), uintptr(unsafe.Pointer(objectInformation)), uintptr(objectInformationLength), uintptr(unsafe.Pointer(returnLength)), 0)
-	if r0 != 0 {
-		ntStatus = windows.NTStatus(r0)
-	}
-	return
+
+	return ntStatusFromSyscall(r0)
 }
 
-func ntQuerySystemInformation(sysInfoClass int32, sysInfo unsafe.Pointer, sysInfoLen uint32, retLen *uint32) (ntstatus windows.NTStatus) {
+func ntQuerySystemInformation(sysInfoClass int32, sysInfo unsafe.Pointer, sysInfoLen uint32, retLen *uint32) windows.NTStatus {
 	if procNtQuerySystemInformationErr != nil {
 		return windows.STATUS_PROCEDURE_NOT_FOUND
 	}
-	r0, _, _ := syscall.SyscallN(procNtQuerySystemInformation.Addr(), uintptr(sysInfoClass), uintptr(sysInfo), uintptr(sysInfoLen), uintptr(unsafe.Pointer(retLen)), 0, 0)
-	if r0 != 0 {
-		ntstatus = windows.NTStatus(r0)
+	sysInfoClassUIP, err := util.CheckedCast[uintptr](sysInfoClass)
+	if err != nil {
+		return windows.STATUS_INTEGER_OVERFLOW
 	}
+	r0, _, _ := syscall.SyscallN(procNtQuerySystemInformation.Addr(), sysInfoClassUIP, uintptr(sysInfo), uintptr(sysInfoLen), uintptr(unsafe.Pointer(retLen)), 0, 0)
+	return ntStatusFromSyscall(r0)
+}
 
-	return
+func ntStatusFromSyscall(r0 uintptr) windows.NTStatus {
+	// NTSTATUS is a 32-bit Windows ABI value even though syscall.SyscallN
+	// returns it in a uintptr-sized register. Preserve the low 32 bits instead
+	// of treating wider uintptr values as overflow; this keeps statuses with
+	// the high bit set intact even if a platform sign-extends the register.
+	return windows.NTStatus(uint32(r0)) //nolint:gosec // G115: intentional ABI conversion from syscall return value.
 }

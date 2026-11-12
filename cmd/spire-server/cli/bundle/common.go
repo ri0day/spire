@@ -2,7 +2,6 @@ package bundle
 
 import (
 	"bytes"
-	"crypto"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
@@ -17,7 +16,8 @@ import (
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/spire-api-sdk/proto/spire/api/types"
 	"github.com/spiffe/spire/cmd/spire-server/util"
-	"github.com/zeebo/errs"
+	"github.com/spiffe/spire/pkg/common/jwtutil"
+	"github.com/spiffe/spire/pkg/common/witutil"
 )
 
 const (
@@ -78,7 +78,7 @@ func printBundle(out io.Writer, bundle *types.Bundle) error {
 
 	docBytes, err := b.Marshal()
 	if err != nil {
-		return errs.Wrap(err)
+		return err
 	}
 
 	var o bytes.Buffer
@@ -86,11 +86,8 @@ func printBundle(out io.Writer, bundle *types.Bundle) error {
 		return err
 	}
 
-	if _, err := fmt.Fprintln(out, o.String()); err != nil {
-		return errs.Wrap(err)
-	}
-
-	return nil
+	_, err = fmt.Fprintln(out, o.String())
+	return err
 }
 
 // bundleFromProto converts a bundle from the given *types.Bundle to *spiffebundle.Bundle
@@ -103,13 +100,18 @@ func bundleFromProto(bundleProto *types.Bundle) (*spiffebundle.Bundle, error) {
 	if err != nil {
 		return nil, err
 	}
-	jwtAuthorities, err := jwtKeysFromProto(bundleProto.JwtAuthorities)
+	jwtAuthorities, err := jwtutil.JWTKeysFromProto(bundleProto.JwtAuthorities)
+	if err != nil {
+		return nil, err
+	}
+	witAuthorities, err := witutil.WITKeysFromProto(bundleProto.WitAuthorities)
 	if err != nil {
 		return nil, err
 	}
 	bundle := spiffebundle.New(td)
 	bundle.SetX509Authorities(x509Authorities)
 	bundle.SetJWTAuthorities(jwtAuthorities)
+	bundle.SetWITAuthorities(witAuthorities)
 	if bundleProto.RefreshHint > 0 {
 		bundle.SetRefreshHint(time.Duration(bundleProto.RefreshHint) * time.Second)
 	}
@@ -130,20 +132,6 @@ func x509CertificatesFromProto(proto []*types.X509Certificate) ([]*x509.Certific
 		certs = append(certs, cert)
 	}
 	return certs, nil
-}
-
-// jwtKeysFromProto converts JWT keys from the given []*types.JWTKey to map[string]crypto.PublicKey.
-// The key ID of the public key is used as the key in the returned map.
-func jwtKeysFromProto(proto []*types.JWTKey) (map[string]crypto.PublicKey, error) {
-	keys := make(map[string]crypto.PublicKey)
-	for i, publicKey := range proto {
-		jwtSigningKey, err := x509.ParsePKIXPublicKey(publicKey.PublicKey)
-		if err != nil {
-			return nil, fmt.Errorf("unable to parse JWT signing key %d: %w", i, err)
-		}
-		keys[publicKey.KeyId] = jwtSigningKey
-	}
-	return keys, nil
 }
 
 func printBundleWithFormat(out io.Writer, bundle *types.Bundle, format string, header bool) error {

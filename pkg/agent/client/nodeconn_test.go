@@ -1,7 +1,6 @@
 package client
 
 import (
-	"context"
 	"crypto"
 	"crypto/x509"
 	"testing"
@@ -33,11 +32,11 @@ func newTestConn(t *testing.T) *grpc.ClientConn {
 		KeysAndBundle: emptyKeysAndBundle,
 		TrustDomain:   trustDomain,
 	})
-	client.dialContext = func(ctx context.Context, addr string, opts ...grpc.DialOption) (*grpc.ClientConn, error) {
+	client.dialOpts = []grpc.DialOption{
 		// make a normal grpc dial but without any of the provided options that may cause it to fail
-		return grpc.DialContext(ctx, addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	}
-	conn, err := client.dial(context.Background())
+	conn, err := client.newServerGRPCClient()
 	require.NoError(t, err)
 	return conn
 }
@@ -64,7 +63,7 @@ func TestNewNodeMany(t *testing.T) {
 	firstRelease := false
 
 	go func() {
-		for i := 0; i < 100; i++ {
+		for range 100 {
 			nodeConn.AddRef()
 			if !firstRelease {
 				nodeConn.Release()
@@ -75,7 +74,7 @@ func TestNewNodeMany(t *testing.T) {
 	}()
 
 	go func() {
-		for i := 0; i < 100; i++ {
+		for range 100 {
 			nodeConn.Release()
 		}
 		close(waitForReleases)

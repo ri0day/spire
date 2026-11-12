@@ -18,37 +18,27 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
 	"github.com/fullsailor/pkcs7"
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/spire/pkg/agent/plugin/nodeattestor"
 	nodeattestortest "github.com/spiffe/spire/pkg/agent/plugin/nodeattestor/test"
-	"github.com/spiffe/spire/pkg/common/pemutil"
+	"github.com/spiffe/spire/pkg/common/catalog"
 	"github.com/spiffe/spire/pkg/common/plugin/aws"
 	"github.com/spiffe/spire/test/plugintest"
 	"github.com/spiffe/spire/test/spiretest"
+	"github.com/spiffe/spire/test/testkey"
 	"google.golang.org/grpc/codes"
 )
 
 const (
-	apiTokenPath                 = "/latest/api/token"   //nolint: gosec // false positive
-	staticToken                  = "It's just some data" //nolint: gosec // false positive
+	apiTokenPath                 = "/latest/api/token"
+	staticToken                  = "It's just some data"
 	defaultIdentityDocumentPath  = "/latest/dynamic/instance-identity/document"
 	identitySignatureRSA1024Path = "/latest/dynamic/instance-identity/signature"
 	identitySignatureRSA2048Path = "/latest/dynamic/instance-identity/rsa2048"
 )
 
 var (
-	signingKeyPEM = []byte(`-----BEGIN RSA PRIVATE KEY-----
-MIIBywIBAAJhAOn4rFLlxONpujl+q/h/kTQzZoqn1nQZbCKEyIPBWO6kkcSqIqON
-aB3i+xyxgZNwkGEkLGRl/Uwasbp7O/sU43wh5ywWp/AG0iFe1RhwMd8LMq5ron6o
-s2eql71hJKsGEwIDAQABAmEAoDa9YcKe8Q68C5TXE8He33z3Ealea3/hET4VxEsI
-p9mfS6kpMQ+qpRSB2aMfVKP1mrAQ4/5TarrG1ZG3T/Mt9Oy1QHbzALvz2XObIvcR
-0cnG353CLQK/nobvWcwAtac5AjEA9k+1a9R6eFaO3grl9yg5XY2+MboV4wjbsDS3
-s4+MivneTPwvK6eHxtoAlYCNOAslAjEA8yy0PJw3TLBK80DryF3r/Q4wd4uYeFhN
-G6EBF0LccLB7GbKpcDHgnNjW/wObx+LXAjBeP4/G6+3U4CIYuojWMvEIaDVPp8m6
-LuiJGxLzxUjc4NF8Gb8e8CLXJxG0IxVmTXUCMQDSPJAG5rgYoUHrVPGEZU8llSLp
-99J2GUFw5Z3f0nprIukKqqA606RxdjdKeoAwLDkCMCptc0jZR3VM4w1wnwvAe0FL
-t61Ol/Q+OqWFX74JwsUU56FqPFm3Y9k7HxDILdedoQ==
------END RSA PRIVATE KEY-----`)
-
+	signingKey    = testkey.MustRSA2048()
 	streamBuilder = nodeattestortest.ServerStream(aws.PluginName)
 )
 
@@ -93,6 +83,9 @@ func (s *Suite) SetupTest() {
 	}))
 
 	s.p = s.loadPlugin(
+		plugintest.CoreConfig(catalog.CoreConfig{
+			TrustDomain: spiffeid.RequireTrustDomainFromString("example.org"),
+		}),
 		plugintest.Configuref(`ec2_metadata_endpoint = "http://%s/latest"`, s.server.Listener.Addr()),
 	)
 
@@ -141,13 +134,21 @@ func (s *Suite) TestConfigure() {
 
 	var err error
 	s.loadPlugin(
+		plugintest.CoreConfig(catalog.CoreConfig{
+			TrustDomain: spiffeid.RequireTrustDomainFromString("example.org"),
+		}),
 		plugintest.CaptureConfigureError(&err),
 		plugintest.Configure("malformed"),
 	)
 	require.Error(err)
 
 	// success
-	s.loadPlugin(plugintest.Configure(""))
+	s.loadPlugin(
+		plugintest.CoreConfig(catalog.CoreConfig{
+			TrustDomain: spiffeid.RequireTrustDomainFromString("example.org"),
+		}),
+		plugintest.Configure(""),
+	)
 }
 
 func (s *Suite) loadPlugin(opts ...plugintest.Option) nodeattestor.NodeAttestor {
@@ -167,15 +168,13 @@ func (s *Suite) buildDefaultIIDDocAndSig() (docBytes []byte, sigBytes []byte, si
 	s.Require().NoError(err)
 
 	rng := rand.Reader
-	key, err := pemutil.ParseRSAPrivateKey(signingKeyPEM)
-	s.Require().NoError(err)
 
 	// doc signature
 	docHash := sha256.Sum256(docBytes)
-	sig, err := rsa.SignPKCS1v15(rng, key, crypto.SHA256, docHash[:])
+	sig, err := rsa.SignPKCS1v15(rng, signingKey, crypto.SHA256, docHash[:])
 	s.Require().NoError(err)
 
-	sigRSA2048 = s.generatePKCS7Signature(docBytes, key)
+	sigRSA2048 = s.generatePKCS7Signature(docBytes, signingKey)
 
 	return docBytes, sig, sigRSA2048
 }

@@ -11,7 +11,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/spiffe/go-spiffe/v2/bundle/spiffebundle"
 	"github.com/spiffe/spire/pkg/common/bundleutil"
-	"github.com/zeebo/errs"
+	"github.com/spiffe/spire/pkg/common/tlspolicy"
 )
 
 type Getter interface {
@@ -34,6 +34,7 @@ type ServerConfig struct {
 	Getter      Getter
 	ServerAuth  ServerAuth
 	RefreshHint time.Duration
+	TLSPolicy   tlspolicy.Policy
 
 	// test hooks
 	listen func(network, address string) (net.Listener, error)
@@ -57,12 +58,14 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	// it gives us the ability to use/inspect an ephemeral port during testing.
 	listener, err := s.c.listen("tcp", s.c.Address)
 	if err != nil {
-		return errs.Wrap(err)
+		return err
 	}
 
 	// Set up the TLS config, setting TLS 1.2 as the minimum.
-	tlsConfig := s.c.ServerAuth.GetTLSConfig()
-	tlsConfig.MinVersion = tls.VersionTLS12
+	tlsConfig, err := buildListenerTLSConfig(s)
+	if err != nil {
+		return err
+	}
 
 	server := &http.Server{
 		Handler:           http.HandlerFunc(s.serveHTTP),
@@ -72,7 +75,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- errs.Wrap(server.ServeTLS(listener, "", ""))
+		errCh <- server.ServeTLS(listener, "", "")
 	}()
 
 	select {
@@ -84,8 +87,16 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	}
 }
 
+func (s *Server) WaitForListening() {
+	// This method is a no-op for the bundle server since it does not have a
+	// separate listening hook like the agent endpoints.
+	// If needed, this can be implemented to signal when the server starts
+	// listening.
+}
+
 func (s *Server) serveHTTP(w http.ResponseWriter, req *http.Request) {
 	if req.Method != "GET" {
+		w.Header().Set("Allow", http.MethodGet)
 		http.Error(w, "405 method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -123,4 +134,13 @@ func chainDER(chain []*x509.Certificate) [][]byte {
 		der = append(der, cert.Raw)
 	}
 	return der
+}
+
+func buildListenerTLSConfig(s *Server) (*tls.Config, error) {
+	tlsConfig := s.c.ServerAuth.GetTLSConfig()
+	tlsConfig.MinVersion = tls.VersionTLS12
+	if err := tlspolicy.ApplyPolicy(tlsConfig, s.c.TLSPolicy, tlspolicy.WithServerTLSConfig()); err != nil {
+		return nil, err
+	}
+	return tlsConfig, nil
 }

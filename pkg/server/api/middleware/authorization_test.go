@@ -10,7 +10,7 @@ import (
 	"net/url"
 	"testing"
 
-	"github.com/open-policy-agent/opa/storage/inmem"
+	"github.com/open-policy-agent/opa/v1/storage/inmem"
 	"github.com/sirupsen/logrus/hooks/test"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/spire-api-sdk/proto/spire/api/types"
@@ -96,6 +96,21 @@ func TestWithAuthorizationPreprocess(t *testing.T) {
 			State: tls.ConnectionState{
 				HandshakeComplete: true,
 				PeerCertificates:  []*x509.Certificate{downstreamX509SVID},
+			},
+		},
+	}
+
+	agentID := spiffeid.RequireFromPath(td, "/spire/agent/foo")
+	agentX509SVID := &x509.Certificate{URIs: []*url.URL{agentID.URL()}}
+	agentPeer := &peer.Peer{
+		Addr: &net.TCPAddr{
+			IP:   net.ParseIP("2.2.2.2"),
+			Port: 2,
+		},
+		AuthInfo: credentials.TLSInfo{
+			State: tls.ConnectionState{
+				HandshakeComplete: true,
+				PeerCertificates:  []*x509.Certificate{agentX509SVID},
 			},
 		},
 	}
@@ -211,6 +226,21 @@ func TestWithAuthorizationPreprocess(t *testing.T) {
 			expectCode:      codes.OK,
 		},
 		{
+			name:       "allow_if_admin or allow_if_agent agent caller skips entry fetch",
+			fullMethod: fakeFullMethod,
+			peer:       agentPeer,
+			rego: simpleRego(map[string]bool{
+				"allow_if_admin":      true,
+				"allow_if_downstream": true,
+				"allow_if_agent":      true,
+			}),
+			entryFetcher: func(ctx context.Context, id spiffeid.ID) ([]*types.Entry, error) {
+				return nil, errors.New("entries should not be fetched for agents")
+			},
+			agentAuthorizer: yesAgentAuthorizer,
+			expectCode:      codes.OK,
+		},
+		{
 			name:       "allow_if_agent non-agent caller test",
 			fullMethod: fakeFullMethod,
 			peer:       mtlsPeer,
@@ -321,7 +351,6 @@ func TestWithAuthorizationPreprocess(t *testing.T) {
 			expectMsg:  "failed to fetch caller entries: entry fetcher error",
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := context.Background()
 			policyEngine, err := authpolicy.NewEngineFromRego(ctx, tt.rego, inmem.NewFromObject(map[string]any{}))
@@ -490,7 +519,7 @@ func condCheckRego(cond string) string {
     }
     default allow = false
     
-    allow=true {
+    allow=true if {
         %s
     }
     `

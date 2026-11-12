@@ -109,7 +109,6 @@ func TestRun(t *testing.T) {
 			},
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 			defer cancel()
@@ -161,7 +160,7 @@ func TestRunDeleteSecrets(t *testing.T) {
 		// readyRecords list of records that are ready to be stored
 		readyRecords []*storecache.Record
 		// stores is a list of configured SVIDStores,
-		// it contains the list of expected configurations to be send
+		// it contains the list of expected configurations to be sent
 		stores map[string]*fakeSVIDStore
 		// logs is the list of expected logs
 		logs []spiretest.LogEntry
@@ -361,7 +360,6 @@ func TestRunDeleteSecrets(t *testing.T) {
 			},
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 			defer cancel()

@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/spiffe/spire/pkg/common/coretypes/x509certificate"
 	"github.com/spiffe/spire/pkg/server/plugin/upstreamauthority"
 	"github.com/spiffe/spire/proto/spire/common"
 	"google.golang.org/grpc/codes"
@@ -17,8 +18,9 @@ import (
 // BundleUpdater is the interface used by the UpstreamClient to append bundle
 // updates.
 type BundleUpdater interface {
-	AppendX509Roots(ctx context.Context, roots []*x509.Certificate) error
+	SyncX509Roots(ctx context.Context, roots []*x509certificate.X509Authority) error
 	AppendJWTKeys(ctx context.Context, keys []*common.PublicKey) ([]*common.PublicKey, error)
+	AppendWITKeys(ctx context.Context, keys []*common.PublicKey) ([]*common.PublicKey, error)
 	LogError(err error, msg string)
 }
 
@@ -38,18 +40,24 @@ type UpstreamClientConfig struct {
 type UpstreamClient struct {
 	c UpstreamClientConfig
 
-	mintX509CAMtx       sync.Mutex
-	mintX509CAStream    *streamState
-	publishJWTKeyMtx    sync.Mutex
-	publishJWTKeyStream *streamState
+	mintX509CAMtx                   sync.Mutex
+	mintX509CAStream                *streamState
+	publishJWTKeyMtx                sync.Mutex
+	publishJWTKeyStream             *streamState
+	publishWITKeyMtx                sync.Mutex
+	publishWITKeyStream             *streamState
+	subscribeToLocalBundleStreamMtx sync.Mutex
+	subscribeToLocalBundleStream    *streamState
 }
 
 // NewUpstreamClient returns a new UpstreamAuthority plugin client.
 func NewUpstreamClient(config UpstreamClientConfig) *UpstreamClient {
 	return &UpstreamClient{
-		c:                   config,
-		mintX509CAStream:    newStreamState(),
-		publishJWTKeyStream: newStreamState(),
+		c:                            config,
+		mintX509CAStream:             newStreamState(),
+		publishJWTKeyStream:          newStreamState(),
+		publishWITKeyStream:          newStreamState(),
+		subscribeToLocalBundleStream: newStreamState(),
 	}
 }
 
@@ -65,6 +73,16 @@ func (u *UpstreamClient) Close() error {
 		u.publishJWTKeyMtx.Lock()
 		defer u.publishJWTKeyMtx.Unlock()
 		u.publishJWTKeyStream.Stop()
+	}()
+	func() {
+		u.publishWITKeyMtx.Lock()
+		defer u.publishWITKeyMtx.Unlock()
+		u.publishWITKeyStream.Stop()
+	}()
+	func() {
+		u.subscribeToLocalBundleStreamMtx.Lock()
+		defer u.subscribeToLocalBundleStreamMtx.Unlock()
+		u.subscribeToLocalBundleStream.Stop()
 	}()
 	return nil
 }
@@ -95,11 +113,6 @@ func (u *UpstreamClient) MintX509CA(ctx context.Context, csr []byte, ttl time.Du
 	}
 }
 
-// WaitUntilMintX509CAStreamDone waits until the MintX509CA stream has stopped.
-func (u *UpstreamClient) WaitUntilMintX509CAStreamDone(ctx context.Context) error {
-	return u.mintX509CAStream.WaitUntilStopped(ctx)
-}
-
 // PublishJWTKey publishes the JWT key to the UpstreamAuthority. It maintains
 // an open stream to the UpstreamAuthority plugin to receive and append JWT key
 // updates to the bundle. The stream remains open until another call to
@@ -126,9 +139,52 @@ func (u *UpstreamClient) PublishJWTKey(ctx context.Context, jwtKey *common.Publi
 	}
 }
 
-// WaitUntilPublishJWTKeyStreamDone waits until the MintX509CA stream has stopped.
-func (u *UpstreamClient) WaitUntilPublishJWTKeyStreamDone(ctx context.Context) error {
-	return u.publishJWTKeyStream.WaitUntilStopped(ctx)
+// PublishWITKey publishes the WIT key to the UpstreamAuthority. It maintains
+// an open stream to the UpstreamAuthority plugin to receive and append WIT key
+// updates to the bundle. The stream remains open until another call to
+// PublishWITKey happens or the client is closed.
+func (u *UpstreamClient) PublishWITKey(ctx context.Context, witKey *common.PublicKey) (_ []*common.PublicKey, err error) {
+	u.publishWITKeyMtx.Lock()
+	defer u.publishWITKeyMtx.Unlock()
+
+	firstResultCh := make(chan publishWITKeyResult, 1)
+	u.publishWITKeyStream.Start(func(streamCtx context.Context) {
+		u.runPublishWITKeyStream(streamCtx, witKey, firstResultCh)
+	})
+	defer func() {
+		if err != nil {
+			u.publishWITKeyStream.Stop()
+		}
+	}()
+
+	select {
+	case result := <-firstResultCh:
+		return result.witKeys, result.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (u *UpstreamClient) SubscribeToLocalBundle(ctx context.Context) (err error) {
+	u.subscribeToLocalBundleStreamMtx.Lock()
+	defer u.subscribeToLocalBundleStreamMtx.Unlock()
+
+	firstResultCh := make(chan bundleUpdatesResult, 1)
+	u.subscribeToLocalBundleStream.Start(func(streamCtx context.Context) {
+		u.runSubscribeToLocalBundleStream(streamCtx, firstResultCh)
+	})
+	defer func() {
+		if err != nil {
+			u.subscribeToLocalBundleStream.Stop()
+		}
+	}()
+
+	select {
+	case result := <-firstResultCh:
+		return result.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (u *UpstreamClient) runMintX509CAStream(ctx context.Context, csr []byte, ttl time.Duration, validateX509CA ValidateX509CAFunc, firstResultCh chan<- mintX509CAResult) {
@@ -139,16 +195,22 @@ func (u *UpstreamClient) runMintX509CAStream(ctx context.Context, csr []byte, tt
 	}
 	defer x509RootsStream.Close()
 
+	// Extract all root certificates
+	var x509RootCerts []*x509.Certificate
+	for _, eachRoot := range x509Roots {
+		x509RootCerts = append(x509RootCerts, eachRoot.Certificate)
+	}
+
 	// Before we append the roots and return the response, we must first
 	// validate that the minted intermediate can sign a valid, conformant
 	// X509-SVID chain of trust using the provided callback.
-	if err := validateX509CA(x509CA, x509Roots); err != nil {
+	if err := validateX509CA(x509CA, x509RootCerts); err != nil {
 		err = status.Errorf(codes.InvalidArgument, "X509 CA minted by upstream authority is invalid: %v", err)
 		firstResultCh <- mintX509CAResult{err: err}
 		return
 	}
 
-	if err := u.c.BundleUpdater.AppendX509Roots(ctx, x509Roots); err != nil {
+	if err := u.c.BundleUpdater.SyncX509Roots(ctx, x509Roots); err != nil {
 		firstResultCh <- mintX509CAResult{err: err}
 		return
 	}
@@ -171,7 +233,7 @@ func (u *UpstreamClient) runMintX509CAStream(ctx context.Context, csr []byte, tt
 			return
 		}
 
-		if err := u.c.BundleUpdater.AppendX509Roots(ctx, x509Roots); err != nil {
+		if err := u.c.BundleUpdater.SyncX509Roots(ctx, x509Roots); err != nil {
 			u.c.BundleUpdater.LogError(err, "Failed to store X.509 roots received by the upstream authority plugin.")
 			continue
 		}
@@ -216,6 +278,112 @@ func (u *UpstreamClient) runPublishJWTKeyStream(ctx context.Context, jwtKey *com
 	}
 }
 
+func (u *UpstreamClient) runPublishWITKeyStream(ctx context.Context, witKey *common.PublicKey, firstResultCh chan<- publishWITKeyResult) {
+	witKeys, witKeysStream, err := u.c.UpstreamAuthority.PublishWITKey(ctx, witKey)
+	if err != nil {
+		firstResultCh <- publishWITKeyResult{err: err}
+		return
+	}
+	defer witKeysStream.Close()
+
+	updatedKeys, err := u.c.BundleUpdater.AppendWITKeys(ctx, witKeys)
+	if err != nil {
+		firstResultCh <- publishWITKeyResult{err: err}
+		return
+	}
+	firstResultCh <- publishWITKeyResult{witKeys: updatedKeys}
+
+	for {
+		witKeys, err := witKeysStream.RecvUpstreamWITAuthorities()
+		if err != nil {
+			switch {
+			case errors.Is(err, io.EOF):
+				// This is normal if the plugin does not support streaming
+				// bundle updates.
+			case status.Code(err) == codes.Canceled:
+				// This is normal. This client cancels this stream when opening
+				// a new stream.
+			default:
+				u.c.BundleUpdater.LogError(err, "The upstream authority plugin stopped streaming WIT key updates prematurely. Please report this bug. Will retry later.")
+			}
+			return
+		}
+
+		if _, err := u.c.BundleUpdater.AppendWITKeys(ctx, witKeys); err != nil {
+			u.c.BundleUpdater.LogError(err, "Failed to store WIT keys received by the upstream authority plugin.")
+			continue
+		}
+	}
+}
+
+func (u *UpstreamClient) runSubscribeToLocalBundleStream(ctx context.Context, firstResultCh chan<- bundleUpdatesResult) {
+	x509CAs, jwtKeys, witKeys, authorityStream, err := u.c.UpstreamAuthority.SubscribeToLocalBundle(ctx)
+	if err != nil {
+		firstResultCh <- bundleUpdatesResult{err: err}
+		return
+	}
+	defer authorityStream.Close()
+
+	err = u.c.BundleUpdater.SyncX509Roots(ctx, x509CAs)
+	if err != nil {
+		firstResultCh <- bundleUpdatesResult{err: err}
+		return
+	}
+	updatedJWTKeys, err := u.c.BundleUpdater.AppendJWTKeys(ctx, jwtKeys)
+	if err != nil {
+		firstResultCh <- bundleUpdatesResult{err: err}
+		return
+	}
+	updatedWITKeys, err := u.c.BundleUpdater.AppendWITKeys(ctx, witKeys)
+	if err != nil {
+		firstResultCh <- bundleUpdatesResult{err: err}
+		return
+	}
+
+	x509CA := []*x509.Certificate{}
+	for _, ca := range x509CAs {
+		x509CA = append(x509CA, ca.Certificate)
+	}
+
+	firstResultCh <- bundleUpdatesResult{
+		x509CA:  x509CA,
+		jwtKeys: updatedJWTKeys,
+		witKeys: updatedWITKeys,
+	}
+
+	for {
+		x509CA, jwtKeys, witKeys, err := authorityStream.RecvLocalBundleUpdate()
+		if err != nil {
+			switch {
+			case errors.Is(err, io.EOF):
+				// This is normal if the plugin does not support streaming
+				// bundle updates.
+			case status.Code(err) == codes.Canceled:
+				// This is normal. This client cancels this stream when opening
+				// a new stream.
+			default:
+				u.c.BundleUpdater.LogError(err, "The upstream authority plugin stopped streaming authorities updates prematurely. Please report this bug. Will retry later.")
+			}
+			return
+		}
+
+		if err := u.c.BundleUpdater.SyncX509Roots(ctx, x509CA); err != nil {
+			u.c.BundleUpdater.LogError(err, "Failed to store X.509 CAs received by the upstream authority plugin.")
+			continue
+		}
+
+		if _, err := u.c.BundleUpdater.AppendJWTKeys(ctx, jwtKeys); err != nil {
+			u.c.BundleUpdater.LogError(err, "Failed to store JWT keys received by the upstream authority plugin.")
+			continue
+		}
+
+		if _, err := u.c.BundleUpdater.AppendWITKeys(ctx, witKeys); err != nil {
+			u.c.BundleUpdater.LogError(err, "Failed to store WIT keys received by the upstream authority plugin.")
+			continue
+		}
+	}
+}
+
 type mintX509CAResult struct {
 	x509CA []*x509.Certificate
 	err    error
@@ -223,6 +391,18 @@ type mintX509CAResult struct {
 
 type publishJWTKeyResult struct {
 	jwtKeys []*common.PublicKey
+	err     error
+}
+
+type publishWITKeyResult struct {
+	witKeys []*common.PublicKey
+	err     error
+}
+
+type bundleUpdatesResult struct {
+	x509CA  []*x509.Certificate
+	jwtKeys []*common.PublicKey
+	witKeys []*common.PublicKey
 	err     error
 }
 
@@ -255,11 +435,9 @@ func (s *streamState) Start(fn func(context.Context)) {
 	s.stopped = make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
 	s.cancel = cancel
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
+	s.wg.Go(func() {
 		fn(ctx)
-	}()
+	})
 }
 
 func (s *streamState) WaitUntilStopped(ctx context.Context) error {

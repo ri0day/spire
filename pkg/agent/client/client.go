@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/andres-erbsen/clock"
 	"github.com/sirupsen/logrus"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	agentv1 "github.com/spiffe/spire-api-sdk/proto/spire/api/server/agent/v1"
@@ -18,30 +19,64 @@ import (
 	entryv1 "github.com/spiffe/spire-api-sdk/proto/spire/api/server/entry/v1"
 	svidv1 "github.com/spiffe/spire-api-sdk/proto/spire/api/server/svid/v1"
 	"github.com/spiffe/spire-api-sdk/proto/spire/api/types"
+	"github.com/spiffe/spire/pkg/common/backoff"
 	"github.com/spiffe/spire/pkg/common/bundleutil"
+	"github.com/spiffe/spire/pkg/common/idutil"
 	"github.com/spiffe/spire/pkg/common/telemetry"
+	"github.com/spiffe/spire/pkg/common/tlspolicy"
 	"github.com/spiffe/spire/proto/spire/common"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
+const (
+	defaultRPCTimeout       = 30 * time.Second
+	defaultMaxBundleWorkers = 10
+)
+
 var (
 	ErrUnableToGetStream = errors.New("unable to get a stream")
 
+	rpcTimeout = defaultRPCTimeout
+
+	// maxBundleWorkers is the maximum number of worker goroutines to use when fetching bundles.
+	maxBundleWorkers = defaultMaxBundleWorkers
+
 	entryOutputMask = &types.EntryMask{
-		SpiffeId:       true,
-		Selectors:      true,
-		FederatesWith:  true,
-		Admin:          true,
-		Downstream:     true,
-		RevisionNumber: true,
-		StoreSvid:      true,
-		Hint:           true,
+		SpiffeId:             true,
+		Selectors:            true,
+		FederatesWith:        true,
+		Admin:                true,
+		Downstream:           true,
+		RevisionNumber:       true,
+		StoreSvid:            true,
+		Hint:                 true,
+		AdditionalAttributes: true,
+		CreatedAt:            true,
 	}
+
+	// RPCTimeoutWithCacheHit can be more aggressive with timeouts in cases where a valid SVID
+	// exists in the cache but is old enough to try for a new SVID quickly. This is configurable
+	// in the Experimental Config of the Agent, and can be set as low as 5 seconds
+	RPCTimeoutWithCacheHit = defaultRPCTimeout
+
+	// jwtSVIDRetryInterval is the initial backoff interval used when retrying
+	// transient NewJWTSVID failures. It is a var so tests can shorten it.
+	jwtSVIDRetryInterval = time.Second
 )
 
-const rpcTimeout = 30 * time.Second
+func SetRPCTimeout(d time.Duration) {
+	rpcTimeout = d
+}
+
+func SetMaxBundleWorkers(n int) {
+	maxBundleWorkers = n
+}
+
+func SetJWTSVIDCacheHitTimeout(d time.Duration) {
+	RPCTimeoutWithCacheHit = d
+}
 
 type X509SVID struct {
 	CertChain []byte
@@ -49,6 +84,12 @@ type X509SVID struct {
 }
 
 type JWTSVID struct {
+	Token     string
+	IssuedAt  time.Time
+	ExpiresAt time.Time
+}
+
+type WITSVID struct {
 	Token     string
 	IssuedAt  time.Time
 	ExpiresAt time.Time
@@ -71,11 +112,12 @@ type SyncBundlesStats struct {
 }
 
 type Client interface {
-	FetchUpdates(ctx context.Context) (*Update, error)
 	SyncUpdates(ctx context.Context, cachedEntries map[string]*common.RegistrationEntry, cachedBundles map[string]*common.Bundle) (SyncStats, error)
 	RenewSVID(ctx context.Context, csr []byte) (*X509SVID, error)
 	NewX509SVIDs(ctx context.Context, csrs map[string][]byte) (map[string]*X509SVID, error)
-	NewJWTSVID(ctx context.Context, entryID string, audience []string) (*JWTSVID, error)
+	NewJWTSVID(ctx context.Context, entryID string, audience []string, hasCacheHit bool) (*JWTSVID, spiffeid.ID, error)
+	NewWITSVIDs(ctx context.Context, publicKeys map[string]crypto.PublicKey, signatureAlgorithm string) (map[string]*WITSVID, error)
+	PostStatus(ctx context.Context, agentVersion string) error
 
 	// Release releases any resources that were held by this Client, if any.
 	Release()
@@ -92,6 +134,13 @@ type Config struct {
 
 	// RotMtx is used to prevent the creation of new connections during SVID rotations
 	RotMtx *sync.RWMutex
+
+	// TLSPolicy determines the post-quantum-safe policy to apply to all TLS connections.
+	TLSPolicy tlspolicy.Policy
+
+	// LoadBalancingConfig is an optional, opaque payload used as the
+	// loadBalancingConfig field of the gRPC service config.
+	LoadBalancingConfig string
 }
 
 type client struct {
@@ -99,8 +148,17 @@ type client struct {
 	connections *nodeConn
 	m           sync.Mutex
 
-	// Constructor used for testing purposes.
-	dialContext func(ctx context.Context, target string, opts ...grpc.DialOption) (*grpc.ClientConn, error)
+	// clk is used for backoff timing when retrying transient failures.
+	clk clock.Clock
+
+	// dialOpts optionally sets gRPC dial options
+	dialOpts []grpc.DialOption
+}
+
+// fetchBundleResult contains the result of fetching a federated bundle.
+type fetchBundleResult struct {
+	bundle *types.Bundle
+	err    error
 }
 
 // New creates a new client struct with the configuration provided
@@ -110,67 +168,9 @@ func New(c *Config) Client {
 
 func newClient(c *Config) *client {
 	return &client{
-		c: c,
+		c:   c,
+		clk: clock.New(),
 	}
-}
-
-func (c *client) FetchUpdates(ctx context.Context) (*Update, error) {
-	c.c.RotMtx.RLock()
-	defer c.c.RotMtx.RUnlock()
-
-	ctx, cancel := context.WithTimeout(ctx, rpcTimeout)
-	defer cancel()
-
-	protoEntries, err := c.fetchEntries(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	regEntries := make(map[string]*common.RegistrationEntry)
-	federatesWith := make(map[string]bool)
-	for _, e := range protoEntries {
-		entry, err := slicedEntryFromProto(e)
-		if err != nil {
-			c.c.Log.WithFields(logrus.Fields{
-				telemetry.RegistrationID: e.Id,
-				telemetry.SPIFFEID:       e.SpiffeId,
-				telemetry.Selectors:      e.Selectors,
-				telemetry.Error:          err.Error(),
-			}).Warn("Received malformed entry from SPIRE server; are the server and agent versions compatible?")
-			continue
-		}
-
-		// Get all federated trust domains
-		for _, td := range entry.FederatesWith {
-			federatesWith[td] = true
-		}
-		regEntries[entry.EntryId] = entry
-	}
-
-	keys := make([]string, 0, len(federatesWith))
-	for key := range federatesWith {
-		keys = append(keys, key)
-	}
-
-	protoBundles, err := c.fetchBundles(ctx, keys)
-	if err != nil {
-		return nil, err
-	}
-
-	bundles := make(map[string]*common.Bundle)
-	for _, b := range protoBundles {
-		bundle, err := bundleutil.CommonBundleFromProto(b)
-		if err != nil {
-			c.c.Log.WithError(err).Warn("Received malformed bundle from SPIRE server; are the server and agent versions compatible?")
-			continue
-		}
-		bundles[bundle.TrustDomainId] = bundle
-	}
-
-	return &Update{
-		Entries: regEntries,
-		Bundles: bundles,
-	}, nil
 }
 
 func (c *client) SyncUpdates(ctx context.Context, cachedEntries map[string]*common.RegistrationEntry, cachedBundles map[string]*common.Bundle) (SyncStats, error) {
@@ -229,7 +229,7 @@ func (c *client) RenewSVID(ctx context.Context, csr []byte) (*X509SVID, error) {
 	ctx, cancel := context.WithTimeout(ctx, rpcTimeout)
 	defer cancel()
 
-	agentClient, connection, err := c.newAgentClient(ctx)
+	agentClient, connection, err := c.newAgentClient()
 	if err != nil {
 		return nil, err
 	}
@@ -254,6 +254,31 @@ func (c *client) RenewSVID(ctx context.Context, csr []byte) (*X509SVID, error) {
 		CertChain: certChain,
 		ExpiresAt: resp.Svid.ExpiresAt,
 	}, nil
+}
+
+func (c *client) PostStatus(ctx context.Context, agentVersion string) error {
+	c.c.RotMtx.RLock()
+	defer c.c.RotMtx.RUnlock()
+
+	ctx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	defer cancel()
+
+	agentClient, connection, err := c.newAgentClient()
+	if err != nil {
+		return err
+	}
+	defer connection.Release()
+
+	_, err = agentClient.PostStatus(ctx, &agentv1.PostStatusRequest{
+		AgentVersion: agentVersion,
+	})
+	if err != nil {
+		c.release(connection)
+		c.c.Log.WithError(err).Warn("Failed to post agent status")
+		return fmt.Errorf("failed to post agent status: %w", err)
+	}
+
+	return nil
 }
 
 func (c *client) NewX509SVIDs(ctx context.Context, csrs map[string][]byte) (map[string]*X509SVID, error) {
@@ -297,14 +322,73 @@ func (c *client) NewX509SVIDs(ctx context.Context, csrs map[string][]byte) (map[
 	return svids, nil
 }
 
-func (c *client) NewJWTSVID(ctx context.Context, entryID string, audience []string) (*JWTSVID, error) {
+func (c *client) NewJWTSVID(ctx context.Context, entryID string, audience []string, hasCacheHit bool) (*JWTSVID, spiffeid.ID, error) {
+	timeout := rpcTimeout
+	if hasCacheHit {
+		timeout = RPCTimeoutWithCacheHit
+	}
+
+	// The timeout bounds the entire retry loop: every attempt shares this single
+	// deadline, and retries continue until it (or the caller's context) expires.
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	fetchBackoff := backoff.NewBackoff(c.clk, jwtSVIDRetryInterval)
+	for {
+		svid, err := c.fetchJWTSVID(ctx, entryID, audience)
+		if err != nil {
+			if !isRetriable(err) {
+				c.withErrorFields(err).Error("Failed to fetch JWT SVID")
+				return nil, spiffeid.ID{}, fmt.Errorf("failed to fetch JWT SVID: %w", err)
+			}
+
+			c.withErrorFields(err).Debug("Failed to fetch JWT SVID; retrying")
+			select {
+			case <-ctx.Done():
+				c.withErrorFields(err).Error("Failed to fetch JWT SVID")
+				return nil, spiffeid.ID{}, fmt.Errorf("failed to fetch JWT SVID: %w", err)
+			case <-c.clk.After(fetchBackoff.NextBackOff()):
+				continue
+			}
+		}
+
+		// A malformed response indicates a server/agent mismatch rather than a
+		// transient failure, so it is not retried.
+		switch {
+		case svid == nil:
+			return nil, spiffeid.ID{}, errors.New("JWTSVID response missing SVID")
+		case svid.IssuedAt == 0:
+			return nil, spiffeid.ID{}, errors.New("JWTSVID missing issued at")
+		case svid.ExpiresAt == 0:
+			return nil, spiffeid.ID{}, errors.New("JWTSVID missing expires at")
+		case svid.IssuedAt > svid.ExpiresAt:
+			return nil, spiffeid.ID{}, errors.New("JWTSVID issued after it has expired")
+		}
+
+		spiffeId, err := idutil.IDFromProto(svid.Id)
+		if err != nil {
+			return nil, spiffeid.ID{}, fmt.Errorf("could not parse JWT-SVID SPIFFE ID: %w", err)
+		}
+
+		return &JWTSVID{
+			Token:     svid.Token,
+			IssuedAt:  time.Unix(svid.IssuedAt, 0).UTC(),
+			ExpiresAt: time.Unix(svid.ExpiresAt, 0).UTC(),
+		}, spiffeId, nil
+	}
+}
+
+// fetchJWTSVID performs a single NewJWTSVID RPC. Any returned error is the raw
+// error from the connection or gRPC call so the caller can classify it for
+// retries.
+func (c *client) fetchJWTSVID(ctx context.Context, entryID string, audience []string) (*types.JWTSVID, error) {
+	// The rotation lock is taken per attempt (rather than around the whole retry
+	// loop) so that a retrying request does not block SVID rotation for the
+	// entire timeout window; each attempt uses whatever connection is current.
 	c.c.RotMtx.RLock()
 	defer c.c.RotMtx.RUnlock()
 
-	ctx, cancel := context.WithTimeout(ctx, rpcTimeout)
-	defer cancel()
-
-	svidClient, connection, err := c.newSVIDClient(ctx)
+	svidClient, connection, err := c.newSVIDClient()
 	if err != nil {
 		return nil, err
 	}
@@ -316,27 +400,53 @@ func (c *client) NewJWTSVID(ctx context.Context, entryID string, audience []stri
 	})
 	if err != nil {
 		c.release(connection)
-		c.withErrorFields(err).Error("Failed to fetch JWT SVID")
-		return nil, fmt.Errorf("failed to fetch JWT SVID: %w", err)
+		return nil, err
 	}
 
-	svid := resp.Svid
-	switch {
-	case svid == nil:
-		return nil, errors.New("JWTSVID response missing SVID")
-	case svid.IssuedAt == 0:
-		return nil, errors.New("JWTSVID missing issued at")
-	case svid.ExpiresAt == 0:
-		return nil, errors.New("JWTSVID missing expires at")
-	case svid.IssuedAt > svid.ExpiresAt:
-		return nil, errors.New("JWTSVID issued after it has expired")
+	return resp.Svid, nil
+}
+
+func (c *client) NewWITSVIDs(ctx context.Context, publicKeys map[string]crypto.PublicKey, signatureAlgorithm string) (map[string]*WITSVID, error) {
+	c.c.RotMtx.RLock()
+	defer c.c.RotMtx.RUnlock()
+
+	ctx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	defer cancel()
+
+	svids := make(map[string]*WITSVID)
+	var params []*svidv1.NewWITSVIDParams
+	for entryID, publicKey := range publicKeys {
+		pkixPublicKey, err := x509.MarshalPKIXPublicKey(publicKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal PKIX public key for entry %q: %w", entryID, err)
+		}
+
+		params = append(params, &svidv1.NewWITSVIDParams{
+			EntryId:          entryID,
+			PublicKey:        pkixPublicKey,
+			SigningAlgorithm: signatureAlgorithm,
+		})
 	}
 
-	return &JWTSVID{
-		Token:     svid.Token,
-		IssuedAt:  time.Unix(svid.IssuedAt, 0).UTC(),
-		ExpiresAt: time.Unix(svid.ExpiresAt, 0).UTC(),
-	}, nil
+	protoSVIDs, err := c.fetchWITSVIDs(ctx, params)
+	if err != nil {
+		return nil, err
+	}
+
+	for i, s := range protoSVIDs {
+		entryID := params[i].EntryId
+		if s == nil {
+			continue
+		}
+
+		svids[entryID] = &WITSVID{
+			Token:     s.Token,
+			IssuedAt:  time.Unix(s.IssuedAt, 0).UTC(),
+			ExpiresAt: time.Unix(s.ExpiresAt, 0).UTC(),
+		}
+	}
+
+	return svids, nil
 }
 
 // Release the underlying connection.
@@ -353,8 +463,8 @@ func (c *client) release(conn *nodeConn) {
 	}
 }
 
-func (c *client) dial(ctx context.Context) (*grpc.ClientConn, error) {
-	return DialServer(ctx, DialServerConfig{
+func (c *client) newServerGRPCClient() (*grpc.ClientConn, error) {
+	return NewServerGRPCClient(ServerClientConfig{
 		Address:     c.c.Addr,
 		TrustDomain: c.c.TrustDomain,
 		GetBundle: func() []*x509.Certificate {
@@ -371,31 +481,14 @@ func (c *client) dial(ctx context.Context) (*grpc.ClientConn, error) {
 			}
 			return agentCert
 		},
-		dialContext: c.dialContext,
+		TLSPolicy:           c.c.TLSPolicy,
+		LoadBalancingConfig: c.c.LoadBalancingConfig,
+		dialOpts:            c.dialOpts,
 	})
-}
-
-func (c *client) fetchEntries(ctx context.Context) ([]*types.Entry, error) {
-	entryClient, connection, err := c.newEntryClient(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer connection.Release()
-
-	resp, err := entryClient.GetAuthorizedEntries(ctx, &entryv1.GetAuthorizedEntriesRequest{
-		OutputMask: entryOutputMask,
-	})
-	if err != nil {
-		c.release(connection)
-		c.withErrorFields(err).Error("Failed to fetch authorized entries")
-		return nil, fmt.Errorf("failed to fetch authorized entries: %w", err)
-	}
-
-	return resp.Entries, err
 }
 
 func (c *client) syncEntries(ctx context.Context, cachedEntries map[string]*common.RegistrationEntry) (SyncEntriesStats, error) {
-	entryClient, connection, err := c.newEntryClient(ctx)
+	entryClient, connection, err := c.newEntryClient()
 	if err != nil {
 		return SyncEntriesStats{}, err
 	}
@@ -409,6 +502,27 @@ func (c *client) syncEntries(ctx context.Context, cachedEntries map[string]*comm
 	}
 
 	return stats, nil
+}
+
+func entryIsStale(entry *common.RegistrationEntry, revisionNumber, revisionCreatedAt int64) bool {
+	if entry.RevisionNumber != revisionNumber {
+		return true
+	}
+
+	// TODO: remove in SPIRE 1.14
+	if revisionCreatedAt == 0 {
+		return false
+	}
+
+	// Verify that the CreatedAt of the entries match. If they are different, they are
+	// completely different entries even if the revision number is the same.
+	// This can happen for example if an entry is deleted and recreated with the
+	// same entry id.
+	if entry.CreatedAt != revisionCreatedAt {
+		return true
+	}
+
+	return false
 }
 
 func (c *client) streamAndSyncEntries(ctx context.Context, entryClient entryv1.EntryClient, cachedEntries map[string]*common.RegistrationEntry) (stats SyncEntriesStats, err error) {
@@ -440,7 +554,7 @@ func (c *client) streamAndSyncEntries(ctx context.Context, entryClient entryv1.E
 	// on entry revisions.
 	processEntryRevisions := func(entryRevisions []*entryv1.EntryRevision) {
 		for _, entryRevision := range entryRevisions {
-			if entryRevision.Id == "" || entryRevision.RevisionNumber <= 0 {
+			if entryRevision.Id == "" || entryRevision.RevisionNumber < 0 {
 				c.c.Log.WithFields(logrus.Fields{
 					telemetry.RegistrationID: entryRevision.Id,
 					telemetry.RevisionNumber: entryRevision.RevisionNumber,
@@ -454,7 +568,7 @@ func (c *client) streamAndSyncEntries(ctx context.Context, entryClient entryv1.E
 			// If entry is either not cached or is stale, record the ID so
 			// the full entry can be requested after syncing down all
 			// entry revisions.
-			if cachedEntry, ok := cachedEntries[entryRevision.Id]; !ok || cachedEntry.RevisionNumber < entryRevision.RevisionNumber {
+			if cachedEntry, ok := cachedEntries[entryRevision.Id]; !ok || entryIsStale(cachedEntry, entryRevision.GetRevisionNumber(), entryRevision.GetCreatedAt()) {
 				needFull = append(needFull, entryRevision.Id)
 			}
 		}
@@ -482,7 +596,7 @@ func (c *client) streamAndSyncEntries(ctx context.Context, entryClient entryv1.E
 			switch {
 			case !ok:
 				stats.Missing++
-			case cachedEntry.RevisionNumber < entry.RevisionNumber:
+			case entryIsStale(cachedEntry, entry.GetRevisionNumber(), entry.GetCreatedAt()):
 				stats.Stale++
 			}
 
@@ -544,10 +658,7 @@ func (c *client) streamAndSyncEntries(ctx context.Context, entryClient entryv1.E
 	// time using the assumed page size.
 	for len(needFull) > 0 {
 		// Request up to a page full of full entries
-		n := len(needFull)
-		if n > pageSize {
-			n = pageSize
-		}
+		n := min(len(needFull), pageSize)
 		if err := stream.Send(&entryv1.SyncAuthorizedEntriesRequest{Ids: needFull[:n]}); err != nil {
 			return SyncEntriesStats{}, err
 		}
@@ -575,13 +686,13 @@ func (c *client) streamAndSyncEntries(ctx context.Context, entryClient entryv1.E
 }
 
 func (c *client) fetchBundles(ctx context.Context, federatedBundles []string) ([]*types.Bundle, error) {
-	bundleClient, connection, err := c.newBundleClient(ctx)
+	bundleClient, connection, err := c.newBundleClient()
 	if err != nil {
 		return nil, err
 	}
 	defer connection.Release()
 
-	var bundles []*types.Bundle
+	bundles := make([]*types.Bundle, 0, len(federatedBundles)+1)
 
 	// Get bundle
 	bundle, err := bundleClient.GetBundle(ctx, &bundlev1.GetBundleRequest{})
@@ -592,31 +703,69 @@ func (c *client) fetchBundles(ctx context.Context, federatedBundles []string) ([
 	}
 	bundles = append(bundles, bundle)
 
-	for _, b := range federatedBundles {
-		federatedTD, err := spiffeid.TrustDomainFromString(b)
-		if err != nil {
-			return nil, err
-		}
-		bundle, err := bundleClient.GetFederatedBundle(ctx, &bundlev1.GetFederatedBundleRequest{
-			TrustDomain: federatedTD.Name(),
+	return c.fetchFederatedBundlesConcurrently(ctx, bundleClient, federatedBundles, bundles)
+}
+
+// fetchFederatedBundlesConcurrently fetches federated bundles concurrently.
+// This is done to improve sync times when there are many federations. This should ensure that the
+// sync does not exceed rpcTimeout.
+func (c *client) fetchFederatedBundlesConcurrently(ctx context.Context, bundleClient bundlev1.BundleClient, trustDomains []string, bundles []*types.Bundle) ([]*types.Bundle, error) {
+	jobCh := make(chan string)
+	resultCh := make(chan fetchBundleResult, len(trustDomains))
+	// Start a set of worker goroutines.
+	wg := sync.WaitGroup{}
+	for range min(maxBundleWorkers, len(trustDomains)) {
+		wg.Go(func() {
+			for trustDomain := range jobCh {
+				bundle, err := c.fetchFederatedBundle(ctx, bundleClient, trustDomain)
+				resultCh <- fetchBundleResult{bundle: bundle, err: err}
+			}
 		})
-		log := c.withErrorFields(err)
-		switch status.Code(err) {
-		case codes.OK:
-			bundles = append(bundles, bundle)
-		case codes.NotFound:
-			log.WithField(telemetry.FederatedBundle, b).Warn("Federated bundle not found")
-		default:
-			log.WithField(telemetry.FederatedBundle, b).Error("Failed to fetch federated bundle")
-			return nil, fmt.Errorf("failed to fetch federated bundle: %w", err)
+	}
+	// Feed the workers.
+	for _, b := range trustDomains {
+		jobCh <- b
+	}
+	close(jobCh)
+	// Wait for completion of all jobs.
+	wg.Wait()
+	close(resultCh)
+	// Process the results.
+	for r := range resultCh {
+		if r.err != nil {
+			return nil, r.err
+		}
+		if r.bundle != nil {
+			bundles = append(bundles, r.bundle)
 		}
 	}
-
 	return bundles, nil
 }
 
+// fetchFederatedBundle fetches a single federated bundle from SPIRE server.
+func (c *client) fetchFederatedBundle(ctx context.Context, bundleClient bundlev1.BundleClient, trustDomain string) (*types.Bundle, error) {
+	federatedTD, err := spiffeid.TrustDomainFromString(trustDomain)
+	if err != nil {
+		return nil, err
+	}
+	bundle, err := bundleClient.GetFederatedBundle(ctx, &bundlev1.GetFederatedBundleRequest{
+		TrustDomain: federatedTD.Name(),
+	})
+	log := c.withErrorFields(err)
+	switch status.Code(err) {
+	case codes.OK:
+		return bundle, nil
+	case codes.NotFound:
+		log.WithField(telemetry.FederatedBundle, trustDomain).Warn("Federated bundle not found")
+		return nil, nil
+	default:
+		log.WithField(telemetry.FederatedBundle, trustDomain).Error("Failed to fetch federated bundle")
+		return nil, fmt.Errorf("failed to fetch federated bundle: %w", err)
+	}
+}
+
 func (c *client) fetchSVIDs(ctx context.Context, params []*svidv1.NewX509SVIDParams) ([]*types.X509SVID, error) {
-	svidClient, connection, err := c.newSVIDClient(ctx)
+	svidClient, connection, err := c.newSVIDClient()
 	if err != nil {
 		return nil, err
 	}
@@ -648,44 +797,100 @@ func (c *client) fetchSVIDs(ctx context.Context, params []*svidv1.NewX509SVIDPar
 	return svids, nil
 }
 
-func (c *client) newEntryClient(ctx context.Context) (entryv1.EntryClient, *nodeConn, error) {
-	conn, err := c.getOrOpenConn(ctx)
+func (c *client) fetchWITSVIDs(ctx context.Context, params []*svidv1.NewWITSVIDParams) ([]*types.WITSVID, error) {
+	svidClient, connection, err := c.newSVIDClient()
+	if err != nil {
+		return nil, err
+	}
+	defer connection.Release()
+
+	resp, err := svidClient.BatchNewWITSVID(ctx, &svidv1.BatchNewWITSVIDRequest{
+		Params: params,
+	})
+	if err != nil {
+		c.release(connection)
+		c.withErrorFields(err).Error("Failed to batch new WIT-SVID(s)")
+		return nil, fmt.Errorf("failed to batch new WIT-SVID(s): %w", err)
+	}
+
+	okStatus := int32(codes.OK)
+	var svids []*types.WITSVID
+	for i, r := range resp.Results {
+		if r.Status.Code != okStatus {
+			c.c.Log.WithFields(logrus.Fields{
+				telemetry.RegistrationID: params[i].EntryId,
+				telemetry.Status:         r.Status.Code,
+				telemetry.Error:          r.Status.Message,
+			}).Warn("Failed to mint WIT-SVID")
+			svids = append(svids, nil)
+			continue
+		}
+
+		svid := r.Svid
+		var svidErr error
+		switch {
+		case svid == nil:
+			svidErr = errors.New("WITSVID response missing SVID")
+		case svid.IssuedAt == 0:
+			svidErr = errors.New("WITSVID missing issued at")
+		case svid.ExpiresAt == 0:
+			svidErr = errors.New("WITSVID missing expires at")
+		case svid.IssuedAt > svid.ExpiresAt:
+			svidErr = errors.New("WITSVID issued after it has expired")
+		}
+		if svidErr != nil {
+			c.c.Log.WithFields(logrus.Fields{
+				telemetry.RegistrationID: params[i].EntryId,
+				logrus.ErrorKey:          svidErr.Error(),
+			}).Error("Invalid WIT-SVID")
+			svids = append(svids, nil)
+			continue
+		}
+
+		svids = append(svids, svid)
+	}
+
+	return svids, nil
+}
+
+func (c *client) newEntryClient() (entryv1.EntryClient, *nodeConn, error) {
+	conn, err := c.getOrOpenConn()
 	if err != nil {
 		return nil, nil, err
 	}
 	return entryv1.NewEntryClient(conn.Conn()), conn, nil
 }
 
-func (c *client) newBundleClient(ctx context.Context) (bundlev1.BundleClient, *nodeConn, error) {
-	conn, err := c.getOrOpenConn(ctx)
+func (c *client) newBundleClient() (bundlev1.BundleClient, *nodeConn, error) {
+	conn, err := c.getOrOpenConn()
 	if err != nil {
 		return nil, nil, err
 	}
 	return bundlev1.NewBundleClient(conn.Conn()), conn, nil
 }
 
-func (c *client) newSVIDClient(ctx context.Context) (svidv1.SVIDClient, *nodeConn, error) {
-	conn, err := c.getOrOpenConn(ctx)
+func (c *client) newSVIDClient() (svidv1.SVIDClient, *nodeConn, error) {
+	conn, err := c.getOrOpenConn()
 	if err != nil {
 		return nil, nil, err
 	}
 	return svidv1.NewSVIDClient(conn.Conn()), conn, nil
 }
 
-func (c *client) newAgentClient(ctx context.Context) (agentv1.AgentClient, *nodeConn, error) {
-	conn, err := c.getOrOpenConn(ctx)
+func (c *client) newAgentClient() (agentv1.AgentClient, *nodeConn, error) {
+	conn, err := c.getOrOpenConn()
 	if err != nil {
 		return nil, nil, err
 	}
 	return agentv1.NewAgentClient(conn.Conn()), conn, nil
 }
 
-func (c *client) getOrOpenConn(ctx context.Context) (*nodeConn, error) {
+func (c *client) getOrOpenConn() (*nodeConn, error) {
 	c.m.Lock()
 	defer c.m.Unlock()
 
 	if c.connections == nil {
-		conn, err := c.dial(ctx)
+		conn, err := c.newServerGRPCClient()
 		if err != nil {
 			return nil, err
 		}
@@ -725,4 +930,13 @@ func (c *client) withErrorFields(err error) logrus.FieldLogger {
 	}
 
 	return logger
+}
+
+func isRetriable(err error) bool {
+	switch status.Code(err) {
+	case codes.Unknown, codes.Canceled, codes.DeadlineExceeded, codes.InvalidArgument, codes.Unimplemented:
+		return false
+	default:
+		return true
+	}
 }

@@ -7,14 +7,18 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/sirupsen/logrus"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	entryv1 "github.com/spiffe/spire-api-sdk/proto/spire/api/server/entry/v1"
 	"github.com/spiffe/spire-api-sdk/proto/spire/api/types"
+	commonapi "github.com/spiffe/spire/pkg/common/api"
 	"github.com/spiffe/spire/pkg/common/telemetry"
 	"github.com/spiffe/spire/pkg/server/api"
 	"github.com/spiffe/spire/pkg/server/api/rpccontext"
+	"github.com/spiffe/spire/pkg/server/ca"
+	"github.com/spiffe/spire/pkg/server/credtemplate"
 	"github.com/spiffe/spire/pkg/server/datastore"
 	"github.com/spiffe/spire/proto/spire/common"
 	"google.golang.org/grpc"
@@ -30,6 +34,7 @@ type Config struct {
 	EntryFetcher  api.AuthorizedEntryFetcher
 	DataStore     datastore.DataStore
 	EntryPageSize int
+	CATTL         time.Duration
 }
 
 // Service defines the v1 entry service.
@@ -40,10 +45,14 @@ type Service struct {
 	ds            datastore.DataStore
 	ef            api.AuthorizedEntryFetcher
 	entryPageSize int
+	caTTL         time.Duration
 }
 
 // New creates a new v1 entry service.
 func New(config Config) *Service {
+	if config.CATTL == 0 {
+		config.CATTL = credtemplate.DefaultX509CATTL
+	}
 	if config.EntryPageSize == 0 {
 		config.EntryPageSize = defaultEntryPageSize
 	}
@@ -52,6 +61,7 @@ func New(config Config) *Service {
 		ds:            config.DataStore,
 		ef:            config.EntryFetcher,
 		entryPageSize: config.EntryPageSize,
+		caTTL:         config.CATTL,
 	}
 }
 
@@ -61,11 +71,73 @@ func RegisterService(s grpc.ServiceRegistrar, service *Service) {
 }
 
 // CountEntries returns the total number of entries.
-func (s *Service) CountEntries(ctx context.Context, _ *entryv1.CountEntriesRequest) (*entryv1.CountEntriesResponse, error) {
-	count, err := s.ds.CountRegistrationEntries(ctx)
+func (s *Service) CountEntries(ctx context.Context, req *entryv1.CountEntriesRequest) (*entryv1.CountEntriesResponse, error) {
+	log := rpccontext.Logger(ctx)
+	countReq := &datastore.CountRegistrationEntriesRequest{}
+
+	if req.Filter != nil {
+		rpccontext.AddRPCAuditFields(ctx, fieldsFromCountEntryFilter(ctx, s.td, req.Filter))
+		if req.Filter.ByHint != nil {
+			countReq.ByHint = req.Filter.ByHint.GetValue()
+		}
+
+		if req.Filter.ByParentId != nil {
+			parentID, err := api.TrustDomainMemberIDFromProto(ctx, s.td, req.Filter.ByParentId)
+			if err != nil {
+				return nil, commonapi.MakeErr(log, codes.InvalidArgument, "malformed parent ID filter", err)
+			}
+			countReq.ByParentID = parentID.String()
+		}
+
+		if req.Filter.BySpiffeId != nil {
+			spiffeID, err := api.TrustDomainWorkloadIDFromProto(ctx, s.td, req.Filter.BySpiffeId)
+			if err != nil {
+				return nil, commonapi.MakeErr(log, codes.InvalidArgument, "malformed SPIFFE ID filter", err)
+			}
+			countReq.BySpiffeID = spiffeID.String()
+		}
+
+		if req.Filter.BySelectors != nil {
+			dsSelectors, err := api.SelectorsFromProto(req.Filter.BySelectors.Selectors)
+			if err != nil {
+				return nil, commonapi.MakeErr(log, codes.InvalidArgument, "malformed selectors filter", err)
+			}
+			if len(dsSelectors) == 0 {
+				return nil, commonapi.MakeErr(log, codes.InvalidArgument, "malformed selectors filter", errors.New("empty selector set"))
+			}
+			countReq.BySelectors = &datastore.BySelectors{
+				Match:     datastore.MatchBehavior(req.Filter.BySelectors.Match),
+				Selectors: dsSelectors,
+			}
+		}
+
+		if req.Filter.ByFederatesWith != nil {
+			trustDomains := make([]string, 0, len(req.Filter.ByFederatesWith.TrustDomains))
+			for _, tdStr := range req.Filter.ByFederatesWith.TrustDomains {
+				td, err := spiffeid.TrustDomainFromString(tdStr)
+				if err != nil {
+					return nil, commonapi.MakeErr(log, codes.InvalidArgument, "malformed federates with filter", err)
+				}
+				trustDomains = append(trustDomains, td.IDString())
+			}
+			if len(trustDomains) == 0 {
+				return nil, commonapi.MakeErr(log, codes.InvalidArgument, "malformed federates with filter", errors.New("empty trust domain set"))
+			}
+			countReq.ByFederatesWith = &datastore.ByFederatesWith{
+				Match:        datastore.MatchBehavior(req.Filter.ByFederatesWith.Match),
+				TrustDomains: trustDomains,
+			}
+		}
+
+		if req.Filter.ByDownstream != nil {
+			countReq.ByDownstream = &req.Filter.ByDownstream.Value
+		}
+	}
+
+	count, err := s.ds.CountRegistrationEntries(ctx, countReq)
 	if err != nil {
 		log := rpccontext.Logger(ctx)
-		return nil, api.MakeErr(log, codes.Internal, "failed to count entries", err)
+		return nil, commonapi.MakeErr(log, codes.Internal, "failed to count entries", err)
 	}
 	rpccontext.AuditRPC(ctx)
 
@@ -95,7 +167,7 @@ func (s *Service) ListEntries(ctx context.Context, req *entryv1.ListEntriesReque
 		if req.Filter.ByParentId != nil {
 			parentID, err := api.TrustDomainMemberIDFromProto(ctx, s.td, req.Filter.ByParentId)
 			if err != nil {
-				return nil, api.MakeErr(log, codes.InvalidArgument, "malformed parent ID filter", err)
+				return nil, commonapi.MakeErr(log, codes.InvalidArgument, "malformed parent ID filter", err)
 			}
 			listReq.ByParentID = parentID.String()
 		}
@@ -103,7 +175,7 @@ func (s *Service) ListEntries(ctx context.Context, req *entryv1.ListEntriesReque
 		if req.Filter.BySpiffeId != nil {
 			spiffeID, err := api.TrustDomainWorkloadIDFromProto(ctx, s.td, req.Filter.BySpiffeId)
 			if err != nil {
-				return nil, api.MakeErr(log, codes.InvalidArgument, "malformed SPIFFE ID filter", err)
+				return nil, commonapi.MakeErr(log, codes.InvalidArgument, "malformed SPIFFE ID filter", err)
 			}
 			listReq.BySpiffeID = spiffeID.String()
 		}
@@ -111,10 +183,10 @@ func (s *Service) ListEntries(ctx context.Context, req *entryv1.ListEntriesReque
 		if req.Filter.BySelectors != nil {
 			dsSelectors, err := api.SelectorsFromProto(req.Filter.BySelectors.Selectors)
 			if err != nil {
-				return nil, api.MakeErr(log, codes.InvalidArgument, "malformed selectors filter", err)
+				return nil, commonapi.MakeErr(log, codes.InvalidArgument, "malformed selectors filter", err)
 			}
 			if len(dsSelectors) == 0 {
-				return nil, api.MakeErr(log, codes.InvalidArgument, "malformed selectors filter", errors.New("empty selector set"))
+				return nil, commonapi.MakeErr(log, codes.InvalidArgument, "malformed selectors filter", errors.New("empty selector set"))
 			}
 			listReq.BySelectors = &datastore.BySelectors{
 				Match:     datastore.MatchBehavior(req.Filter.BySelectors.Match),
@@ -127,23 +199,27 @@ func (s *Service) ListEntries(ctx context.Context, req *entryv1.ListEntriesReque
 			for _, tdStr := range req.Filter.ByFederatesWith.TrustDomains {
 				td, err := spiffeid.TrustDomainFromString(tdStr)
 				if err != nil {
-					return nil, api.MakeErr(log, codes.InvalidArgument, "malformed federates with filter", err)
+					return nil, commonapi.MakeErr(log, codes.InvalidArgument, "malformed federates with filter", err)
 				}
 				trustDomains = append(trustDomains, td.IDString())
 			}
 			if len(trustDomains) == 0 {
-				return nil, api.MakeErr(log, codes.InvalidArgument, "malformed federates with filter", errors.New("empty trust domain set"))
+				return nil, commonapi.MakeErr(log, codes.InvalidArgument, "malformed federates with filter", errors.New("empty trust domain set"))
 			}
 			listReq.ByFederatesWith = &datastore.ByFederatesWith{
 				Match:        datastore.MatchBehavior(req.Filter.ByFederatesWith.Match),
 				TrustDomains: trustDomains,
 			}
 		}
+
+		if req.Filter.ByDownstream != nil {
+			listReq.ByDownstream = &req.Filter.ByDownstream.Value
+		}
 	}
 
 	dsResp, err := s.ds.ListRegistrationEntries(ctx, listReq)
 	if err != nil {
-		return nil, api.MakeErr(log, codes.Internal, "failed to list entries", err)
+		return nil, commonapi.MakeErr(log, codes.Internal, "failed to list entries", err)
 	}
 
 	resp := &entryv1.ListEntriesResponse{}
@@ -170,22 +246,23 @@ func (s *Service) GetEntry(ctx context.Context, req *entryv1.GetEntryRequest) (*
 	log := rpccontext.Logger(ctx)
 
 	if req.Id == "" {
-		return nil, api.MakeErr(log, codes.InvalidArgument, "missing ID", nil)
+		return nil, commonapi.MakeErr(log, codes.InvalidArgument, "missing ID", nil)
 	}
 	rpccontext.AddRPCAuditFields(ctx, logrus.Fields{telemetry.RegistrationID: req.Id})
 	log = log.WithField(telemetry.RegistrationID, req.Id)
-	registrationEntry, err := s.ds.FetchRegistrationEntry(ctx, req.Id)
+	registrationEntries, err := s.ds.FetchRegistrationEntries(ctx, []string{req.Id})
 	if err != nil {
-		return nil, api.MakeErr(log, codes.Internal, "failed to fetch entry", err)
+		return nil, commonapi.MakeErr(log, codes.Internal, "failed to fetch entry", err)
 	}
 
+	registrationEntry := registrationEntries[req.Id]
 	if registrationEntry == nil {
-		return nil, api.MakeErr(log, codes.NotFound, "entry not found", nil)
+		return nil, commonapi.MakeErr(log, codes.NotFound, "entry not found", nil)
 	}
 
 	entry, err := api.RegistrationEntryToProto(registrationEntry)
 	if err != nil {
-		return nil, api.MakeErr(log, codes.Internal, "failed to convert entry", err)
+		return nil, commonapi.MakeErr(log, codes.Internal, "failed to convert entry", err)
 	}
 	applyMask(entry, req.OutputMask)
 	rpccontext.AuditRPC(ctx)
@@ -215,30 +292,35 @@ func (s *Service) createEntry(ctx context.Context, e *types.Entry, outputMask *t
 	cEntry, err := api.ProtoToRegistrationEntry(ctx, s.td, e)
 	if err != nil {
 		return &entryv1.BatchCreateEntryResponse_Result{
-			Status: api.MakeStatus(log, codes.InvalidArgument, "failed to convert entry", err),
+			Status: commonapi.MakeStatus(log, codes.InvalidArgument, "failed to convert entry", err),
 		}
 	}
 
 	log = log.WithField(telemetry.SPIFFEID, cEntry.SpiffeId)
 
-	resultStatus := api.OK()
+	resultStatus := commonapi.OK()
 	regEntry, existing, err := s.ds.CreateOrReturnRegistrationEntry(ctx, cEntry)
 	switch {
 	case err != nil:
+		statusCode := status.Code(err)
+		if statusCode == codes.Unknown {
+			statusCode = codes.Internal
+		}
 		return &entryv1.BatchCreateEntryResponse_Result{
-			Status: api.MakeStatus(log, codes.Internal, "failed to create entry", err),
+			Status: commonapi.MakeStatus(log, statusCode, "failed to create entry", err),
 		}
 	case existing:
-		resultStatus = api.CreateStatus(codes.AlreadyExists, "similar entry already exists")
+		resultStatus = commonapi.CreateStatus(codes.AlreadyExists, "similar entry already exists")
 	}
 
 	tEntry, err := api.RegistrationEntryToProto(regEntry)
 	if err != nil {
 		return &entryv1.BatchCreateEntryResponse_Result{
-			Status: api.MakeStatus(log, codes.Internal, "failed to convert entry", err),
+			Status: commonapi.MakeStatus(log, codes.Internal, "failed to convert entry", err),
 		}
 	}
 
+	s.warnOnEntryTTLs(log, regEntry)
 	applyMask(tEntry, outputMask)
 
 	return &entryv1.BatchCreateEntryResponse_Result{
@@ -286,7 +368,7 @@ func (s *Service) deleteEntry(ctx context.Context, id string) *entryv1.BatchDele
 	if id == "" {
 		return &entryv1.BatchDeleteEntryResponse_Result{
 			Id:     id,
-			Status: api.MakeStatus(log, codes.InvalidArgument, "missing entry ID", nil),
+			Status: commonapi.MakeStatus(log, codes.InvalidArgument, "missing entry ID", nil),
 		}
 	}
 
@@ -297,17 +379,17 @@ func (s *Service) deleteEntry(ctx context.Context, id string) *entryv1.BatchDele
 	case codes.OK:
 		return &entryv1.BatchDeleteEntryResponse_Result{
 			Id:     id,
-			Status: api.OK(),
+			Status: commonapi.OK(),
 		}
 	case codes.NotFound:
 		return &entryv1.BatchDeleteEntryResponse_Result{
 			Id:     id,
-			Status: api.MakeStatus(log, codes.NotFound, "entry not found", nil),
+			Status: commonapi.MakeStatus(log, codes.NotFound, "entry not found", nil),
 		}
 	default:
 		return &entryv1.BatchDeleteEntryResponse_Result{
 			Id:     id,
-			Status: api.MakeStatus(log, codes.Internal, "failed to delete entry", err),
+			Status: commonapi.MakeStatus(log, codes.Internal, "failed to delete entry", err),
 		}
 	}
 }
@@ -320,14 +402,13 @@ func (s *Service) GetAuthorizedEntries(ctx context.Context, req *entryv1.GetAuth
 	if err != nil {
 		return nil, err
 	}
-	for i, entry := range entries {
-		applyMask(entry, req.OutputMask)
-		entries[i] = entry
+
+	resp := &entryv1.GetAuthorizedEntriesResponse{}
+
+	for _, entry := range entries {
+		resp.Entries = append(resp.Entries, entry.Clone(req.OutputMask))
 	}
 
-	resp := &entryv1.GetAuthorizedEntriesResponse{
-		Entries: entries,
-	}
 	rpccontext.AuditRPC(ctx)
 
 	return resp, nil
@@ -353,7 +434,7 @@ func (s *Service) SyncAuthorizedEntries(stream entryv1.Entry_SyncAuthorizedEntri
 	return SyncAuthorizedEntries(stream, entries, s.entryPageSize)
 }
 
-func SyncAuthorizedEntries(stream entryv1.Entry_SyncAuthorizedEntriesServer, entries []*types.Entry, entryPageSize int) (err error) {
+func SyncAuthorizedEntries(stream entryv1.Entry_SyncAuthorizedEntriesServer, entries []api.ReadOnlyEntry, entryPageSize int) (err error) {
 	// Receive the initial request with the output mask.
 	req, err := stream.Recv()
 	if err != nil {
@@ -376,18 +457,17 @@ func SyncAuthorizedEntries(stream entryv1.Entry_SyncAuthorizedEntriesServer, ent
 
 	// Apply output mask to entries. The output mask field will be
 	// intentionally ignored on subsequent requests.
-	for i, entry := range entries {
-		applyMask(entry, req.OutputMask)
-		entries[i] = entry
-	}
+	initialOutputMask := req.OutputMask
 
 	// If the number of entries is less than or equal to the entry page size,
 	// then just send the full list back. Otherwise, we'll send a sparse list
 	// and then stream back full entries as requested.
 	if len(entries) <= entryPageSize {
-		return stream.Send(&entryv1.SyncAuthorizedEntriesResponse{
-			Entries: entries,
-		})
+		resp := &entryv1.SyncAuthorizedEntriesResponse{}
+		for _, entry := range entries {
+			resp.Entries = append(resp.Entries, entry.Clone(initialOutputMask))
+		}
+		return stream.Send(resp)
 	}
 
 	// Prepopulate the entry page used in the response with empty entry structs.
@@ -404,8 +484,9 @@ func SyncAuthorizedEntries(stream entryv1.Entry_SyncAuthorizedEntriesServer, ent
 			more = true
 		}
 		for j, entry := range entries[i : i+n] {
-			entryRevisions[j].Id = entry.Id
-			entryRevisions[j].RevisionNumber = entry.RevisionNumber
+			entryRevisions[j].Id = entry.GetId()
+			entryRevisions[j].RevisionNumber = entry.GetRevisionNumber()
+			entryRevisions[j].CreatedAt = entry.GetCreatedAt()
 		}
 
 		if err := stream.Send(&entryv1.SyncAuthorizedEntriesResponse{
@@ -445,7 +526,7 @@ func SyncAuthorizedEntries(stream entryv1.Entry_SyncAuthorizedEntriesServer, ent
 		}
 
 		// Sort the requested IDs for efficient lookups into the sorted entry
-		// list. Agents SHOULD already send the list sorted but we need to
+		// list. Agents SHOULD already send the list sorted, but we need to
 		// make sure they are sorted for correctness of the search loop below.
 		// The go stdlib sorting algorithm performs well on pre-sorted data.
 		slices.Sort(req.Ids)
@@ -458,7 +539,7 @@ func SyncAuthorizedEntries(stream entryv1.Entry_SyncAuthorizedEntriesServer, ent
 		entriesToSearch := entries
 		for _, id := range req.Ids {
 			i, found := sort.Find(len(entriesToSearch), func(i int) int {
-				return strings.Compare(id, entriesToSearch[i].Id)
+				return strings.Compare(id, entriesToSearch[i].GetId())
 			})
 			if found {
 				if len(resp.Entries) == entryPageSize {
@@ -471,7 +552,7 @@ func SyncAuthorizedEntries(stream entryv1.Entry_SyncAuthorizedEntriesServer, ent
 					}
 					resp.Entries = resp.Entries[:0]
 				}
-				resp.Entries = append(resp.Entries, entriesToSearch[i])
+				resp.Entries = append(resp.Entries, entriesToSearch[i].Clone(initialOutputMask))
 			}
 			entriesToSearch = entriesToSearch[i:]
 			if len(entriesToSearch) == 0 {
@@ -488,15 +569,15 @@ func SyncAuthorizedEntries(stream entryv1.Entry_SyncAuthorizedEntriesServer, ent
 }
 
 // fetchEntries fetches authorized entries using caller ID from context
-func (s *Service) fetchEntries(ctx context.Context, log logrus.FieldLogger) ([]*types.Entry, error) {
+func (s *Service) fetchEntries(ctx context.Context, log logrus.FieldLogger) ([]api.ReadOnlyEntry, error) {
 	callerID, ok := rpccontext.CallerID(ctx)
 	if !ok {
-		return nil, api.MakeErr(log, codes.Internal, "caller ID missing from request context", nil)
+		return nil, commonapi.MakeErr(log, codes.Internal, "caller ID missing from request context", nil)
 	}
 
 	entries, err := s.ef.FetchAuthorizedEntries(ctx, callerID)
 	if err != nil {
-		return nil, api.MakeErr(log, codes.Internal, "failed to fetch entries", err)
+		return nil, commonapi.MakeErr(log, codes.Internal, "failed to fetch entries", err)
 	}
 
 	return entries, nil
@@ -555,8 +636,16 @@ func applyMask(e *types.Entry, mask *types.EntryMask) {
 		e.JwtSvidTtl = 0
 	}
 
+	if !mask.WitSvidTtl {
+		e.WitSvidTtl = 0
+	}
+
 	if !mask.Hint {
 		e.Hint = ""
+	}
+
+	if !mask.AdditionalAttributes {
+		e.AdditionalAttributes = nil
 	}
 
 	if !mask.CreatedAt {
@@ -571,47 +660,64 @@ func (s *Service) updateEntry(ctx context.Context, e *types.Entry, inputMask *ty
 	convEntry, err := api.ProtoToRegistrationEntryWithMask(ctx, s.td, e, inputMask)
 	if err != nil {
 		return &entryv1.BatchUpdateEntryResponse_Result{
-			Status: api.MakeStatus(log, codes.InvalidArgument, "failed to convert entry", err),
+			Status: commonapi.MakeStatus(log, codes.InvalidArgument, "failed to convert entry", err),
 		}
 	}
 
 	var mask *common.RegistrationEntryMask
 	if inputMask != nil {
 		mask = &common.RegistrationEntryMask{
-			SpiffeId:      inputMask.SpiffeId,
-			ParentId:      inputMask.ParentId,
-			FederatesWith: inputMask.FederatesWith,
-			Admin:         inputMask.Admin,
-			Downstream:    inputMask.Downstream,
-			EntryExpiry:   inputMask.ExpiresAt,
-			DnsNames:      inputMask.DnsNames,
-			Selectors:     inputMask.Selectors,
-			StoreSvid:     inputMask.StoreSvid,
-			X509SvidTtl:   inputMask.X509SvidTtl,
-			JwtSvidTtl:    inputMask.JwtSvidTtl,
-			Hint:          inputMask.Hint,
+			SpiffeId:             inputMask.SpiffeId,
+			ParentId:             inputMask.ParentId,
+			FederatesWith:        inputMask.FederatesWith,
+			Admin:                inputMask.Admin,
+			Downstream:           inputMask.Downstream,
+			EntryExpiry:          inputMask.ExpiresAt,
+			DnsNames:             inputMask.DnsNames,
+			Selectors:            inputMask.Selectors,
+			StoreSvid:            inputMask.StoreSvid,
+			X509SvidTtl:          inputMask.X509SvidTtl,
+			JwtSvidTtl:           inputMask.JwtSvidTtl,
+			WitSvidTtl:           inputMask.WitSvidTtl,
+			Hint:                 inputMask.Hint,
+			AdditionalAttributes: inputMask.AdditionalAttributes,
 		}
 	}
 	dsEntry, err := s.ds.UpdateRegistrationEntry(ctx, convEntry, mask)
 	if err != nil {
+		statusCode := status.Code(err)
+		if statusCode == codes.Unknown {
+			statusCode = codes.Internal
+		}
 		return &entryv1.BatchUpdateEntryResponse_Result{
-			Status: api.MakeStatus(log, codes.Internal, "failed to update entry", err),
+			Status: commonapi.MakeStatus(log, statusCode, "failed to update entry", err),
 		}
 	}
 
 	tEntry, err := api.RegistrationEntryToProto(dsEntry)
 	if err != nil {
 		return &entryv1.BatchUpdateEntryResponse_Result{
-			Status: api.MakeStatus(log, codes.Internal, "failed to convert entry in updateEntry", err),
+			Status: commonapi.MakeStatus(log, codes.Internal, "failed to convert entry in updateEntry", err),
 		}
 	}
 
+	s.warnOnEntryTTLs(log, dsEntry)
 	applyMask(tEntry, outputMask)
 
 	return &entryv1.BatchUpdateEntryResponse_Result{
-		Status: api.OK(),
+		Status: commonapi.OK(),
 		Entry:  tEntry,
 	}
+}
+
+func (s *Service) warnOnEntryTTLs(log logrus.FieldLogger, e *common.RegistrationEntry) {
+	log = log.WithFields(logrus.Fields{
+		telemetry.RegistrationID: e.EntryId,
+		telemetry.SPIFFEID:       e.SpiffeId,
+	})
+	ca.WarnOnIncompatibleTTL(log, s.caTTL, time.Duration(e.X509SvidTtl)*time.Second, telemetry.X509SVIDTTL)
+	ca.WarnOnIncompatibleTTL(log, s.caTTL, time.Duration(e.JwtSvidTtl)*time.Second, telemetry.JWTSVIDTTL)
+	ca.WarnOnIncompatibleTTL(log, s.caTTL, time.Duration(e.WitSvidTtl)*time.Second, telemetry.WITSVIDTTL)
 }
 
 func fieldsFromEntryProto(ctx context.Context, proto *types.Entry, inputMask *types.EntryMask) logrus.Fields {
@@ -651,6 +757,10 @@ func fieldsFromEntryProto(ctx context.Context, proto *types.Entry, inputMask *ty
 
 	if inputMask == nil || inputMask.JwtSvidTtl {
 		fields[telemetry.JWTSVIDTTL] = proto.JwtSvidTtl
+	}
+
+	if inputMask == nil || inputMask.WitSvidTtl {
+		fields[telemetry.WITSVIDTTL] = proto.WitSvidTtl
 	}
 
 	if inputMask == nil || inputMask.FederatesWith {
@@ -725,11 +835,51 @@ func fieldsFromListEntryFilter(ctx context.Context, td spiffeid.TrustDomain, fil
 		fields[telemetry.FederatesWith] = strings.Join(filter.ByFederatesWith.TrustDomains, ",")
 	}
 
+	if filter.ByDownstream != nil {
+		fields[telemetry.Downstream] = &filter.ByDownstream.Value
+	}
+
 	return fields
 }
 
-func sortEntriesByID(entries []*types.Entry) {
+func fieldsFromCountEntryFilter(ctx context.Context, td spiffeid.TrustDomain, filter *entryv1.CountEntriesRequest_Filter) logrus.Fields {
+	fields := logrus.Fields{}
+
+	if filter.ByHint != nil {
+		fields[telemetry.Hint] = filter.ByHint.Value
+	}
+
+	if filter.ByParentId != nil {
+		if parentID, err := api.TrustDomainMemberIDFromProto(ctx, td, filter.ByParentId); err == nil {
+			fields[telemetry.ParentID] = parentID.String()
+		}
+	}
+
+	if filter.BySpiffeId != nil {
+		if id, err := api.TrustDomainWorkloadIDFromProto(ctx, td, filter.BySpiffeId); err == nil {
+			fields[telemetry.SPIFFEID] = id.String()
+		}
+	}
+
+	if filter.BySelectors != nil {
+		fields[telemetry.BySelectorMatch] = filter.BySelectors.Match.String()
+		fields[telemetry.BySelectors] = api.SelectorFieldFromProto(filter.BySelectors.Selectors)
+	}
+
+	if filter.ByFederatesWith != nil {
+		fields[telemetry.FederatesWithMatch] = filter.ByFederatesWith.Match.String()
+		fields[telemetry.FederatesWith] = strings.Join(filter.ByFederatesWith.TrustDomains, ",")
+	}
+
+	if filter.ByDownstream != nil {
+		fields[telemetry.Downstream] = &filter.ByDownstream.Value
+	}
+
+	return fields
+}
+
+func sortEntriesByID(entries []api.ReadOnlyEntry) {
 	sort.Slice(entries, func(a, b int) bool {
-		return entries[a].Id < entries[b].Id
+		return entries[a].GetId() < entries[b].GetId()
 	})
 }

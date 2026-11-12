@@ -5,6 +5,7 @@ import (
 	"crypto"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"math/big"
@@ -12,9 +13,12 @@ import (
 	"time"
 
 	"github.com/andres-erbsen/clock"
-	"github.com/go-jose/go-jose/v3/jwt"
+	"github.com/go-jose/go-jose/v4"
+	"github.com/go-jose/go-jose/v4/jwt"
+	"github.com/gofrs/uuid/v5"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/spire/pkg/common/idutil"
+	"github.com/spiffe/spire/pkg/common/tlspolicy"
 	"github.com/spiffe/spire/pkg/common/x509util"
 	"github.com/spiffe/spire/pkg/server/api"
 	"github.com/spiffe/spire/pkg/server/plugin/credentialcomposer"
@@ -32,6 +36,10 @@ const (
 	// DefaultJWTSVIDTTL is the TTL given to JWT SVIDs if a different TTL is
 	// not provided in the signing request.
 	DefaultJWTSVIDTTL = time.Minute * 5
+
+	// DefaultWITSVIDTTL is the TTL given to WIT-SVIDs if a different TTL is
+	// not provided in the signing request.
+	DefaultWITSVIDTTL = time.Hour
 
 	// NotBeforeCushion is how much of a cushion to subtract from the current
 	// time when determining the notBefore field of certificates to account
@@ -66,29 +74,33 @@ type UpstreamSignedX509CAParams struct {
 }
 
 type DownstreamX509CAParams struct {
-	ParentChain []*x509.Certificate
-	PublicKey   crypto.PublicKey
-	TTL         time.Duration
+	ParentChain   []*x509.Certificate
+	PublicKey     crypto.PublicKey
+	TTL           time.Duration
+	ExpirationCap time.Time
 }
 
 type ServerX509SVIDParams struct {
-	ParentChain []*x509.Certificate
-	PublicKey   crypto.PublicKey
+	ParentChain   []*x509.Certificate
+	PublicKey     crypto.PublicKey
+	ExpirationCap time.Time
 }
 
 type AgentX509SVIDParams struct {
-	ParentChain []*x509.Certificate
-	PublicKey   crypto.PublicKey
-	SPIFFEID    spiffeid.ID
+	ParentChain   []*x509.Certificate
+	PublicKey     crypto.PublicKey
+	SPIFFEID      spiffeid.ID
+	ExpirationCap time.Time
 }
 
 type WorkloadX509SVIDParams struct {
-	ParentChain []*x509.Certificate
-	PublicKey   crypto.PublicKey
-	SPIFFEID    spiffeid.ID
-	DNSNames    []string
-	TTL         time.Duration
-	Subject     pkix.Name
+	ParentChain   []*x509.Certificate
+	PublicKey     crypto.PublicKey
+	SPIFFEID      spiffeid.ID
+	DNSNames      []string
+	TTL           time.Duration
+	Subject       pkix.Name
+	ExpirationCap time.Time
 }
 
 type WorkloadJWTSVIDParams struct {
@@ -96,21 +108,33 @@ type WorkloadJWTSVIDParams struct {
 	Audience      []string
 	TTL           time.Duration
 	ExpirationCap time.Time
+	// IncludeJTI, when true, causes the issued JWT-SVID to include a unique "jti"
+	// (JWT ID) claim, making each token individually auditable.
+	IncludeJTI bool
+}
+
+type WorkloadWITSVIDParams struct {
+	SPIFFEID      spiffeid.ID
+	PublicKey     jose.JSONWebKey
+	TTL           time.Duration
+	ExpirationCap time.Time
 }
 
 type Config struct {
-	TrustDomain            spiffeid.TrustDomain
-	Clock                  clock.Clock
-	X509CASubject          pkix.Name
-	X509CATTL              time.Duration
-	X509SVIDSubject        pkix.Name
-	X509SVIDTTL            time.Duration
-	JWTSVIDTTL             time.Duration
-	JWTIssuer              string
-	AgentSVIDTTL           time.Duration
-	CredentialComposers    []credentialcomposer.CredentialComposer
-	NewSerialNumber        func() (*big.Int, error)
-	ExcludeSNFromCASubject bool
+	TrustDomain         spiffeid.TrustDomain
+	Clock               clock.Clock
+	X509CASubject       pkix.Name
+	X509CATTL           time.Duration
+	X509SVIDSubject     pkix.Name
+	X509SVIDTTL         time.Duration
+	JWTSVIDTTL          time.Duration
+	JWTIssuer           string
+	WITSVIDTTL          time.Duration
+	WITIssuer           string
+	AgentSVIDTTL        time.Duration
+	CredentialComposers []credentialcomposer.CredentialComposer
+	NewSerialNumber     func() (*big.Int, error)
+	TLSPolicy           tlspolicy.Policy
 }
 
 type Builder struct {
@@ -142,6 +166,9 @@ func NewBuilder(config Config) (*Builder, error) {
 	if config.JWTSVIDTTL == 0 {
 		config.JWTSVIDTTL = DefaultJWTSVIDTTL
 	}
+	if config.WITSVIDTTL == 0 {
+		config.WITSVIDTTL = DefaultWITSVIDTTL
+	}
 	if config.AgentSVIDTTL == 0 {
 		// config.X509SVIDTTL should be initialized by the code above and
 		// therefore safe to use to initialize the AgentSVIDTTL.
@@ -169,7 +196,7 @@ func (b *Builder) Config() Config {
 }
 
 func (b *Builder) BuildSelfSignedX509CATemplate(ctx context.Context, params SelfSignedX509CAParams) (*x509.Certificate, error) {
-	tmpl, err := b.buildX509CATemplate(params.PublicKey, nil, 0)
+	tmpl, err := b.buildX509CATemplate(params.PublicKey, nil, 0, time.Time{})
 	if err != nil {
 		return nil, err
 	}
@@ -186,7 +213,7 @@ func (b *Builder) BuildSelfSignedX509CATemplate(ctx context.Context, params Self
 }
 
 func (b *Builder) BuildUpstreamSignedX509CACSR(ctx context.Context, params UpstreamSignedX509CAParams) (*x509.CertificateRequest, error) {
-	tmpl, err := b.buildX509CATemplate(params.PublicKey, nil, 0)
+	tmpl, err := b.buildX509CATemplate(params.PublicKey, nil, 0, time.Time{})
 	if err != nil {
 		return nil, err
 	}
@@ -200,7 +227,7 @@ func (b *Builder) BuildUpstreamSignedX509CACSR(ctx context.Context, params Upstr
 	}
 
 	// Create the CertificateRequest from the Certificate template. The
-	// PolicyIdentifiers field is ignored since that can be applied by the
+	// Policies field is ignored since that can be applied by the
 	// upstream signer and isn't a part of the native CertificateRequest type.
 	// TODO: maybe revisit this if needed and embed the policy identifiers in
 	// the extra extensions.
@@ -217,16 +244,12 @@ func (b *Builder) BuildDownstreamX509CATemplate(ctx context.Context, params Down
 		return nil, errors.New("parent chain required to build downstream X509 CA template")
 	}
 
-	tmpl, err := b.buildX509CATemplate(params.PublicKey, params.ParentChain, params.TTL)
+	tmpl, err := b.buildX509CATemplate(params.PublicKey, params.ParentChain, params.TTL, params.ExpirationCap)
 	if err != nil {
 		return nil, err
 	}
 	tmpl.Subject = params.ParentChain[0].Subject
 	tmpl.Subject.OrganizationalUnit = []string{fmt.Sprintf("DOWNSTREAM-%d", len(params.ParentChain))}
-
-	// It's a bit gross, but SPIRE has historically signed downstream X509CA's with the X509-SVID ttl, so
-	// let's override the NotBefore/NotAfter fields set by buildX509CATemplate.
-	tmpl.NotBefore, tmpl.NotAfter = b.computeX509SVIDLifetime(params.ParentChain, params.TTL)
 
 	for _, cc := range b.config.CredentialComposers {
 		attributes, err := cc.ComposeServerX509CA(ctx, x509CAAttributesFromTemplate(tmpl))
@@ -240,7 +263,7 @@ func (b *Builder) BuildDownstreamX509CATemplate(ctx context.Context, params Down
 }
 
 func (b *Builder) BuildServerX509SVIDTemplate(ctx context.Context, params ServerX509SVIDParams) (*x509.Certificate, error) {
-	tmpl, err := b.buildX509SVIDTemplate(b.serverID, params.PublicKey, params.ParentChain, pkix.Name{}, 0)
+	tmpl, err := b.buildX509SVIDTemplate(b.serverID, params.PublicKey, params.ParentChain, pkix.Name{}, 0, params.ExpirationCap)
 	if err != nil {
 		return nil, err
 	}
@@ -257,7 +280,7 @@ func (b *Builder) BuildServerX509SVIDTemplate(ctx context.Context, params Server
 }
 
 func (b *Builder) BuildAgentX509SVIDTemplate(ctx context.Context, params AgentX509SVIDParams) (*x509.Certificate, error) {
-	tmpl, err := b.buildX509SVIDTemplate(params.SPIFFEID, params.PublicKey, params.ParentChain, pkix.Name{}, b.config.AgentSVIDTTL)
+	tmpl, err := b.buildX509SVIDTemplate(params.SPIFFEID, params.PublicKey, params.ParentChain, pkix.Name{}, b.config.AgentSVIDTTL, params.ExpirationCap)
 	if err != nil {
 		return nil, err
 	}
@@ -279,7 +302,7 @@ func (b *Builder) BuildWorkloadX509SVIDTemplate(ctx context.Context, params Work
 		subject = params.Subject
 	}
 
-	tmpl, err := b.buildX509SVIDTemplate(params.SPIFFEID, params.PublicKey, params.ParentChain, subject, params.TTL)
+	tmpl, err := b.buildX509SVIDTemplate(params.SPIFFEID, params.PublicKey, params.ParentChain, subject, params.TTL, params.ExpirationCap)
 	if err != nil {
 		return nil, err
 	}
@@ -287,7 +310,7 @@ func (b *Builder) BuildWorkloadX509SVIDTemplate(ctx context.Context, params Work
 	// The first DNS name is also added as the CN by default. This happens
 	// even if the subject is provided explicitly in the params for backwards
 	// compatibility. Ideally we wouldn't do override the subject in this
-	// case. It is still overridable via the credential composers however.
+	// case. It is still overridable via the credential composers, however.
 	if len(params.DNSNames) > 0 {
 		tmpl.Subject.CommonName = params.DNSNames[0]
 		tmpl.DNSNames = params.DNSNames
@@ -333,6 +356,14 @@ func (b *Builder) BuildWorkloadJWTSVIDClaims(ctx context.Context, params Workloa
 			"iat": jwt.NewNumericDate(now),
 		},
 	}
+
+	if params.IncludeJTI {
+		jtiBytes, err := uuid.NewV4()
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate jti: %w", err)
+		}
+		attributes.Claims["jti"] = base64.RawURLEncoding.EncodeToString(jtiBytes[:])
+	}
 	if b.config.JWTIssuer != "" {
 		attributes.Claims["iss"] = b.config.JWTIssuer
 	}
@@ -345,27 +376,70 @@ func (b *Builder) BuildWorkloadJWTSVIDClaims(ctx context.Context, params Workloa
 		}
 	}
 
+	// AWS will otherwise reject validating timestamps serialized in scientific notation.
+	// Protobuf serializes large integers as float since Claims are represented as google.protobuf.Struct.
+	if len(b.config.CredentialComposers) > 0 {
+		if iat, ok := attributes.Claims["iat"].(float64); ok {
+			attributes.Claims["iat"] = int64(iat)
+		}
+
+		if exp, ok := attributes.Claims["exp"].(float64); ok {
+			attributes.Claims["exp"] = int64(exp)
+		}
+	}
+
 	return attributes.Claims, nil
 }
 
-func (b *Builder) buildX509CATemplate(publicKey crypto.PublicKey, parentChain []*x509.Certificate, ttl time.Duration) (*x509.Certificate, error) {
+func (b *Builder) BuildWorkloadWITSVIDClaims(ctx context.Context, params WorkloadWITSVIDParams) (map[string]any, error) {
+	if params.SPIFFEID.IsZero() {
+		return nil, errors.New("invalid WIT-SVID ID: cannot be empty")
+	}
+	if err := api.VerifyTrustDomainMemberID(b.config.TrustDomain, params.SPIFFEID); err != nil {
+		return nil, fmt.Errorf("invalid WIT-SVID ID: %w", err)
+	}
+
+	ttl := params.TTL
+	if ttl <= 0 {
+		ttl = b.config.WITSVIDTTL
+	}
+
+	now := b.config.Clock.Now()
+	_, expiresAt := computeCappedLifetime(b.config.Clock, ttl, params.ExpirationCap)
+
+	claims := map[string]any{
+		"sub": params.SPIFFEID.String(),
+		"exp": jwt.NewNumericDate(expiresAt),
+		"iat": jwt.NewNumericDate(now),
+		"cnf": map[string]any{
+			"jwk": params.PublicKey,
+		},
+	}
+	if b.config.WITIssuer != "" {
+		claims["iss"] = b.config.WITIssuer
+	}
+
+	return claims, nil
+}
+
+func (b *Builder) buildX509CATemplate(publicKey crypto.PublicKey, parentChain []*x509.Certificate, ttl time.Duration, expirationCap time.Time) (*x509.Certificate, error) {
 	tmpl, err := b.buildBaseTemplate(b.x509CAID, publicKey, parentChain)
 	if err != nil {
 		return nil, err
 	}
 
 	tmpl.Subject = b.config.X509CASubject
-	if tmpl.Subject.SerialNumber == "" && !b.config.ExcludeSNFromCASubject {
+	if tmpl.Subject.SerialNumber == "" {
 		tmpl.Subject.SerialNumber = tmpl.SerialNumber.String()
 	}
-	tmpl.NotBefore, tmpl.NotAfter = b.computeX509CALifetime(parentChain, ttl)
+	tmpl.NotBefore, tmpl.NotAfter = b.computeX509CALifetime(parentChain, ttl, expirationCap)
 	tmpl.KeyUsage = x509.KeyUsageCertSign | x509.KeyUsageCRLSign
 	tmpl.IsCA = true
 
 	return tmpl, nil
 }
 
-func (b *Builder) buildX509SVIDTemplate(spiffeID spiffeid.ID, publicKey crypto.PublicKey, parentChain []*x509.Certificate, subject pkix.Name, ttl time.Duration) (*x509.Certificate, error) {
+func (b *Builder) buildX509SVIDTemplate(spiffeID spiffeid.ID, publicKey crypto.PublicKey, parentChain []*x509.Certificate, subject pkix.Name, ttl time.Duration, expirationCap time.Time) (*x509.Certificate, error) {
 	if len(parentChain) == 0 {
 		return nil, errors.New("parent chain required to build X509-SVID template")
 	}
@@ -386,7 +460,7 @@ func (b *Builder) buildX509SVIDTemplate(spiffeID spiffeid.ID, publicKey crypto.P
 		tmpl.Subject = subject
 	}
 
-	tmpl.NotBefore, tmpl.NotAfter = b.computeX509SVIDLifetime(parentChain, ttl)
+	tmpl.NotBefore, tmpl.NotAfter = b.computeX509SVIDLifetime(parentChain, ttl, expirationCap)
 	tmpl.KeyUsage = x509.KeyUsageKeyEncipherment |
 		x509.KeyUsageKeyAgreement |
 		x509.KeyUsageDigitalSignature
@@ -426,27 +500,28 @@ func (b *Builder) buildBaseTemplate(spiffeID spiffeid.ID, publicKey crypto.Publi
 	}, nil
 }
 
-func (b *Builder) computeX509CALifetime(parentChain []*x509.Certificate, ttl time.Duration) (notBefore, notAfter time.Time) {
+func (b *Builder) computeX509CALifetime(parentChain []*x509.Certificate, ttl time.Duration, expirationCap time.Time) (notBefore, notAfter time.Time) {
 	if ttl <= 0 {
 		ttl = b.config.X509CATTL
 	}
-	return computeCappedLifetime(b.config.Clock, ttl, parentChainExpiration(parentChain))
+	return computeCappedLifetime(b.config.Clock, ttl, earliestExpiration(parentChainExpiration(parentChain), expirationCap))
 }
 
-func (b *Builder) computeX509SVIDLifetime(parentChain []*x509.Certificate, ttl time.Duration) (notBefore, notAfter time.Time) {
+func (b *Builder) computeX509SVIDLifetime(parentChain []*x509.Certificate, ttl time.Duration, expirationCap time.Time) (notBefore, notAfter time.Time) {
 	if ttl <= 0 {
 		ttl = b.config.X509SVIDTTL
 	}
-	return computeCappedLifetime(b.config.Clock, ttl, parentChainExpiration(parentChain))
+	return computeCappedLifetime(b.config.Clock, ttl, earliestExpiration(parentChainExpiration(parentChain), expirationCap))
 }
 
 func x509CAAttributesFromTemplate(tmpl *x509.Certificate) credentialcomposer.X509CAAttributes {
 	return credentialcomposer.X509CAAttributes{
-		Subject:           tmpl.Subject,
-		PolicyIdentifiers: tmpl.PolicyIdentifiers,
-		ExtraExtensions:   tmpl.ExtraExtensions,
+		Subject:         tmpl.Subject,
+		Policies:        tmpl.Policies,
+		ExtraExtensions: tmpl.ExtraExtensions,
 	}
 }
+
 func x509SVIDAttributesFromTemplate(tmpl *x509.Certificate) credentialcomposer.X509SVIDAttributes {
 	return credentialcomposer.X509SVIDAttributes{
 		Subject:         tmpl.Subject,
@@ -457,7 +532,7 @@ func x509SVIDAttributesFromTemplate(tmpl *x509.Certificate) credentialcomposer.X
 
 func applyX509CAAttributes(tmpl *x509.Certificate, attribs credentialcomposer.X509CAAttributes) {
 	tmpl.Subject = attribs.Subject
-	tmpl.PolicyIdentifiers = attribs.PolicyIdentifiers
+	tmpl.Policies = attribs.Policies
 	tmpl.ExtraExtensions = attribs.ExtraExtensions
 }
 
@@ -483,6 +558,16 @@ func parentChainExpiration(parentChain []*x509.Certificate) time.Time {
 		expiration = parentChain[0].NotAfter
 	}
 	return expiration
+}
+
+func earliestExpiration(expirations ...time.Time) time.Time {
+	var earliest time.Time
+	for _, expiration := range expirations {
+		if !expiration.IsZero() && (earliest.IsZero() || expiration.Before(earliest)) {
+			earliest = expiration
+		}
+	}
+	return earliest
 }
 
 func dropEmptyValues(ss []string) []string {

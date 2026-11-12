@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"sort"
 	"strings"
 	"sync"
 
@@ -19,6 +18,7 @@ import (
 	configv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/service/common/config/v1"
 	"github.com/spiffe/spire/pkg/agent/plugin/svidstore"
 	"github.com/spiffe/spire/pkg/common/catalog"
+	"github.com/spiffe/spire/pkg/common/pluginconf"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -54,6 +54,18 @@ type Configuration struct {
 	UnusedKeyPositions map[string][]token.Pos `hcl:",unusedKeyPositions" json:",omitempty"`
 }
 
+func buildConfig(coreConfig catalog.CoreConfig, hclText string, status *pluginconf.Status) *Configuration {
+	newConfig := &Configuration{}
+	if err := hcl.Decode(newConfig, hclText); err != nil {
+		status.ReportErrorf("unable to decode configuration: %v", err)
+		return nil
+	}
+
+	pluginconf.ReportUnusedKeys(status, newConfig.UnusedKeyPositions)
+
+	return newConfig
+}
+
 type SecretManagerPlugin struct {
 	svidstorev1.UnsafeSVIDStoreServer
 	configv1.UnsafeConfigServer
@@ -74,23 +86,12 @@ func (p *SecretManagerPlugin) SetLogger(log hclog.Logger) {
 
 // Configure configures the SecretManagerPlugin.
 func (p *SecretManagerPlugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) (*configv1.ConfigureResponse, error) {
-	// Parse HCL config payload into config struct
-	config := &Configuration{}
-	if err := hcl.Decode(config, req.HclConfiguration); err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "unable to decode configuration: %v", err)
+	newConfig, _, err := pluginconf.Build(req, buildConfig)
+	if err != nil {
+		return nil, err
 	}
 
-	if len(config.UnusedKeyPositions) != 0 {
-		var keys []string
-		for k := range config.UnusedKeyPositions {
-			keys = append(keys, k)
-		}
-
-		sort.Strings(keys)
-		return nil, status.Errorf(codes.InvalidArgument, "unknown configurations detected: %s", strings.Join(keys, ","))
-	}
-
-	secretMangerClient, err := p.hooks.newSecretManagerClient(ctx, config.ServiceAccountFile)
+	secretMangerClient, err := p.hooks.newSecretManagerClient(ctx, newConfig.ServiceAccountFile)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to create secretmanager client: %v", err)
 	}
@@ -105,6 +106,15 @@ func (p *SecretManagerPlugin) Configure(ctx context.Context, req *configv1.Confi
 	p.tdHash = hex.EncodeToString(tdHash[:])
 
 	return &configv1.ConfigureResponse{}, nil
+}
+
+func (p *SecretManagerPlugin) Validate(ctx context.Context, req *configv1.ValidateRequest) (*configv1.ValidateResponse, error) {
+	_, notes, err := pluginconf.Build(req, buildConfig)
+
+	return &configv1.ValidateResponse{
+		Valid: err == nil,
+		Notes: notes,
+	}, nil
 }
 
 // PutX509SVID puts the specified X509-SVID in the configured Google Cloud Secrets Manager
@@ -126,11 +136,7 @@ func (p *SecretManagerPlugin) PutX509SVID(ctx context.Context, req *svidstorev1.
 			Parent:   opt.parent(),
 			SecretId: opt.name,
 			Secret: &secretmanagerpb.Secret{
-				Replication: &secretmanagerpb.Replication{
-					Replication: &secretmanagerpb.Replication_Automatic_{
-						Automatic: &secretmanagerpb.Replication_Automatic{},
-					},
-				},
+				Replication: opt.replication,
 				Labels: map[string]string{
 					"spire-svid": p.tdHash,
 				},
@@ -283,6 +289,7 @@ type secretOptions struct {
 	name           string
 	roleName       string
 	serviceAccount string
+	replication    *secretmanagerpb.Replication
 }
 
 // parent gets parent in the format `projects/*`
@@ -327,11 +334,52 @@ func optionsFromSecretData(selectorData []string) (*secretOptions, error) {
 		return nil, status.Error(codes.InvalidArgument, "service account is required when role is set")
 	}
 
+	regions, ok := data["regions"]
+
+	var replica *secretmanagerpb.Replication
+
+	if !ok {
+		replica = &secretmanagerpb.Replication{
+			Replication: &secretmanagerpb.Replication_Automatic_{
+				Automatic: &secretmanagerpb.Replication_Automatic{},
+			},
+		}
+	} else {
+		regionsSlice := strings.Split(regions, ",")
+
+		var replicas []*secretmanagerpb.Replication_UserManaged_Replica
+
+		for _, region := range regionsSlice {
+			// Avoid adding empty strings as region
+			if region == "" {
+				continue
+			}
+			replica := &secretmanagerpb.Replication_UserManaged_Replica{
+				Location: region,
+			}
+
+			replicas = append(replicas, replica)
+		}
+
+		if len(replicas) == 0 {
+			return nil, status.Error(codes.InvalidArgument, "need to specify at least one region")
+		}
+
+		replica = &secretmanagerpb.Replication{
+			Replication: &secretmanagerpb.Replication_UserManaged_{
+				UserManaged: &secretmanagerpb.Replication_UserManaged{
+					Replicas: replicas,
+				},
+			},
+		}
+	}
+
 	return &secretOptions{
 		name:           name,
 		projectID:      projectID,
 		roleName:       roleName,
 		serviceAccount: serviceAccount,
+		replication:    replica,
 	}, nil
 }
 

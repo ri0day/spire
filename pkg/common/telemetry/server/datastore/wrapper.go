@@ -2,7 +2,6 @@ package datastore
 
 import (
 	"context"
-	"crypto"
 	"time"
 
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
@@ -108,6 +107,12 @@ func (w metricsWrapper) FetchAttestedNode(ctx context.Context, spiffeID string) 
 	return w.ds.FetchAttestedNode(ctx, spiffeID)
 }
 
+func (w metricsWrapper) FetchAttestedNodeEvent(ctx context.Context, eventID uint) (_ *datastore.AttestedNodeEvent, err error) {
+	callCounter := StartFetchAttestedNodeEventCall(w.m)
+	defer callCounter.Done(&err)
+	return w.ds.FetchAttestedNodeEvent(ctx, eventID)
+}
+
 func (w metricsWrapper) FetchBundle(ctx context.Context, trustDomain string) (_ *common.Bundle, err error) {
 	callCounter := StartFetchBundleCall(w.m)
 	defer callCounter.Done(&err)
@@ -120,28 +125,22 @@ func (w metricsWrapper) FetchJoinToken(ctx context.Context, token string) (_ *da
 	return w.ds.FetchJoinToken(ctx, token)
 }
 
-func (w metricsWrapper) FetchRegistrationEntry(ctx context.Context, entryID string) (_ *common.RegistrationEntry, err error) {
+func (w metricsWrapper) FetchRegistrationEntries(ctx context.Context, entryIDs []string) (_ map[string]*common.RegistrationEntry, err error) {
 	callCounter := StartFetchRegistrationCall(w.m)
 	defer callCounter.Done(&err)
-	return w.ds.FetchRegistrationEntry(ctx, entryID)
+	return w.ds.FetchRegistrationEntries(ctx, entryIDs)
+}
+
+func (w metricsWrapper) FetchRegistrationEntryEvent(ctx context.Context, eventID uint) (_ *datastore.RegistrationEntryEvent, err error) {
+	callCounter := StartFetchRegistrationEntryEventCall(w.m)
+	defer callCounter.Done(&err)
+	return w.ds.FetchRegistrationEntryEvent(ctx, eventID)
 }
 
 func (w metricsWrapper) FetchFederationRelationship(ctx context.Context, trustDomain spiffeid.TrustDomain) (_ *datastore.FederationRelationship, err error) {
 	callCounter := StartFetchFederationRelationshipCall(w.m)
 	defer callCounter.Done(&err)
 	return w.ds.FetchFederationRelationship(ctx, trustDomain)
-}
-
-func (w metricsWrapper) GetLatestAttestedNodeEventID(ctx context.Context) (_ uint, err error) {
-	callCounter := StartGetLatestAttestedNodeEventIDCall(w.m)
-	defer callCounter.Done(&err)
-	return w.ds.GetLatestAttestedNodeEventID(ctx)
-}
-
-func (w metricsWrapper) GetLatestRegistrationEntryEventID(ctx context.Context) (_ uint, err error) {
-	callCounter := StartGetLatestRegistrationEntryEventIDCall(w.m)
-	defer callCounter.Done(&err)
-	return w.ds.GetLatestRegistrationEntryEventID(ctx)
 }
 
 func (w metricsWrapper) GetNodeSelectors(ctx context.Context, spiffeID string, dataConsistency datastore.DataConsistency) (_ []*common.Selector, err error) {
@@ -156,10 +155,10 @@ func (w metricsWrapper) ListAttestedNodes(ctx context.Context, req *datastore.Li
 	return w.ds.ListAttestedNodes(ctx, req)
 }
 
-func (w metricsWrapper) ListAttestedNodesEvents(ctx context.Context, req *datastore.ListAttestedNodesEventsRequest) (_ *datastore.ListAttestedNodesEventsResponse, err error) {
-	callCounter := StartListAttestedNodesEventsCall(w.m)
+func (w metricsWrapper) ListAttestedNodeEvents(ctx context.Context, req *datastore.ListAttestedNodeEventsRequest) (_ *datastore.ListAttestedNodeEventsResponse, err error) {
+	callCounter := StartListAttestedNodeEventsCall(w.m)
 	defer callCounter.Done(&err)
-	return w.ds.ListAttestedNodesEvents(ctx, req)
+	return w.ds.ListAttestedNodeEvents(ctx, req)
 }
 
 func (w metricsWrapper) ListBundles(ctx context.Context, req *datastore.ListBundlesRequest) (_ *datastore.ListBundlesResponse, err error) {
@@ -180,16 +179,16 @@ func (w metricsWrapper) ListRegistrationEntries(ctx context.Context, req *datast
 	return w.ds.ListRegistrationEntries(ctx, req)
 }
 
-func (w metricsWrapper) ListRegistrationEntriesEvents(ctx context.Context, req *datastore.ListRegistrationEntriesEventsRequest) (_ *datastore.ListRegistrationEntriesEventsResponse, err error) {
-	callCounter := StartListRegistrationEntriesEventsCall(w.m)
+func (w metricsWrapper) ListRegistrationEntryEvents(ctx context.Context, req *datastore.ListRegistrationEntryEventsRequest) (_ *datastore.ListRegistrationEntryEventsResponse, err error) {
+	callCounter := StartListRegistrationEntryEventsCall(w.m)
 	defer callCounter.Done(&err)
-	return w.ds.ListRegistrationEntriesEvents(ctx, req)
+	return w.ds.ListRegistrationEntryEvents(ctx, req)
 }
 
-func (w metricsWrapper) CountAttestedNodes(ctx context.Context) (_ int32, err error) {
+func (w metricsWrapper) CountAttestedNodes(ctx context.Context, req *datastore.CountAttestedNodesRequest) (_ int32, err error) {
 	callCounter := StartCountNodeCall(w.m)
 	defer callCounter.Done(&err)
-	return w.ds.CountAttestedNodes(ctx)
+	return w.ds.CountAttestedNodes(ctx, req)
 }
 
 func (w metricsWrapper) CountBundles(ctx context.Context) (_ int32, err error) {
@@ -198,16 +197,16 @@ func (w metricsWrapper) CountBundles(ctx context.Context) (_ int32, err error) {
 	return w.ds.CountBundles(ctx)
 }
 
-func (w metricsWrapper) CountRegistrationEntries(ctx context.Context) (_ int32, err error) {
+func (w metricsWrapper) CountRegistrationEntries(ctx context.Context, req *datastore.CountRegistrationEntriesRequest) (_ int32, err error) {
 	callCounter := StartCountRegistrationCall(w.m)
 	defer callCounter.Done(&err)
-	return w.ds.CountRegistrationEntries(ctx)
+	return w.ds.CountRegistrationEntries(ctx, req)
 }
 
-func (w metricsWrapper) PruneAttestedNodesEvents(ctx context.Context, olderThan time.Duration) (err error) {
-	callCounter := StartPruneAttestedNodesEventsCall(w.m)
+func (w metricsWrapper) PruneAttestedNodeEvents(ctx context.Context, olderThan time.Duration) (err error) {
+	callCounter := StartPruneAttestedNodeEventsCall(w.m)
 	defer callCounter.Done(&err)
-	return w.ds.PruneAttestedNodesEvents(ctx, olderThan)
+	return w.ds.PruneAttestedNodeEvents(ctx, olderThan)
 }
 
 func (w metricsWrapper) PruneBundle(ctx context.Context, trustDomainID string, expiresBefore time.Time) (_ bool, err error) {
@@ -228,10 +227,16 @@ func (w metricsWrapper) PruneRegistrationEntries(ctx context.Context, expiresBef
 	return w.ds.PruneRegistrationEntries(ctx, expiresBefore)
 }
 
-func (w metricsWrapper) PruneRegistrationEntriesEvents(ctx context.Context, olderThan time.Duration) (err error) {
-	callCounter := StartPruneRegistrationEntriesEventsCall(w.m)
+func (w metricsWrapper) PruneRegistrationEntryEvents(ctx context.Context, olderThan time.Duration) (err error) {
+	callCounter := StartPruneRegistrationEntryEventsCall(w.m)
 	defer callCounter.Done(&err)
-	return w.ds.PruneRegistrationEntriesEvents(ctx, olderThan)
+	return w.ds.PruneRegistrationEntryEvents(ctx, olderThan)
+}
+
+func (w metricsWrapper) PruneAttestedExpiredNodes(ctx context.Context, expiredBefore time.Time, includeNonReattestable bool, batchSize int) (err error) {
+	callCounter := StartPruneAttestedExpiredNodes(w.m)
+	defer callCounter.Done(&err)
+	return w.ds.PruneAttestedExpiredNodes(ctx, expiredBefore, includeNonReattestable, batchSize)
 }
 
 func (w metricsWrapper) SetBundle(ctx context.Context, bundle *common.Bundle) (_ *common.Bundle, err error) {
@@ -240,16 +245,16 @@ func (w metricsWrapper) SetBundle(ctx context.Context, bundle *common.Bundle) (_
 	return w.ds.SetBundle(ctx, bundle)
 }
 
-func (w metricsWrapper) TaintX509CA(ctx context.Context, trustDomainID string, publicKeyToTaint crypto.PublicKey) (err error) {
+func (w metricsWrapper) TaintX509CA(ctx context.Context, trustDomainID string, subjectKeyIDToTaint string) (err error) {
 	callCounter := StartTaintX509CAByKeyCall(w.m)
 	defer callCounter.Done(&err)
-	return w.ds.TaintX509CA(ctx, trustDomainID, publicKeyToTaint)
+	return w.ds.TaintX509CA(ctx, trustDomainID, subjectKeyIDToTaint)
 }
 
-func (w metricsWrapper) RevokeX509CA(ctx context.Context, trustDomainID string, publicKeyToRevoke crypto.PublicKey) (err error) {
+func (w metricsWrapper) RevokeX509CA(ctx context.Context, trustDomainID string, subjectKeyIDToRevoke string) (err error) {
 	callCounter := StartRevokeX509CACall(w.m)
 	defer callCounter.Done(&err)
-	return w.ds.RevokeX509CA(ctx, trustDomainID, publicKeyToRevoke)
+	return w.ds.RevokeX509CA(ctx, trustDomainID, subjectKeyIDToRevoke)
 }
 
 func (w metricsWrapper) TaintJWTKey(ctx context.Context, trustDomainID string, authorityID string) (_ *common.PublicKey, err error) {
@@ -304,12 +309,6 @@ func (w metricsWrapper) FetchCAJournal(ctx context.Context, activeX509AuthorityI
 	callCounter := StartFetchCAJournal(w.m)
 	defer callCounter.Done(&err)
 	return w.ds.FetchCAJournal(ctx, activeX509AuthorityID)
-}
-
-func (w metricsWrapper) ListCAJournalsForTesting(ctx context.Context) (_ []*datastore.CAJournal, err error) {
-	callCounter := StartListCAJournalsForTesting(w.m)
-	defer callCounter.Done(&err)
-	return w.ds.ListCAJournalsForTesting(ctx)
 }
 
 func (w metricsWrapper) PruneCAJournals(ctx context.Context, allCAsExpireBefore int64) (err error) {

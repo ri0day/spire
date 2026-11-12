@@ -1,6 +1,6 @@
 # Server plugin: NodeAttestor "azure_msi"
 
-*Must be used in conjunction with the agent-side azure_msi plugin*
+*Must be used in conjunction with the [agent-side azure_msi plugin](plugin_agent_nodeattestor_azure_msi.md)*
 
 The `azure_msi` plugin attests nodes running in Microsoft Azure that have
 Managed Service Identity (MSI) enabled. Agent nodes acquire a signed MSI token
@@ -27,7 +27,6 @@ Each tenant in the main configuration supports the following
 | Configuration     | Required                             | Description                                                                                               | Default                         |
 |-------------------|--------------------------------------|-----------------------------------------------------------------------------------------------------------|---------------------------------|
 | `resource_id`     | Optional                             | The resource ID (or audience) for the tenant's MSI token. Tokens for a different resource ID are rejected | <https://management.azure.com/> |
-| `use_msi`         | [Deprecated](#authenticating-to-azure) | Whether or not to use MSI to authenticate to Azure services for selector resolution.                      | false                           |
 | `subscription_id` | [Optional](#authenticating-to-azure) | The subscription the tenant resides in                                                                    |                                 |
 | `app_id`          | [Optional](#authenticating-to-azure) | The application id                                                                                        |                                 |
 | `app_secret`      | [Optional](#authenticating-to-azure) | The application secret                                                                                    |                                 |
@@ -81,7 +80,6 @@ required, however, it will be in a future release.
             tenants = {
                 "00000000-1111-2222-3333-444444444444" = {
                     resource_id = "http://example.org/app/"
-                    use_msi = true
                 }
             }
         }
@@ -98,14 +96,15 @@ The plugin produces the following selectors.
 | Virtual Machine Name   | `vm-name:frontend:blog`                                | The name of the virtual machine (e.g. `blog`) qualified by the resource group (e.g. `frontend`)              |
 | Network Security Group | `network-security-group:frontend:webservers`           | The name of the network security group (e.g. `webservers`) qualified by the resource group (e.g. `frontend`) |
 | Virtual Network        | `virtual-network:frontend:vnet`                        | The name of the virtual network (e.g. `vnet`) qualified by the resource group (e.g. `frontend`)              |
-| Virtual Network Subnet | `virtual-network-subnet:frontend:vnet:default`         | The name of the virtual network subnet (e.g. `default`) qualified by the virtual network and resource group   |
+| Virtual Network Subnet | `virtual-network-subnet:frontend:vnet:default`         | The name of the virtual network subnet (e.g. `default`) qualified by the virtual network and resource group  |
 
-All of the selectors have the type `azure_msi`.
+All the selectors have the type `azure_msi`.
 
 ## Agent Path Template
 
 The agent path template is a way of customizing the format of generated SPIFFE IDs for agents.
 The template formatter is using Golang text/template conventions, it can reference values provided by the plugin or in a [MSI access token](https://learn.microsoft.com/en-us/azure/active-directory/develop/access-tokens#payload-claims).
+Details about the template engine are available in the [template engine documentation](template_engine.md).
 
 Some useful values are:
 

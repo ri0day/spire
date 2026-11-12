@@ -39,12 +39,10 @@ func (p *Plugin) buildCertificateRequest(request *upstreamauthorityv1.MintX509CA
 	}
 
 	return &cmapi.CertificateRequest{
-		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: "spiffe-ca-",
-			Namespace:    p.config.Namespace,
-			Labels: map[string]string{
-				"cert-manager.spiffe.io/trust-domain": p.trustDomain,
-			},
+		GenerateName: "spiffe-ca-",
+		Namespace:    p.config.Namespace,
+		Labels: map[string]string{
+			"cert-manager.spiffe.io/trust-domain": p.trustDomain,
 		},
 		Spec: cmapi.CertificateRequestSpec{
 			Duration: &metav1.Duration{
@@ -83,15 +81,15 @@ func (p *Plugin) cleanupStaleCertificateRequests(ctx context.Context) error {
 
 	for i, cr := range crList.Items {
 		for _, cond := range []cmapi.CertificateRequestCondition{
-			cmapi.CertificateRequestCondition{
+			{
 				Type:   cmapi.CertificateRequestConditionDenied,
 				Status: cmapi.ConditionTrue,
 			},
-			cmapi.CertificateRequestCondition{
+			{
 				Type:   cmapi.CertificateRequestConditionReady,
 				Status: cmapi.ConditionTrue,
 			},
-			cmapi.CertificateRequestCondition{
+			{
 				Type:   cmapi.CertificateRequestConditionReady,
 				Status: cmapi.ConditionFalse,
 				Reason: cmapi.CertificateRequestReasonFailed,

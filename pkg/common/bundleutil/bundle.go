@@ -12,6 +12,7 @@ import (
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/spire-api-sdk/proto/spire/api/types"
 	"github.com/spiffe/spire/pkg/common/telemetry"
+	"github.com/spiffe/spire/pkg/common/x509util"
 	"github.com/spiffe/spire/proto/spire/common"
 	"google.golang.org/protobuf/proto"
 )
@@ -29,7 +30,8 @@ func CommonBundleFromProto(b *types.Bundle) (*common.Bundle, error) {
 	var rootCAs []*common.Certificate
 	for _, rootCA := range b.X509Authorities {
 		rootCAs = append(rootCAs, &common.Certificate{
-			DerBytes: rootCA.Asn1,
+			DerBytes:   rootCA.Asn1,
+			TaintedKey: rootCA.Tainted,
 		})
 	}
 
@@ -40,9 +42,24 @@ func CommonBundleFromProto(b *types.Bundle) (*common.Bundle, error) {
 		}
 
 		jwtKeys = append(jwtKeys, &common.PublicKey{
-			PkixBytes: key.PublicKey,
-			Kid:       key.KeyId,
-			NotAfter:  key.ExpiresAt,
+			PkixBytes:  key.PublicKey,
+			Kid:        key.KeyId,
+			NotAfter:   key.ExpiresAt,
+			TaintedKey: key.Tainted,
+		})
+	}
+
+	var witKeys []*common.PublicKey
+	for _, key := range b.WitAuthorities {
+		if key.KeyId == "" {
+			return nil, errors.New("missing key ID")
+		}
+
+		witKeys = append(witKeys, &common.PublicKey{
+			PkixBytes:  key.PublicKey,
+			Kid:        key.KeyId,
+			NotAfter:   key.ExpiresAt,
+			TaintedKey: key.Tainted,
 		})
 	}
 
@@ -52,6 +69,7 @@ func CommonBundleFromProto(b *types.Bundle) (*common.Bundle, error) {
 		SequenceNumber: b.SequenceNumber,
 		RootCas:        rootCAs,
 		JwtSigningKeys: jwtKeys,
+		WitSigningKeys: witKeys,
 	}, nil
 }
 
@@ -73,9 +91,20 @@ func SPIFFEBundleToProto(b *spiffebundle.Bundle) (*common.Bundle, error) {
 	for kid, key := range b.JWTAuthorities() {
 		pkixBytes, err := x509.MarshalPKIXPublicKey(key)
 		if err != nil {
-			return nil, fmt.Errorf("failed to marshal public key: %w", err)
+			return nil, fmt.Errorf("failed to marshal JWT public key: %w", err)
 		}
 		bundle.JwtSigningKeys = append(bundle.JwtSigningKeys, &common.PublicKey{
+			PkixBytes: pkixBytes,
+			Kid:       kid,
+		})
+	}
+
+	for kid, key := range b.WITAuthorities() {
+		pkixBytes, err := x509.MarshalPKIXPublicKey(key)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal WIT public key: %w", err)
+		}
+		bundle.WitSigningKeys = append(bundle.WitSigningKeys, &common.PublicKey{
 			PkixBytes: pkixBytes,
 			Kid:       kid,
 		})
@@ -93,6 +122,10 @@ func SPIFFEBundleFromProto(b *common.Bundle) (*spiffebundle.Bundle, error) {
 	if err != nil {
 		return nil, err
 	}
+	witSigningKeys, err := WITSigningKeysFromBundleProto(b)
+	if err != nil {
+		return nil, err
+	}
 	td, err := spiffeid.TrustDomainFromString(b.TrustDomainId)
 	if err != nil {
 		return nil, err
@@ -101,6 +134,7 @@ func SPIFFEBundleFromProto(b *common.Bundle) (*spiffebundle.Bundle, error) {
 	bundle := spiffebundle.New(td)
 	bundle.SetX509Authorities(rootCAs)
 	bundle.SetJWTAuthorities(jwtSigningKeys)
+	bundle.SetWITAuthorities(witSigningKeys)
 	bundle.SetRefreshHint(time.Second * time.Duration(b.RefreshHint))
 	bundle.SetSequenceNumber(b.SequenceNumber)
 
@@ -146,6 +180,18 @@ func JWTSigningKeysFromBundleProto(b *common.Bundle) (map[string]crypto.PublicKe
 	return out, nil
 }
 
+func WITSigningKeysFromBundleProto(b *common.Bundle) (map[string]crypto.PublicKey, error) {
+	out := make(map[string]crypto.PublicKey)
+	for i, publicKey := range b.WitSigningKeys {
+		witSigningKey, err := x509.ParsePKIXPublicKey(publicKey.PkixBytes)
+		if err != nil {
+			return nil, fmt.Errorf("unable to parse WIT signing key %d: %w", i, err)
+		}
+		out[publicKey.Kid] = witSigningKey
+	}
+	return out, nil
+}
+
 func MergeBundles(a, b *common.Bundle) (*common.Bundle, bool) {
 	c := cloneBundle(a)
 
@@ -156,6 +202,10 @@ func MergeBundles(a, b *common.Bundle) (*common.Bundle, bool) {
 	jwtSigningKeys := make(map[string]bool)
 	for _, jwtSigningKey := range a.JwtSigningKeys {
 		jwtSigningKeys[jwtSigningKey.String()] = true
+	}
+	witSigningKeys := make(map[string]bool)
+	for _, witSigningKey := range a.WitSigningKeys {
+		witSigningKeys[witSigningKey.String()] = true
 	}
 
 	var changed bool
@@ -171,11 +221,17 @@ func MergeBundles(a, b *common.Bundle) (*common.Bundle, bool) {
 			changed = true
 		}
 	}
+	for _, witSigningKey := range b.WitSigningKeys {
+		if !witSigningKeys[witSigningKey.String()] {
+			c.WitSigningKeys = append(c.WitSigningKeys, witSigningKey)
+			changed = true
+		}
+	}
 	return c, changed
 }
 
 // PruneBundle removes the bundle RootCAs and JWT keys that expired before a given time
-// It returns an error if prunning results in a bundle with no CAs or keys
+// It returns an error if pruning results in a bundle with no CAs or keys
 func PruneBundle(bundle *common.Bundle, expiration time.Time, log logrus.FieldLogger) (*common.Bundle, bool, error) {
 	if bundle == nil {
 		return nil, false, errors.New("current bundle is nil")
@@ -224,17 +280,61 @@ pruneRootCA:
 		newBundle.JwtSigningKeys = append(newBundle.JwtSigningKeys, jwtSigningKey)
 	}
 
+	for _, witSigningKey := range bundle.WitSigningKeys {
+		notAfter := time.Unix(witSigningKey.NotAfter, 0)
+		if !notAfter.After(expiration) {
+			log.WithFields(logrus.Fields{
+				telemetry.Kid:        witSigningKey.Kid,
+				telemetry.Expiration: notAfter,
+			}).Info("Pruning WIT signing key due to expiration")
+			changed = true
+			continue
+		}
+		newBundle.WitSigningKeys = append(newBundle.WitSigningKeys, witSigningKey)
+	}
+
 	if len(newBundle.RootCas) == 0 {
 		log.Warn("Pruning halted; all known CA certificates have expired")
 		return nil, false, errors.New("would prune all certificates")
 	}
 
-	if len(newBundle.JwtSigningKeys) == 0 {
+	if len(bundle.JwtSigningKeys) > 0 && len(newBundle.JwtSigningKeys) == 0 {
 		log.Warn("Pruning halted; all known JWT signing keys have expired")
 		return nil, false, errors.New("would prune all JWT signing keys")
 	}
 
+	if len(bundle.WitSigningKeys) > 0 && len(newBundle.WitSigningKeys) == 0 {
+		log.Warn("Pruning halted; all known WIT signing keys have expired")
+		return nil, false, errors.New("would prune all WIT signing keys")
+	}
+
 	return newBundle, changed, nil
+}
+
+// FindX509Authorities search for all X.509 authorities with provided subjectKeyIDs
+func FindX509Authorities(bundle *spiffebundle.Bundle, subjectKeyIDs []string) ([]*x509.Certificate, error) {
+	var x509Authorities []*x509.Certificate
+	for _, subjectKeyID := range subjectKeyIDs {
+		x509Authority, err := getX509Authority(bundle, subjectKeyID)
+		if err != nil {
+			return nil, err
+		}
+
+		x509Authorities = append(x509Authorities, x509Authority)
+	}
+
+	return x509Authorities, nil
+}
+
+func getX509Authority(bundle *spiffebundle.Bundle, subjectKeyID string) (*x509.Certificate, error) {
+	for _, x509Authority := range bundle.X509Authorities() {
+		authoritySKID := x509util.SubjectKeyIDToString(x509Authority.SubjectKeyId)
+		if authoritySKID == subjectKeyID {
+			return x509Authority, nil
+		}
+	}
+
+	return nil, fmt.Errorf("no X.509 authority found with SubjectKeyID %q", subjectKeyID)
 }
 
 func cloneBundle(b *common.Bundle) *common.Bundle {

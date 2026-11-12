@@ -11,9 +11,9 @@ import (
 	"time"
 
 	"github.com/andres-erbsen/clock"
-	"github.com/go-jose/go-jose/v3"
-	"github.com/go-jose/go-jose/v3/cryptosigner"
-	"github.com/go-jose/go-jose/v3/jwt"
+	"github.com/go-jose/go-jose/v4"
+	"github.com/go-jose/go-jose/v4/cryptosigner"
+	"github.com/go-jose/go-jose/v4/jwt"
 	"github.com/sirupsen/logrus"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/spire/pkg/common/cryptoutil"
@@ -36,6 +36,10 @@ type ServerCA interface {
 	SignAgentX509SVID(ctx context.Context, params AgentX509SVIDParams) ([]*x509.Certificate, error)
 	SignWorkloadX509SVID(ctx context.Context, params WorkloadX509SVIDParams) ([]*x509.Certificate, error)
 	SignWorkloadJWTSVID(ctx context.Context, params WorkloadJWTSVIDParams) (string, error)
+	SignWorkloadWITSVID(ctx context.Context, params WorkloadWITSVIDParams) (string, error)
+	TaintedAuthorities() <-chan []*x509.Certificate
+	IsJWTSVIDsDisabled() bool
+	IsWITSVIDsDisabled() bool
 }
 
 // DownstreamX509CAParams are parameters relevant to downstream X.509 CA creation
@@ -94,6 +98,23 @@ type WorkloadJWTSVIDParams struct {
 
 	// Audience is used for audience claims
 	Audience []string
+
+	// IncludeJTI, when true, instructs the CA to include a unique "jti" (JWT ID)
+	// claim in the issued token.
+	IncludeJTI bool
+}
+
+// WorkloadWITSVIDParams are parameters relevant to workload WIT-SVID creation
+type WorkloadWITSVIDParams struct {
+	// SPIFFE ID of the SVID
+	SPIFFEID spiffeid.ID
+
+	// TTL is the desired time-to-live of the SVID. Regardless of the TTL, the
+	// lifetime of the token will be capped to that of the signing key.
+	TTL time.Duration
+
+	// PublicKey is used for the cnf claim
+	PublicKey jose.JSONWebKey
 }
 
 type X509CA struct {
@@ -107,6 +128,9 @@ type X509CA struct {
 	// chain back to the upstream trust bundle. It is only set if the CA is
 	// signed by an UpstreamCA.
 	UpstreamChain []*x509.Certificate
+
+	// NotAfter is the effective expiration of the CA chain.
+	NotAfter time.Time
 }
 
 type JWTKey struct {
@@ -120,23 +144,38 @@ type JWTKey struct {
 	NotAfter time.Time
 }
 
+type WITKey struct {
+	// The signer used to sign keys
+	Signer crypto.Signer
+
+	// Kid is the WIT key ID (i.e. "kid" claim)
+	Kid string
+
+	// NotAfter is the expiration time of the WIT key.
+	NotAfter time.Time
+}
+
 type Config struct {
-	Log           logrus.FieldLogger
-	Clock         clock.Clock
-	Metrics       telemetry.Metrics
-	TrustDomain   spiffeid.TrustDomain
-	CredBuilder   *credtemplate.Builder
-	CredValidator *credvalidator.Validator
-	HealthChecker health.Checker
+	Log             logrus.FieldLogger
+	Clock           clock.Clock
+	Metrics         telemetry.Metrics
+	TrustDomain     spiffeid.TrustDomain
+	CredBuilder     *credtemplate.Builder
+	CredValidator   *credvalidator.Validator
+	HealthChecker   health.Checker
+	DisableJWTSVIDs bool
+	DisableWITSVIDs bool
 }
 
 type CA struct {
 	c Config
 
-	mu          sync.RWMutex
-	x509CA      *X509CA
-	x509CAChain []*x509.Certificate
-	jwtKey      *JWTKey
+	mu                   sync.RWMutex
+	x509CA               *X509CA
+	x509CAChain          []*x509.Certificate
+	jwtKey               *JWTKey
+	witKey               *WITKey
+	taintedAuthoritiesCh chan []*x509.Certificate
 }
 
 func NewCA(config Config) *CA {
@@ -146,6 +185,9 @@ func NewCA(config Config) *CA {
 
 	ca := &CA{
 		c: config,
+
+		// Notify caller about any tainted authority
+		taintedAuthoritiesCh: make(chan []*x509.Certificate, 1),
 	}
 
 	_ = config.HealthChecker.AddCheck("server.ca", &caHealth{
@@ -188,6 +230,29 @@ func (ca *CA) SetJWTKey(jwtKey *JWTKey) {
 	ca.jwtKey = jwtKey
 }
 
+func (ca *CA) WITKey() *WITKey {
+	ca.mu.RLock()
+	defer ca.mu.RUnlock()
+	return ca.witKey
+}
+
+func (ca *CA) SetWITKey(witKey *WITKey) {
+	ca.mu.Lock()
+	defer ca.mu.Unlock()
+	ca.witKey = witKey
+}
+
+func (ca *CA) NotifyTaintedX509Authorities(taintedAuthorities []*x509.Certificate) {
+	select {
+	case ca.taintedAuthoritiesCh <- taintedAuthorities:
+	default:
+	}
+}
+
+func (ca *CA) TaintedAuthorities() <-chan []*x509.Certificate {
+	return ca.taintedAuthoritiesCh
+}
+
 func (ca *CA) SignDownstreamX509CA(ctx context.Context, params DownstreamX509CAParams) ([]*x509.Certificate, error) {
 	x509CA, caChain, err := ca.getX509CA()
 	if err != nil {
@@ -195,14 +260,14 @@ func (ca *CA) SignDownstreamX509CA(ctx context.Context, params DownstreamX509CAP
 	}
 
 	template, err := ca.c.CredBuilder.BuildDownstreamX509CATemplate(ctx, credtemplate.DownstreamX509CAParams{
-		ParentChain: caChain,
-		PublicKey:   params.PublicKey,
-		TTL:         params.TTL,
+		ParentChain:   caChain,
+		PublicKey:     params.PublicKey,
+		TTL:           params.TTL,
+		ExpirationCap: x509CA.NotAfter,
 	})
 	if err != nil {
 		return nil, err
 	}
-
 	downstreamCA, err := x509util.CreateCertificate(template, x509CA.Certificate, template.PublicKey, x509CA.Signer)
 	if err != nil {
 		return nil, fmt.Errorf("unable to create downstream X509 CA: %w", err)
@@ -224,8 +289,9 @@ func (ca *CA) SignServerX509SVID(ctx context.Context, params ServerX509SVIDParam
 	}
 
 	template, err := ca.c.CredBuilder.BuildServerX509SVIDTemplate(ctx, credtemplate.ServerX509SVIDParams{
-		ParentChain: caChain,
-		PublicKey:   params.PublicKey,
+		ParentChain:   caChain,
+		PublicKey:     params.PublicKey,
+		ExpirationCap: x509CA.NotAfter,
 	})
 	if err != nil {
 		return nil, err
@@ -250,9 +316,10 @@ func (ca *CA) SignAgentX509SVID(ctx context.Context, params AgentX509SVIDParams)
 	}
 
 	template, err := ca.c.CredBuilder.BuildAgentX509SVIDTemplate(ctx, credtemplate.AgentX509SVIDParams{
-		ParentChain: caChain,
-		PublicKey:   params.PublicKey,
-		SPIFFEID:    params.SPIFFEID,
+		ParentChain:   caChain,
+		PublicKey:     params.PublicKey,
+		SPIFFEID:      params.SPIFFEID,
+		ExpirationCap: x509CA.NotAfter,
 	})
 	if err != nil {
 		return nil, err
@@ -277,12 +344,13 @@ func (ca *CA) SignWorkloadX509SVID(ctx context.Context, params WorkloadX509SVIDP
 	}
 
 	template, err := ca.c.CredBuilder.BuildWorkloadX509SVIDTemplate(ctx, credtemplate.WorkloadX509SVIDParams{
-		ParentChain: caChain,
-		PublicKey:   params.PublicKey,
-		SPIFFEID:    params.SPIFFEID,
-		DNSNames:    params.DNSNames,
-		TTL:         params.TTL,
-		Subject:     params.Subject,
+		ParentChain:   caChain,
+		PublicKey:     params.PublicKey,
+		SPIFFEID:      params.SPIFFEID,
+		DNSNames:      params.DNSNames,
+		TTL:           params.TTL,
+		Subject:       params.Subject,
+		ExpirationCap: x509CA.NotAfter,
 	})
 	if err != nil {
 		return nil, err
@@ -311,6 +379,7 @@ func (ca *CA) SignWorkloadJWTSVID(ctx context.Context, params WorkloadJWTSVIDPar
 		Audience:      params.Audience,
 		TTL:           params.TTL,
 		ExpirationCap: jwtKey.NotAfter,
+		IncludeJTI:    params.IncludeJTI,
 	})
 	if err != nil {
 		return "", err
@@ -326,6 +395,39 @@ func (ca *CA) SignWorkloadJWTSVID(ctx context.Context, params WorkloadJWTSVIDPar
 	}
 
 	telemetry_server.IncrServerCASignJWTSVIDCounter(ca.c.Metrics)
+	return token, nil
+}
+
+func (ca *CA) SignWorkloadWITSVID(ctx context.Context, params WorkloadWITSVIDParams) (string, error) {
+	witKey := ca.WITKey()
+	if witKey == nil {
+		return "", errors.New("WIT key is not available for signing")
+	}
+
+	// We already validate in other places that a valid algorithm is given
+	if params.PublicKey.Algorithm == "" {
+		return "", errors.New("public key must have algorithm set")
+	}
+
+	claims, err := ca.c.CredBuilder.BuildWorkloadWITSVIDClaims(ctx, credtemplate.WorkloadWITSVIDParams{
+		SPIFFEID:      params.SPIFFEID,
+		PublicKey:     params.PublicKey,
+		TTL:           params.TTL,
+		ExpirationCap: witKey.NotAfter,
+	})
+	if err != nil {
+		return "", err
+	}
+
+	token, err := ca.signWITSVID(witKey, claims)
+	if err != nil {
+		return "", fmt.Errorf("unable to sign JWT SVID: %w", err)
+	}
+
+	if err := ca.c.CredValidator.ValidateWorkloadWITSVID(token, params.SPIFFEID); err != nil {
+		return "", err
+	}
+
 	return token, nil
 }
 
@@ -367,9 +469,45 @@ func (ca *CA) signJWTSVID(jwtKey *JWTKey, claims map[string]any) (string, error)
 		return "", fmt.Errorf("failed to configure JWT signer: %w", err)
 	}
 
-	signedToken, err := jwt.Signed(jwtSigner).Claims(claims).CompactSerialize()
+	signedToken, err := jwt.Signed(jwtSigner).Claims(claims).Serialize()
 	if err != nil {
 		return "", fmt.Errorf("failed to sign JWT SVID: %w", err)
+	}
+
+	return signedToken, nil
+}
+
+func (ca *CA) IsJWTSVIDsDisabled() bool {
+	return ca.c.DisableJWTSVIDs
+}
+
+func (ca *CA) IsWITSVIDsDisabled() bool {
+	return ca.c.DisableWITSVIDs
+}
+
+func (ca *CA) signWITSVID(witKey *WITKey, claims map[string]any) (string, error) {
+	alg, err := cryptoutil.JoseAlgFromPublicKey(witKey.Signer.Public())
+	if err != nil {
+		return "", fmt.Errorf("failed to determine WIT key algorithm: %w", err)
+	}
+
+	jwtSigner, err := jose.NewSigner(
+		jose.SigningKey{
+			Algorithm: alg,
+			Key: jose.JSONWebKey{
+				Key:   cryptosigner.Opaque(witKey.Signer),
+				KeyID: witKey.Kid,
+			},
+		},
+		new(jose.SignerOptions).WithType("wit+jwt"),
+	)
+	if err != nil {
+		return "", fmt.Errorf("failed to configure WIT signer: %w", err)
+	}
+
+	signedToken, err := jwt.Signed(jwtSigner).Claims(claims).Serialize()
+	if err != nil {
+		return "", fmt.Errorf("failed to sign WIT SVID: %w", err)
 	}
 
 	return signedToken, nil

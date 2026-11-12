@@ -4,44 +4,50 @@ This document is a configuration reference for SPIRE Server. It includes informa
 
 ## Plugin types
 
-| Type               | Description                                                                                                                                                          |
-|:-------------------|:---------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| DataStore          | Provides persistent storage and HA features. **Note:** Pluggability for the DataStore is no longer supported. Only the built-in SQL plugin can be used.              |
-| KeyManager         | Implements both signing and key storage logic for the server's signing operations. Useful for leveraging hardware-based key operations.                              |
-| CredentialComposer | Allows customization of SVID and CA attributes.                                                                                                                      |
-| NodeAttestor       | Implements validation logic for nodes attempting to assert their identity. Generally paired with an agent plugin of the same type.                                   |
-| UpstreamAuthority  | Allows SPIRE server to integrate with existing PKI systems.                                                                                                          |
-| Notifier           | Notified by SPIRE server for certain events that are happening or have happened. For events that are happening, the notifier can advise SPIRE server on the outcome. |
-| BundlePublisher    | Publishes trust bundles to additional locations.                                                                                                                     |
+| Type               | Description                                                                                                                                                                                                       |
+|:-------------------|:------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| DataStore          | Provides persistent storage and HA features. **Note:** Pluggability for the DataStore is no longer supported. Only the built-in SQL plugin can be used.                                                           |
+| KeyManager         | Implements both signing and key storage logic for the server's signing operations. Useful for leveraging hardware-based key operations.                                                                           |
+| CredentialComposer | Allows customization of SVID and CA attributes.                                                                                                                                                                   |
+| NodeAttestor       | Implements validation logic for nodes attempting to assert their identity. Generally paired with an agent plugin of the same type.                                                                                |
+| UpstreamAuthority  | Allows SPIRE server to integrate with existing PKI systems.                                                                                                                                                       |
+| Notifier           | **Deprecated:** use BundlePublisher instead. Notified by SPIRE server for certain events that are happening or have happened. For events that are happening, the notifier can advise SPIRE server on the outcome. |
+| BundlePublisher    | Publishes the local trust bundle to a store.                                                                                                                                                                      |
 
 ## Built-in plugins
 
-| Type               | Name                                                                 | Description                                                                                                                 |
-|--------------------|----------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------|
-| DataStore          | [sql](/doc/plugin_server_datastore_sql.md)                           | An SQL database storage for SQLite, PostgreSQL and MySQL databases for the SPIRE datastore                                  |
-| KeyManager         | [aws_kms](/doc/plugin_server_keymanager_aws_kms.md)                  | A key manager which manages keys in AWS KMS                                                                                 |
-| KeyManager         | [disk](/doc/plugin_server_keymanager_disk.md)                        | A key manager which manages keys persisted on disk                                                                          |
-| KeyManager         | [memory](/doc/plugin_server_keymanager_memory.md)                    | A key manager which manages unpersisted keys in memory                                                                      |
-| CredentialComposer | [uniqueid](/doc/plugin_server_credentialcomposer_uniqueid.md)        | Adds the x509UniqueIdentifier attribute to workload X509-SVIDs.                                                             |
-| NodeAttestor       | [aws_iid](/doc/plugin_server_nodeattestor_aws_iid.md)                | A node attestor which attests agent identity using an AWS Instance Identity Document                                        |
-| NodeAttestor       | [azure_msi](/doc/plugin_server_nodeattestor_azure_msi.md)            | A node attestor which attests agent identity using an Azure MSI token                                                       |
-| NodeAttestor       | [gcp_iit](/doc/plugin_server_nodeattestor_gcp_iit.md)                | A node attestor which attests agent identity using a GCP Instance Identity Token                                            |
-| NodeAttestor       | [join_token](/doc/plugin_server_nodeattestor_jointoken.md)           | A node attestor which validates agents attesting with server-generated join tokens                                          |
-| NodeAttestor       | [k8s_sat](/doc/plugin_server_nodeattestor_k8s_sat.md) (deprecated)   | A node attestor which attests agent identity using a Kubernetes Service Account token                                       |
-| NodeAttestor       | [k8s_psat](/doc/plugin_server_nodeattestor_k8s_psat.md)              | A node attestor which attests agent identity using a Kubernetes Projected Service Account token                             |
-| NodeAttestor       | [sshpop](/doc/plugin_server_nodeattestor_sshpop.md)                  | A node attestor which attests agent identity using an existing ssh certificate                                              |
-| NodeAttestor       | [tpm_devid](/doc/plugin_server_nodeattestor_tpm_devid.md)            | A node attestor which attests agent identity using a TPM that has been provisioned with a DevID certificate                 |
-| NodeAttestor       | [x509pop](/doc/plugin_server_nodeattestor_x509pop.md)                | A node attestor which attests agent identity using an existing X.509 certificate                                            |
-| UpstreamAuthority  | [disk](/doc/plugin_server_upstreamauthority_disk.md)                 | Uses a CA loaded from disk to sign SPIRE server intermediate certificates.                                                  |
-| UpstreamAuthority  | [aws_pca](/doc/plugin_server_upstreamauthority_aws_pca.md)           | Uses a Private Certificate Authority from AWS Certificate Manager to sign SPIRE server intermediate certificates.           |
-| UpstreamAuthority  | [awssecret](/doc/plugin_server_upstreamauthority_awssecret.md)       | Uses a CA loaded from AWS SecretsManager to sign SPIRE server intermediate certificates.                                    |
-| UpstreamAuthority  | [gcp_cas](/doc/plugin_server_upstreamauthority_gcp_cas.md)           | Uses a Private Certificate Authority from GCP Certificate Authority Service to sign SPIRE Server intermediate certificates. |
-| UpstreamAuthority  | [vault](/doc/plugin_server_upstreamauthority_vault.md)               | Uses a PKI Secret Engine from HashiCorp Vault to sign SPIRE server intermediate certificates.                               |
-| UpstreamAuthority  | [spire](/doc/plugin_server_upstreamauthority_spire.md)               | Uses an upstream SPIRE server in the same trust domain to obtain intermediate signing certificates for SPIRE server.        |
-| UpstreamAuthority  | [cert-manager](/doc/plugin_server_upstreamauthority_cert_manager.md) | Uses a referenced cert-manager Issuer to request intermediate signing certificates.                                         |
-| Notifier           | [gcs_bundle](/doc/plugin_server_notifier_gcs_bundle.md)              | A notifier that pushes the latest trust bundle contents into an object in Google Cloud Storage.                             |
-| Notifier           | [k8sbundle](/doc/plugin_server_notifier_k8sbundle.md)                | A notifier that pushes the latest trust bundle contents into a Kubernetes ConfigMap.                                        |
-| BundlePublisher    | [aws_s3](/doc/plugin_server_bundlepublisher_aws_s3.md)               | Publishes trust bundles to an Amazon S3 bucket.                                                                             |
+| Type               | Name                                                                                                 | Description                                                                                                                                                         |
+|--------------------|------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| DataStore          | [sql](/doc/plugin_server_datastore_sql.md)                                                           | An SQL database storage for SQLite, PostgreSQL and MySQL databases for the SPIRE datastore                                                                          |
+| KeyManager         | [aws_kms](/doc/plugin_server_keymanager_aws_kms.md)                                                  | A key manager which manages keys in AWS KMS                                                                                                                         |
+| KeyManager         | [disk](/doc/plugin_server_keymanager_disk.md)                                                        | A key manager which manages keys persisted on disk                                                                                                                  |
+| KeyManager         | [hashicorp_vault](/doc/plugin_server_keymanager_hashicorp_vault.md)                                  | A key manager which manages keys in HashiCorp Vault's Transit Secret Engine                                                                                         |
+| KeyManager         | [kmip](/doc/plugin_server_keymanager_kmip.md)                                                        | A key manager which manages keys in a KMIP-compliant server over binary TTLV/TCP                                                                                    |
+| KeyManager         | [memory](/doc/plugin_server_keymanager_memory.md)                                                    | A key manager which manages unpersisted keys in memory                                                                                                              |
+| CredentialComposer | [uniqueid](/doc/plugin_server_credentialcomposer_uniqueid.md)                                        | Adds the x509UniqueIdentifier attribute to workload X509-SVIDs.                                                                                                     |
+| NodeAttestor       | [aws_iid](/doc/plugin_server_nodeattestor_aws_iid.md)                                                | A node attestor which attests agent identity using an AWS Instance Identity Document                                                                                |
+| NodeAttestor       | [azure_imds](/doc/plugin_server_nodeattestor_azure_imds.md)                                          | A node attestor which attests agent identity using the Azure Instance Metadata Service                                                                              |
+| NodeAttestor       | [azure_msi](/doc/plugin_server_nodeattestor_azure_msi.md)                                            | A node attestor which attests agent identity using an Azure MSI token                                                                                               |
+| NodeAttestor       | [gcp_iit](/doc/plugin_server_nodeattestor_gcp_iit.md)                                                | A node attestor which attests agent identity using a GCP Instance Identity Token                                                                                    |
+| NodeAttestor       | [join_token](/doc/plugin_server_nodeattestor_jointoken.md)                                           | A node attestor which validates agents attesting with server-generated join tokens                                                                                  |
+| NodeAttestor       | [k8s_psat](/doc/plugin_server_nodeattestor_k8s_psat.md)                                              | A node attestor which attests agent identity using a Kubernetes Projected Service Account token                                                                     |
+| NodeAttestor       | [sshpop](/doc/plugin_server_nodeattestor_sshpop.md)                                                  | A node attestor which attests agent identity using an existing ssh certificate                                                                                      |
+| NodeAttestor       | [tpm_devid](/doc/plugin_server_nodeattestor_tpm_devid.md)                                            | A node attestor which attests agent identity using a TPM that has been provisioned with a DevID certificate                                                         |
+| NodeAttestor       | [x509pop](/doc/plugin_server_nodeattestor_x509pop.md)                                                | A node attestor which attests agent identity using an existing X.509 certificate                                                                                    |
+| UpstreamAuthority  | [disk](/doc/plugin_server_upstreamauthority_disk.md)                                                 | Uses a CA loaded from disk to sign SPIRE server intermediate certificates.                                                                                          |
+| UpstreamAuthority  | [aws_pca](/doc/plugin_server_upstreamauthority_aws_pca.md)                                           | Uses a Private Certificate Authority from AWS Certificate Manager to sign SPIRE server intermediate certificates.                                                   |
+| UpstreamAuthority  | [awssecret](/doc/plugin_server_upstreamauthority_awssecret.md)                                       | Uses a CA loaded from AWS SecretsManager to sign SPIRE server intermediate certificates.                                                                            |
+| UpstreamAuthority  | [gcp_cas](/doc/plugin_server_upstreamauthority_gcp_cas.md)                                           | Uses a Private Certificate Authority from GCP Certificate Authority Service to sign SPIRE Server intermediate certificates.                                         |
+| UpstreamAuthority  | [vault](/doc/plugin_server_upstreamauthority_vault.md)                                               | Uses a PKI Secret Engine from HashiCorp Vault to sign SPIRE server intermediate certificates.                                                                       |
+| UpstreamAuthority  | [spire](/doc/plugin_server_upstreamauthority_spire.md)                                               | Uses an upstream SPIRE server in the same trust domain to obtain intermediate signing certificates for SPIRE server.                                                |
+| UpstreamAuthority  | [cert-manager](/doc/plugin_server_upstreamauthority_cert_manager.md)                                 | Uses a referenced cert-manager Issuer to request intermediate signing certificates.                                                                                 |
+| Notifier           | [gcs_bundle](/doc/plugin_server_notifier_gcs_bundle.md)                                              | **Deprecated:** use the `gcp_cloudstorage` BundlePublisher instead. A notifier that pushes the latest trust bundle contents into an object in Google Cloud Storage. |
+| Notifier           | [k8sbundle](/doc/plugin_server_notifier_k8sbundle.md)                                                | **Deprecated:** use the `k8s_configmap` BundlePublisher instead. A notifier that pushes the latest trust bundle contents into a Kubernetes ConfigMap.               |
+| BundlePublisher    | [aws_s3](/doc/plugin_server_bundlepublisher_aws_s3.md)                                               | Publishes the trust bundle to an Amazon S3 bucket.                                                                                                                  |
+| BundlePublisher    | [gcp_cloudstorage](/doc/plugin_server_bundlepublisher_gcp_cloudstorage.md)                           | Publishes the trust bundle to a Google Cloud Storage bucket.                                                                                                        |
+| BundlePublisher    | [aws_rolesanywhere_trustanchor](/doc/plugin_server_bundlepublisher_aws_rolesanywhere_trustanchor.md) | Publishes the trust bundle to an AWS IAM Roles Anywhere trust anchor.                                                                                               |
+| BundlePublisher    | [azure_blob](/doc/plugin_server_bundlepublisher_azure_blob.md)                                       | Publishes the trust bundle to an Azure Blob Storage account.                                                                                                        |
+| BundlePublisher    | [k8s_configmap](/doc/plugin_server_bundlepublisher_k8s_configmap.md)                                 | Publishes the trust bundle to a Kubernetes ConfigMap.                                                                                                               |
 
 ## Server configuration file
 
@@ -52,35 +58,52 @@ SPIRE configuration files may be represented in either HCL or JSON. Please see t
 If the -expandEnv flag is passed to SPIRE, `$VARIABLE` or `${VARIABLE}` style environment variables are expanded before parsing.
 This may be useful for templating configuration files, for example across different trust domains, or for inserting secrets like database connection passwords.
 
-| Configuration                | Description                                                                                                                                                                                                                                         | Default                                                        |
-|:-----------------------------|:----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:---------------------------------------------------------------|
-| `admin_ids`                  | SPIFFE IDs that, when present in a caller's X509-SVID, grant that caller admin privileges. The admin IDs must reside on the server trust domain or a federated one, and need not have a corresponding admin registration entry with the server.     |                                                                |
-| `agent_ttl`                  | The TTL to use for agent SVIDs                                                                                                                                                                                                                      | The value of `default_x509_svid_ttl`                           |
-| `audit_log_enabled`          | If true, enables audit logging                                                                                                                                                                                                                      | false                                                          |
-| `bind_address`               | IP address or DNS name of the SPIRE server                                                                                                                                                                                                          | 0.0.0.0                                                        |
-| `bind_port`                  | HTTP Port number of the SPIRE server                                                                                                                                                                                                                | 8081                                                           |
-| `ca_key_type`                | The key type used for the server CA (both X509 and JWT), &lt;rsa-2048&vert;rsa-4096&vert;ec-p256&vert;ec-p384&gt;                                                                                                                                   | ec-p256 (the JWT key type can be overridden by `jwt_key_type`) |
-| `ca_subject`                 | The Subject that CA certificates should use (see below)                                                                                                                                                                                             |                                                                |
-| `ca_ttl`                     | The default CA/signing key TTL                                                                                                                                                                                                                      | 24h                                                            |
-| `data_dir`                   | A directory the server can use for its runtime                                                                                                                                                                                                      |                                                                |
-| `default_x509_svid_ttl`      | The default X509-SVID TTL                                                                                                                                                                                                                           | 1h                                                             |
-| `default_jwt_svid_ttl`       | The default JWT-SVID TTL                                                                                                                                                                                                                            | 5m                                                             |
-| `experimental`               | The experimental options that are subject to change or removal (see below)                                                                                                                                                                          |                                                                |
-| `federation`                 | Bundle endpoints configuration section used for [federation](#federation-configuration)                                                                                                                                                             |                                                                |
-| `jwt_key_type`               | The key type used for the server CA (JWT), &lt;rsa-2048&vert;rsa-4096&vert;ec-p256&vert;ec-p384&gt;                                                                                                                                                 | The value of `ca_key_type` or ec-p256 if not defined           |
-| `jwt_issuer`                 | The issuer claim used when minting JWT-SVIDs                                                                                                                                                                                                        |                                                                |
-| `log_file`                   | File to write logs to                                                                                                                                                                                                                               |                                                                |
-| `log_level`                  | Sets the logging level &lt;DEBUG&vert;INFO&vert;WARN&vert;ERROR&gt;                                                                                                                                                                                 | INFO                                                           |
-| `log_format`                 | Format of logs, &lt;text&vert;json&gt;                                                                                                                                                                                                              | text                                                           |
-| `log_source_location`        | If true, logs include source file, line number, and method name fields (adds a bit of runtime cost)                                                                                                                                                 | false                                                          |
-| `profiling_enabled`          | If true, enables a [net/http/pprof](https://pkg.go.dev/net/http/pprof) endpoint                                                                                                                                                                     | false                                                          |
-| `profiling_freq`             | Frequency of dumping profiling data to disk. Only enabled when `profiling_enabled` is `true` and `profiling_freq` > 0.                                                                                                                              |                                                                |
-| `profiling_names`            | List of profile names that will be dumped to disk on each profiling tick, see [Profiling Names](#profiling-names)                                                                                                                                   |                                                                |
-| `profiling_port`             | Port number of the [net/http/pprof](https://pkg.go.dev/net/http/pprof) endpoint. Only used when `profiling_enabled` is `true`.                                                                                                                      |                                                                |
-| `ratelimit`                  | Rate limiting configurations, usually used when the server is behind a load balancer (see below)                                                                                                                                                    |                                                                |
-| `socket_path`                | Path to bind the SPIRE Server API socket to (Unix only)                                                                                                                                                                                             | /tmp/spire-server/private/api.sock                             |
-| `trust_domain`               | The trust domain that this server belongs to (should be no more than 255 characters)                                                                                                                                                                |                                                                |
-| `exclude_sn_from_ca_subject` | Do not include certificate serial number in the subject field                                                                                                                                                                                       | false                                                          |
+| Configuration                           | Description                                                                                                                                                                                                                                                                                                                                                                            | Default                                                        |
+| :-------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------- |
+| `admin_ids`                             | SPIFFE IDs that, when present in a caller's X509-SVID, grant that caller admin privileges. The admin IDs must reside on the server trust domain or a federated one, and need not have a corresponding admin registration entry with the server.                                                                                                                                        |                                                                |
+| `agent_ttl`                             | The TTL to use for agent SVIDs. See [CA and SVID lifetimes](#ca-and-svid-lifetimes).                                                                                                                                                                                                                                                                                                   | The value of `default_x509_svid_ttl`                           |
+| `audit_log_enabled`                     | If true, enables audit logging                                                                                                                                                                                                                                                                                                                                                         | false                                                          |
+| `audit_log_exclude_agent_sync`          | If true, omits successful `GetBundle`, `GetFederatedBundle`, `GetAuthorizedEntries`, and `SyncAuthorizedEntries` audit records regardless of caller identity. Error audit records and other RPCs retain their existing behavior. Only applies when `audit_log_enabled` is true.                                                                                                        | false                                                          |
+| `bind_address`                          | IP address or DNS name of the SPIRE server                                                                                                                                                                                                                                                                                                                                             | 0.0.0.0                                                        |
+| `bind_port`                             | HTTP Port number of the SPIRE server                                                                                                                                                                                                                                                                                                                                                   | 8081                                                           |
+| `ca_key_type`                           | The key type used for the server CA (both X509 and JWT), &lt;rsa-2048&vert;rsa-4096&vert;ec-p256&vert;ec-p384&gt;                                                                                                                                                                                                                                                                      | ec-p256 (the JWT key type can be overridden by `jwt_key_type`) |
+| `ca_subject`                            | The Subject that CA certificates should use (see below)                                                                                                                                                                                                                                                                                                                                |                                                                |
+| `ca_ttl`                                | The default CA/signing key TTL. See [CA and SVID lifetimes](#ca-and-svid-lifetimes).                                                                                                                                                                                                                                                                                                   | 24h                                                            |
+| `data_dir`                              | A directory the server can use for its runtime                                                                                                                                                                                                                                                                                                                                         |                                                                |
+| `default_x509_svid_ttl`                 | The default X509-SVID TTL. See [CA and SVID lifetimes](#ca-and-svid-lifetimes).                                                                                                                                                                                                                                                                                                        | 1h                                                             |
+| `default_jwt_svid_ttl`                  | The default JWT-SVID TTL. See [CA and SVID lifetimes](#ca-and-svid-lifetimes).                                                                                                                                                                                                                                                                                                         | 5m                                                             |
+| `experimental`                          | The experimental options that are subject to change or removal (see below)                                                                                                                                                                                                                                                                                                             |                                                                |
+| `federation`                            | Bundle endpoints configuration section used for [federation](#federation-configuration)                                                                                                                                                                                                                                                                                                |                                                                |
+| `disable_jwt_svids`                     | If true, completely disables JWT-SVID functionality. The server will not generate JWT keys, sign JWT-SVIDs, or implement JWT-related API calls. This is useful for deployments that don't need JWT-SVIDs support.                                                                                                                                                                      | false                                                          |
+| `jwt_key_type`                          | The key type used for the server CA (JWT), &lt;rsa-2048&vert;rsa-4096&vert;ec-p256&vert;ec-p384&gt;                                                                                                                                                                                                                                                                                    | The value of `ca_key_type` or ec-p256 if not defined           |
+| `jwt_issuer`                            | The issuer claim used when minting JWT-SVIDs                                                                                                                                                                                                                                                                                                                                           |                                                                |
+| `log_file`                              | File to write logs to. An external tool can move it aside on any platform, and SPIRE Server then starts a new one on receipt of `SIGUSR2` on POSIX, or of the reopen control code on Windows (see below)                                                                                                                                                                               |                                                                |
+| `log_file_rotation`                     | Rotates `log_file` in process rather than relying on an external tool (below). Works on all platforms. Disabled unless configured                                                                                                                                                                                                                                                      |                                                                |
+| `log_level`                             | Sets the logging level &lt;DEBUG&vert;INFO&vert;WARN&vert;ERROR&gt;                                                                                                                                                                                                                                                                                                                    | INFO                                                           |
+| `log_format`                            | Format of logs, &lt;text&vert;json&gt;. See [Logging](logging.md).                                                                                                                                                                                                                                                                                                                     | text                                                           |
+| `log_source_location`                   | If true, logs include source file, line number, and method name fields (adds a bit of runtime cost)                                                                                                                                                                                                                                                                                    | false                                                          |
+| `profiling_enabled`                     | If true, enables a [net/http/pprof](https://pkg.go.dev/net/http/pprof) endpoint                                                                                                                                                                                                                                                                                                        | false                                                          |
+| `proxy_protocol_trusted_cidrs`          | List of trusted CIDRs for [PROXY protocol](https://www.haproxy.org/download/2.9/doc/proxy-protocol.txt) support. When non-empty, the TCP listener accepts PROXY protocol headers only from sources in these CIDRs; connections from other sources that send PROXY headers are rejected. Useful when the server is behind a load balancer so per-IP rate limiting sees real client IPs. |                                                                |
+| `profiling_freq`                        | Frequency of dumping profiling data to disk. Only enabled when `profiling_enabled` is `true` and `profiling_freq` > 0.                                                                                                                                                                                                                                                                 |                                                                |
+| `profiling_names`                       | List of profile names that will be dumped to disk on each profiling tick, see [Profiling Names](#profiling-names)                                                                                                                                                                                                                                                                      |                                                                |
+| `profiling_port`                        | Port number of the [net/http/pprof](https://pkg.go.dev/net/http/pprof) endpoint. Only used when `profiling_enabled` is `true`.                                                                                                                                                                                                                                                         |                                                                |
+| `prune_attested_nodes_expired_for`      | Enables periodic purging of attested node records with expired SVIDs where the expiry time further in the past than the specified duration. Non-reattestable nodes are not pruned unless `prune_tofu_nodes` is set to `true`. Banned nodes are not pruned. Join-token nodes also cascade-delete the `CreateJoinToken` alias entry on prune or `agent evict`/`purge` (forward-only).    |                                                                |
+| `prune_attested_nodes_batch_size`       | Maximum number of expired attested nodes pruned per cycle. Only applies when `prune_attested_nodes_expired_for` is set.                                                                                                                                                                                                                                                                | 1000                                                           |
+| `prune_tofu_nodes`                      | Includes expired TOFU nodes into consideration for pruning. This does not affect banned nodes, which are not pruned.                                                                                                                                                                                                                                                                   | false                                                          |
+| `ratelimit`                             | Rate limiting configurations, usually used when the server is behind a load balancer (see below)                                                                                                                                                                                                                                                                                       |                                                                |
+| `socket_path`                           | Path to bind the SPIRE Server API socket to (Unix only)                                                                                                                                                                                                                                                                                                                                | /tmp/spire-server/private/api.sock                             |
+| `trust_domain`                          | The trust domain that this server belongs to (should be no more than 255 characters)                                                                                                                                                                                                                                                                                                   |                                                                |
+| `max_attested_node_info_staleness`      | How long to cache and use attested node information before requiring fetching up to date data from the datastore.                                                                                                                                                                                                                                                                      | 0s                                                             |
+
+| tls_config         | Description                                                                                                                                                                                           | Default                      |
+|--------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------------|
+| `min_tls_version`  | Minimum TLS version for terminating server listeners (e.g. `VersionTLS12`, `VersionTLS13`). Values below `VersionTLS12` are rejected at startup. When omitted, defaults to TLS 1.2.                   | TLS 1.2 when block is present|
+| `cipher_suites`    | Allowed TLS 1.2 cipher suites for terminating listeners. Ignored when `min_tls_version` is `VersionTLS13` or higher (Go negotiates TLS 1.3 ciphers). Insecure suite names are filtered with a warning.| Go defaults if all filtered  |
+| `curve_preferences`| Preferred key exchange curves (e.g. `X25519MLKEM768`, `X25519`, `secp256r1`). When minimum TLS is 1.2, at least one classical curve is required.                                                      |                              |
+
+`tls_config` is a top-level `server { ... }` block (not experimental). It is parsed once at startup; invalid values prevent the server from starting. Settings apply only to **inbound TLS listeners** — gRPC TCP API, federation bundle HTTPS endpoint, and Prometheus HTTPS (`ApplyPolicy` with `WithServerTLSConfig()`). They are **not** applied to outbound TLS clients.
+
+When `experimental.require_pq_kem` is enabled, it overrides `min_tls_version` and `curve_preferences` on connections where the policy is applied.
 
 | ca_subject                  | Description                    | Default        |
 |:----------------------------|--------------------------------|----------------|
@@ -88,27 +111,75 @@ This may be useful for templating configuration files, for example across differ
 | `organization`              | Array of `Organization` values |                |
 | `common_name`               | The `CommonName` value         |                |
 
-| experimental             | Description                                                                                                                                                                                                            | Default                            |
-|:-------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------------------|
-| `cache_reload_interval`  | The amount of time between two reloads of the in-memory entry cache. Increasing this will mitigate high database load for extra large deployments, but will also slow propagation of new or updated entries to agents. | 5s                                 |
-| `events_based_cache`     | Use events to update the cache with what's changed since the last update. Enabling this will reduce overhead on the database.                                                                                          | false                              |
-| `prune_events_older_than`| How old an event can be before being deleted. Used with events based cache. Decreasing this will keep the events table smaller, but will increase risk of missing an event if connection to the database is down.      | 12h                                |
-| `auth_opa_policy_engine` | The [auth opa_policy engine](/doc/authorization_policy_engine.md) used for authorization decisions                                                                                                                     | default SPIRE authorization policy |
-| `named_pipe_name`        | Pipe name of the SPIRE Server API named pipe (Windows only)                                                                                                                                                            | \spire-server\private\api          |
+| log_file_rotation | Description                                                                                                                                                                      | Default |
+|:------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------|
+| `max_size_mb`     | Size in MiB that `log_file` may reach before it is rotated. An explicit `0` disables size based rotation, leaving it to `SIGUSR2` on POSIX or the reopen control code on Windows | 100     |
+| `max_files`       | Number of rotated files to retain, not counting the file currently being written. An explicit `0` retains every rotated file                                                     | 7       |
 
-| ratelimit     | Description                                                                                                                                               | Default |
-|:--------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------|---------|
-| `attestation` | Whether or not to rate limit node attestation. If true, node attestation is rate limited to one attempt per second per IP address.                        | true    |
-| `signing`     | Whether or not to rate limit JWT and X509 signing. If true, JWT and X509 signing are rate limited to 500 requests per second per IP address (separately). | true    |
+Requires `log_file` to be set. Rotation moves the accumulated content aside to a
+timestamped sibling of `log_file` (for example `server-2026-08-18T22-43-01.123.log`)
+and keeps writing to `log_file` itself. `max_files` is applied when a rotation
+happens, not on a timer. A key left unset takes its default, so a block with no
+keys still rotates and still prunes.
+
+A reopen also forces an immediate rotation, whether it arrives as `SIGUSR2` on
+POSIX or as the reopen control code on Windows. Rotating an already-empty file is
+a no-op, so a scheduled reopen on an idle service does not consume the
+`max_files` budget.
+
+| experimental                    | Description                                                                                                                                                                                                            | Default                            |
+|:-------------------------------:|:----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------:|:----------------------------------:|
+| `agent_spiffe_id_as_selector`   | Enable adding the agent spiffe_id to the list of node selectors automatically.                                                                                                                                         | false                              |
+| `allow_nonconforming_agent_ids` | Allow node attestors to produce agent IDs outside of `/spire/agent/<attestor>/`. When false, such attestations fail.                                                                                                   | false                              |
+| `cache_reload_interval`         | The amount of time between two reloads of the in-memory entry cache. Increasing this will mitigate high database load for extra large deployments, but will also slow propagation of new or updated entries to agents. | 5s                                 |
+| `full_cache_reload_interval`    | How often to a full reload of the cache from the database when using the events based cache.                                                                                                                           | 24h                                |
+| `events_based_cache`            | Use events to update the cache with what's changed since the last update. Enabling this will reduce overhead on the database.                                                                                          | false                              |
+| `prune_events_older_than`       | How old an event can be before being deleted. Used with events based cache. Decreasing this will keep the events table smaller, but will increase risk of missing an event if connection to the database is down.      | 12h                                |
+| `event_timeout`                 | Maximum time to wait for an event to come in before giving up.                                                                                                                                                         | 15m                                |
+| `auth_opa_policy_engine`        | The [auth opa_policy engine](/doc/authorization_policy_engine.md) used for authorization decisions                                                                                                                     | default SPIRE authorization policy |
+| `named_pipe_name`               | Pipe name of the SPIRE Server API named pipe (Windows only)                                                                                                                                                            | \spire-server\private\api          |
+| `require_pq_kem`                | Require post-quantum-safe KEM on terminating server listeners.                                                                                                                                                         | false                              |
+| `enable_wit_svids`              | Enable the WIT-SVID profile and its APIs. When disabled, WIT-SVID APIs return Unimplemented                                                                                                                            | false                              |
+| `wit_issuer`                    | The issuer claim used when minting WIT-SVIDs                                                                                                                                                                           |                                    |
+| `default_wit_svid_ttl`          | The default WIT-SVID TTL. See [CA and SVID lifetimes](#ca-and-svid-lifetimes).                                                                                                                                         | 1h                                 |
+
+| ratelimit     | Description                                                                                                                                        | Default |
+|:--------------|----------------------------------------------------------------------------------------------------------------------------------------------------|---------|
+| `attestation` | whether to rate limit node attestation. If true, node attestation is rate limited to one attempt per second per IP address.                        | true    |
+| `signing`     | whether to rate limit JWT and X509 signing. If true, JWT and X509 signing are rate limited to 500 requests per second per IP address (separately). | true    |
 
 | auth_opa_policy_engine | Description                                       | Default |
 |:-----------------------|---------------------------------------------------|---------|
 | `local`                | Local OPA configuration for authorization policy. |         |
 
-| auth_opa_policy_engine.local  | Description                                              | Default        |
-|:------------------------------|----------------------------------------------------------|----------------|
-| `rego_path`                   | File to retrieve OPA rego policy for authorization.      |                |
-| `policy_data_path`            | File to retrieve databindings for policy evaluation.     |                |
+| auth_opa_policy_engine.local  | Description                                                                               | Default        |
+|:------------------------------|-------------------------------------------------------------------------------------------|----------------|
+| `rego_path`                   | File to retrieve OPA rego policy for authorization.                                       |                |
+| `policy_data_path`            | File to retrieve databindings for policy evaluation.                                      |                |
+
+### CA and SVID lifetimes
+
+SVID TTLs specify the requested lifetime. SPIRE caps each issued X509-SVID at the effective expiration of its signing CA chain, and each JWT-SVID or WIT-SVID at the expiration of its signing key. An issued SVID can therefore have a shorter lifetime than requested.
+
+SPIRE schedules activation of the next CA or signing key when the current authority has one sixth of its lifetime remaining, capped at seven days. To avoid shortening SVID lifetimes during normal scheduled rotation, plan for:
+
+```text
+SVID TTL <= min(authority lifetime / 6, 7 days)
+```
+
+For a CA or signing key that receives the full configured `ca_ttl`, this means setting `ca_ttl` to at least six times the longest requested SVID TTL, and keeping that SVID TTL at or below seven days. Allow some margin for clock skew and rotation scheduling delays.
+
+Consider all sources of requested SVID lifetimes:
+
+1. `default_x509_svid_ttl`, `default_jwt_svid_ttl`, `default_wit_svid_ttl`.
+2. `agent_ttl`.
+3. TTL overrides in registration entries and TTLs requested through the SVID minting APIs.
+
+When an UpstreamAuthority plugin is configured, `ca_ttl` is the _requested_ X.509 CA lifetime. The _usable_ lifetime depends on how the upstream authority manages certificate lifetimes and rotation; so ensure that it can issue CAs for the requested lifetime on each renewal.
+
+For nested SPIRE deployments, apply the rotation relationship at each hop as described in [the UpstreamAuthority "spire" documentation](/doc/plugin_server_upstreamauthority_spire.md#ca-lifetimes).
+
+SPIRE Server emits warnings tagged `alert_type=shortened_lifetime` when requested TTLs exceed its rotation guarantees, or when CA preparation, issuance, or activation encounters limited usable lifetime. See [Logging](logging.md#alert-markers) for the general alert marker convention.
 
 ### Profiling Names
 
@@ -138,14 +209,63 @@ plugins {
 
 The following configuration options are available to configure a plugin:
 
-| Configuration   | Description                                                                   |
-|-----------------|-------------------------------------------------------------------------------|
-| plugin_cmd      | Path to the plugin implementation binary (optional, not needed for built-ins) |
-| plugin_checksum | An optional sha256 of the plugin binary  (optional, not needed for built-ins) |
-| enabled         | Enable or disable the plugin (enabled by default)                             |
-| plugin_data     | Plugin-specific data                                                          |
+| Configuration    | Description                                                                            |
+|------------------|----------------------------------------------------------------------------------------|
+| plugin_cmd       | Path to the plugin implementation binary (optional, not needed for built-ins)          |
+| plugin_checksum  | An optional sha256 of the plugin binary  (optional, not needed for built-ins)          |
+| enabled          | Enable or disable the plugin (enabled by default)                                      |
+| plugin_data      | Plugin-specific data (mutually exclusive with `plugin_data_file`)                      |
+| plugin_data_file | Path to a file containing plugin-specific data (mutually exclusive with `plugin_data`) |
 
 Please see the [built-in plugins](#built-in-plugins) section below for information on plugins that are available out-of-the-box.
+
+### Examples
+
+#### Built-in Plugin with Static Configuration
+
+```hcl
+plugins {
+    SomeType "some_plugin" {
+        plugin_data = {
+            option1 = "foo"
+            option2 = 3
+        }
+    }
+}
+```
+
+#### External Plugin with Dynamic Configuration
+
+In the `agent.conf`, declare the plugin using the `plugin_data_file` option to source the plugin configuration from file.
+
+```hcl
+plugins {
+    SomeType "some_plugin" {
+        plugin_cmd = "./path/to/plugin"
+        plugin_checksum = "4e1243bd22c66e76c2ba9eddc1f91394e57f9f83"
+        plugin_data_file = "some_plugin.conf"
+    }
+}
+```
+
+And then in `some_plugin.conf` you place the plugin configuration:
+
+```hcl
+option1 = "foo"
+option2 = 3
+```
+
+### Reconfiguring plugins (Posix only)
+
+Plugins that use dynamic configuration sources (i.e. `plugin_data_file`) can be reconfigured at runtime by sending a `SIGUSR1` signal to SPIRE Server. This is true for both built-in and external plugins.
+
+SPIRE Server, upon receipt of the signal, does the following:
+
+1. Reloads the plugin data
+2. Compares the plugin data to the previous data
+3. If changed, the plugin is reconfigured with the new data
+
+**Note** The DataStore is not reconfigurable even when configured with a dynamic data source (e.g. `plugin_data_file`).
 
 ## Federation configuration
 
@@ -183,6 +303,7 @@ server {
             bundle_endpoint_profile "https_spiffe" {
                 endpoint_spiffe_id = "spiffe://domain2.test/beserver"
             }
+            bootstrap_bundle_path = "/etc/spire/domain2.pem"
         }
     }
 }
@@ -199,8 +320,8 @@ This optional section contains the configurables used by SPIRE Server to expose 
 |-----------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | address                                       | IP address where this server will listen for HTTP requests                                                                                                                                                                                         |
 | port                                          | TCP port number where this server will listen for HTTP requests                                                                                                                                                                                    |
-| refresh_hint                                  | Allow manually specifying a [refresh hint](https://github.com/spiffe/spiffe/blob/main/standards/SPIFFE_Trust_Domain_and_Bundle.md#412-refresh-hint). Defaults to 5 minutes. Small values allow to retrieve trust bundle updates in a timely manner |
-| profile "&lt;https_web&vert;https_spiffe&gt;" | Allow to configure bundle profile                                                                                                                                                                                                                  |
+| refresh_hint                                  | Allow manually specifying a [refresh hint](https://github.com/spiffe/spiffe/blob/main/standards/SPIFFE_Trust_Domain_and_Bundle.md#412-refresh-hint). Defaults to 5 minutes. Small values allow retrieving trust bundle updates in a timely manner  |
+| profile "<https_web&vert;https_spiffe>"       | Allows configuring bundle profile                                                                                                                                                                                                                  |
 
 ### Configuration options for `federation.bundle_endpoint.profile`
 
@@ -208,17 +329,25 @@ When setting a `bundle_endpoint`, it is `required` to specify the bundle profile
 
 Allowed profiles:
 
-- `https_web` allow to configure the [Automated Certificate Management Environment](#Configuration options for `federation.bundle_endpoint.profile "https_web".acme`) section.
+- `https_web` allows configuring either the [Automated Certificate Management Environment](#configuration-options-for-federationbundle_endpointprofile-https_webacme) or the [serving cert file](#configuration-options-for-federationbundle_endpointprofile-https_webserving_cert_file) section.
 - `https_spiffe`
 
 ### Configuration options for `federation.bundle_endpoint.profile "https_web".acme`
 
-| Configuration | Description                                                                                                               | Default                                        |
-|---------------|---------------------------------------------------------------------------------------------------------------------------|------------------------------------------------|
+| Configuration | Description                                                                                                               | Default                                          |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------ |
 | directory_url | Directory endpoint URL                                                                                                    | <https://acme-v02.api.letsencrypt.org/directory> |
-| domain_name   | Domain for which the certificate manager tries to retrieve new certificates                                               |                                                |
-| email         | Contact email address. This is used by CAs, such as Let's Encrypt, to notify about problems with issued certificates      |                                                |
-| tos_accepted  | ACME Terms of Service acceptance. If not true, and the provider requires acceptance, then certificate retrieval will fail | false                                          |
+| domain_name   | Domain for which the certificate manager tries to retrieve new certificates                                               |                                                  |
+| email         | Contact email address. This is used by CAs, such as Let's Encrypt, to notify about problems with issued certificates      |                                                  |
+| tos_accepted  | ACME Terms of Service acceptance. If not true, and the provider requires acceptance, then certificate retrieval will fail | false                                            |
+
+### Configuration options for `federation.bundle_endpoint.profile "https_web".serving_cert_file`
+
+| Configuration      | Description                                     | Default |
+|--------------------|-------------------------------------------------|---------|
+| cert_file_path     | Path to the certificate file, in PEM format     |         |
+| key_file_path      | Path to the key file, in PEM format             |         |
+| file_sync_interval | Interval on which to reload the files from disk | 1h      |
 
 ### Configuration options for `federation.bundle_endpoint.profile "https_spiffe"`
 
@@ -232,6 +361,8 @@ The optional `federates_with` section is a map of bundle endpoint profile config
 |---------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------|---------|
 | bundle_endpoint_url                                           | URL of the SPIFFE bundle endpoint that provides the trust bundle to federate with. Must use the HTTPS protocol. |         |
 | bundle_endpoint_profile "&lt;https_web&vert;https_spiffe&gt;" | Configuration of the SPIFFE endpoint profile type.                                                              |         |
+| bootstrap_bundle_path                                         | Path to a bundle used to authenticate the first `https_spiffe` fetch if none is stored yet.                     |         |
+| bootstrap_bundle_format                                       | Format of `bootstrap_bundle_path`. Either `pem` or `spiffe`.                                                    | pem     |
 
 SPIRE supports the `https_web` and `https_spiffe` bundle endpoint profiles.
 
@@ -239,15 +370,17 @@ The `https_web` profile does not require additional settings.
 
 Trust domains configured with the `https_spiffe` bundle endpoint profile must specify the expected SPIFFE ID of the remote SPIFFE bundle endpoint server using the `endpoint_spiffe_id` setting as part of the configuration.
 
+`bootstrap_bundle_path` replaces the need to run `spire-server bundle set` before the first `https_spiffe` poll. It authenticates that first connection only. The bundle returned by the endpoint is stored with a create, not an update. Subsequent refreshes use the stored bundle. The path is not watched.
+
 For more information about the different profiles defined in SPIFFE, along with the security considerations for setting up SPIFFE Federation, please refer to the [SPIFFE Federation standard](https://github.com/spiffe/spiffe/blob/main/standards/SPIFFE_Federation.md).
 
 ## Telemetry configuration
 
-Please see the [Telemetry Configuration](./telemetry_config.md) guide for more information about configuring SPIRE Server to emit telemetry.
+Please see the [Telemetry Configuration](./telemetry/telemetry_config.md) guide for more information about configuring SPIRE Server to emit telemetry.
 
 ## Health check configuration
 
-The server can expose an additional endpoint that can be used for health checking. It is enabled by setting `listener_enabled = true`. Currently it exposes 2 paths: one for liveness (is server up?) and one for readiness (is server ready to serve requests?). By default, health checking endpoint will listen on localhost:80, unless configured otherwise.
+The server can expose an additional endpoint that can be used for health checking. It is enabled by setting `listener_enabled = true`. Currently, it exposes 2 paths: one for liveness (is server up?) and one for readiness (is server ready to serve requests?). By default, health checking endpoint will listen on localhost:80, unless configured otherwise.
 
 ```hcl
 health_checks {
@@ -256,8 +389,11 @@ health_checks {
         bind_port = "8080"
         live_path = "/live"
         ready_path = "/ready"
+        check_interval = "1m"
 }
 ```
+
+Each health check runs every `check_interval` (default `1m`, must be longer than `1s`) while it passes. A failing check is retried every second until it recovers, and its failure is logged once a minute; the other checks keep their own schedule.
 
 ## Command line options
 
@@ -297,6 +433,21 @@ When starting the service, all the arguments to execute SPIRE Server with the `r
 > sc.exe start spire-server run -config c:\spire\conf\server\server.conf
 ```
 
+##### Rotating logs on Windows
+
+A Windows service has no console, so deployments generally set `log_file`. An
+external tool can move that file aside, and the reopen is then requested with a
+user defined service control code, since Windows has no `SIGUSR2`.
+
+```bash
+> sc.exe control spire-server 128
+```
+
+Configure [`log_file_rotation`](#server-configuration-file) instead to have
+SPIRE Server rotate the file itself, with no external tool involved. Either way the
+file is opened for append, so restarting the service does not reset it. Running
+from a console has no trigger, since control codes only reach a service.
+
 ### `spire-server token generate`
 
 Generates one node join token and creates a registration entry for it. This token can be used to
@@ -313,52 +464,59 @@ human-readable registration entry name in addition to the token-based ID.
 
 Creates registration entries.
 
-| Command          | Action                                                                                                                                                                                            | Default                                         |
-|:-----------------|:--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:------------------------------------------------|
-| `-admin`         | If set, the SPIFFE ID in this entry will be granted access to the Server APIs                                                                                                                     |                                                 |
-| `-data`          | Path to a file containing registration data in JSON format (optional, if specified, other flags related with entry information must be omitted). If set to '-', read the JSON from stdin.         |                                                 |
-| `-dns`           | A DNS name that will be included in SVIDs issued based on this entry, where appropriate. Can be used more than once                                                                               |                                                 |
-| `-downstream`    | A boolean value that, when set, indicates that the entry describes a downstream SPIRE server                                                                                                      |                                                 |
-| `-entryExpiry`   | An expiry, from epoch in seconds, for the resulting registration entry to be pruned from the datastore. Please note that this is a data management feature and not a security feature (optional). |                                                 |
-| `-entryID`       | A user-specified ID for the newly created registration entry (optional). If no entry ID is provided, one will be generated during creation                                                        |                                                 |
-| `-federatesWith` | A list of trust domain SPIFFE IDs representing the trust domains this registration entry federates with. A bundle for that trust domain must already exist                                        |                                                 |
-| `-node`          | If set, this entry will be applied to matching nodes rather than workloads                                                                                                                        |                                                 |
-| `-parentID`      | The SPIFFE ID of this record's parent.                                                                                                                                                            |                                                 |
-| `-selector`      | A colon-delimited type:value selector used for attestation. This parameter can be used more than once, to specify multiple selectors that must be satisfied.                                      |                                                 |
-| `-socketPath`    | Path to the SPIRE Server API socket                                                                                                                                                               | /tmp/spire-server/private/api.sock              |
-| `-spiffeID`      | The SPIFFE ID that this record represents and will be set to the SVID issued.                                                                                                                     |                                                 |
-| `-x509SVIDTTL`   | A TTL, in seconds, for any X509-SVID issued as a result of this record. Overrides `-ttl` value.                                                                                                   | The TTL configured with `default_x509_svid_ttl` |
-| `-jwtSVIDTTL`    | A TTL, in seconds, for any JWT-SVID issued as a result of this record. Overrides `-ttl` value.                                                                                                    | The TTL configured with `default_jwt_svid_ttl`  |
-| `-storeSVID`     | A boolean value that, when set, indicates that the resulting issued SVID from this entry must be stored through an SVIDStore plugin                                                               |
+| Command                    | Action                                                                                                                                                                                            | Default                                         |
+|:---------------------------|:--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:------------------------------------------------|
+| `-admin`                   | If set, the SPIFFE ID in this entry will be granted access to the Server APIs                                                                                                                     |                                                 |
+| `-data`                    | Path to a file containing registration data in JSON format (optional, if specified, other flags related with entry information must be omitted). If set to '-', read the JSON from stdin.         |                                                 |
+| `-disableX509SVIDPrefetch` | A boolean value that, when set, disables prefetching X509 SVID for this entry                                                                                                                     | `false`                                         |
+| `-dns`                     | A DNS name that will be included in SVIDs issued based on this entry, where appropriate. Can be used more than once                                                                               |                                                 |
+| `-downstream`              | A boolean value that, when set, indicates that the entry describes a downstream SPIRE server                                                                                                      |                                                 |
+| `-entryExpiry`             | An expiry, from epoch in seconds, for the resulting registration entry to be pruned from the datastore. Please note that this is a data management feature and not a security feature (optional). |                                                 |
+| `-entryID`                 | A user-specified ID for the newly created registration entry (optional). If no entry ID is provided, one will be generated during creation                                                        |                                                 |
+| `-federatesWith`           | A list of trust domain SPIFFE IDs representing the trust domains this registration entry federates with. A bundle for that trust domain must already exist                                        |                                                 |
+| `-node`                    | If set, this entry will be applied to matching nodes rather than workloads                                                                                                                        |                                                 |
+| `-parentID`                | The SPIFFE ID of this record's parent.                                                                                                                                                            |                                                 |
+| `-selector`                | A colon-delimited type:value selector used for attestation. This parameter can be used more than once, to specify multiple selectors that must be satisfied.                                      |                                                 |
+| `-socketPath`              | Path to the SPIRE Server API socket                                                                                                                                                               | /tmp/spire-server/private/api.sock              |
+| `-spiffeID`                | The SPIFFE ID that this record represents and will be set to the SVID issued.                                                                                                                     |                                                 |
+| `-x509SVIDTTL`             | A TTL, in seconds, for any X509-SVID issued as a result of this record.                                                                                                                           | The TTL configured with `default_x509_svid_ttl` |
+| `-jwtSVIDTTL`              | A TTL, in seconds, for any JWT-SVID issued as a result of this record.                                                                                                                            | The TTL configured with `default_jwt_svid_ttl`  |
+| `-storeSVID`               | A boolean value that, when set, indicates that the resulting issued SVID from this entry must be stored through an SVIDStore plugin                                                               |                                                 |
 
 ### `spire-server entry update`
 
 Updates registration entries.
 
-| Command          | Action                                                                                                                                                                                    | Default                                         |
-|:-----------------|:------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:------------------------------------------------|
-| `-admin`         | If true, the SPIFFE ID in this entry will be granted access to the Server APIs                                                                                                            |                                                 |
-| `-data`          | Path to a file containing registration data in JSON format (optional, if specified, other flags related with entry information must be omitted). If set to '-', read the JSON from stdin. |                                                 |
-| `-dns`           | A DNS name that will be included in SVIDs issued based on this entry, where appropriate. Can be used more than once                                                                       |                                                 |
-| `-downstream`    | A boolean value that, when set, indicates that the entry describes a downstream SPIRE server                                                                                              |                                                 |
-| `-entryExpiry`   | An expiry, from epoch in seconds, for the resulting registration entry to be pruned                                                                                                       |                                                 |
-| `-entryID`       | The Registration Entry ID of the record to update                                                                                                                                         |                                                 |
-| `-federatesWith` | A list of trust domain SPIFFE IDs representing the trust domains this registration entry federates with. A bundle for that trust domain must already exist                                |                                                 |
-| `-parentID`      | The SPIFFE ID of this record's parent.                                                                                                                                                    |                                                 |
-| `-selector`      | A colon-delimited type:value selector used for attestation. This parameter can be used more than once, to specify multiple selectors that must be satisfied.                              |                                                 |
-| `-socketPath`    | Path to the SPIRE Server API socket                                                                                                                                                       | /tmp/spire-server/private/api.sock              |
-| `-spiffeID`      | The SPIFFE ID that this record represents and will be set to the SVID issued.                                                                                                             |                                                 |
-| `-x509SVIDTTL`   | A TTL, in seconds, for any X509-SVID issued as a result of this record. Overrides `-ttl` value.                                                                                           | The TTL configured with `default_x509_svid_ttl` |
-| `-jwtSVIDTTL`    | A TTL, in seconds, for any JWT-SVID issued as a result of this record. Overrides `-ttl` value.                                                                                            | The TTL configured with `default_jwt_svid_ttl`  |
-| `storeSVID`      | A boolean value that, when set, indicates that the resulting issued SVID from this entry must be stored through an SVIDStore plugin                                                       |
+| Command                    | Action                                                                                                                                                                                            | Default                                         |
+|:---------------------------|:--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:------------------------------------------------|
+| `-admin`                   | If set, the SPIFFE ID in this entry will be granted access to the Server APIs                                                                                                                     |                                                 |
+| `-data`                    | Path to a file containing registration data in JSON format (optional, if specified, other flags related with entry information must be omitted). If set to '-', read the JSON from stdin.         |                                                 |
+| `-disableX509SVIDPrefetch` | A boolean value that, when set, disables prefetching X509 SVID for this entry                                                                                                                     | `false`                                         |
+| `-dns`                     | A DNS name that will be included in SVIDs issued based on this entry, where appropriate. Can be used more than once                                                                               |                                                 |
+| `-downstream`              | A boolean value that, when set, indicates that the entry describes a downstream SPIRE server                                                                                                      |                                                 |
+| `-entryExpiry`             | An expiry, from epoch in seconds, for the resulting registration entry to be pruned from the datastore. Please note that this is a data management feature and not a security feature (optional). |                                                 |
+| `-entryID`                 | A user-specified ID for the newly created registration entry (optional). If no entry ID is provided, one will be generated during creation                                                        |                                                 |
+| `-federatesWith`           | A list of trust domain SPIFFE IDs representing the trust domains this registration entry federates with. A bundle for that trust domain must already exist                                        |                                                 |
+| `-parentID`                | The SPIFFE ID of this record's parent.                                                                                                                                                            |                                                 |
+| `-selector`                | A colon-delimited type:value selector used for attestation. This parameter can be used more than once, to specify multiple selectors that must be satisfied.                                      |                                                 |
+| `-socketPath`              | Path to the SPIRE Server API socket                                                                                                                                                               | /tmp/spire-server/private/api.sock              |
+| `-spiffeID`                | The SPIFFE ID that this record represents and will be set to the SVID issued.                                                                                                                     |                                                 |
+| `-x509SVIDTTL`             | A TTL, in seconds, for any X509-SVID issued as a result of this record.                                                                                                                           | The TTL configured with `default_x509_svid_ttl` |
+| `-jwtSVIDTTL`              | A TTL, in seconds, for any JWT-SVID issued as a result of this record.                                                                                                                            | The TTL configured with `default_jwt_svid_ttl`  |
+| `-storeSVID`               | A boolean value that, when set, indicates that the resulting issued SVID from this entry must be stored through an SVIDStore plugin                                                               |                                                 |
 
 ### `spire-server entry count`
 
 Displays the total number of registration entries.
 
-| Command       | Action                              | Default                            |
-|:--------------|:------------------------------------|:-----------------------------------|
-| `-socketPath` | Path to the SPIRE Server API socket | /tmp/spire-server/private/api.sock |
+| Command          | Action                                                                                           | Default                            |
+|:-----------------|:-------------------------------------------------------------------------------------------------|:-----------------------------------|
+| `-downstream`    | A boolean value that, when set, indicates that the entry describes a downstream SPIRE server     |                                    |
+| `-federatesWith` | SPIFFE ID of a trust domain an entry is federate with. Can be used more than once                |                                    |
+| `-parentID`      | The Parent ID of the records to count.                                                           |                                    |
+| `-selector`      | A colon-delimited type:value selector. Can be used more than once to specify multiple selectors. |                                    |
+| `-socketPath`    | Path to the SPIRE Server API socket                                                              | /tmp/spire-server/private/api.sock |
+| `-spiffeID`      | The SPIFFE ID of the records to count.                                                           |                                    |
 
 ### `spire-server entry delete`
 
@@ -510,9 +668,13 @@ Ban attested node given its spiffeID. A banned attested node is not able to re-a
 
 Displays the total number of attested nodes.
 
-| Command       | Action                              | Default                            |
-|:--------------|:------------------------------------|:-----------------------------------|
-| `-socketPath` | Path to the SPIRE Server API socket | /tmp/spire-server/private/api.sock |
+| Command          | Action                                                                                                                              | Default |
+| :--------------- | :---------------------------------------------------------------------------------------------------------------------------------- | :------ |
+| `-selector`      | A colon-delimited type:value selector. Can be used more than once to specify multiple selectors.                                    |         |
+| `-canReattest`   | Filter based on string received, 'true': agents that can reattest, 'false': agents that can't reattest, other value will return all |         |
+| `-banned`        | Filter based on string received, 'true': banned agents, 'false': not banned agents, other value will return all                     |         |
+| `-expiresBefore` | Filter by expiration time (format: "2006-01-02 15:04:05 -0700 -07")                                                                 |         |
+| `-spiffeID`      | The SPIFFE ID of the records to count.                                                                                              |         |
 
 ### `spire-server agent evict`
 
@@ -527,9 +689,15 @@ De-attesting an already attested node given its spiffeID.
 
 Displays attested nodes.
 
-| Command       | Action                              | Default                            |
-|:--------------|:------------------------------------|:-----------------------------------|
-| `-socketPath` | Path to the SPIRE Server API socket | /tmp/spire-server/private/api.sock |
+| Command            | Action                                                                                                                              | Default                            |
+| :----------------- | :---------------------------------------------------------------------------------------------------------------------------------- | :--------------------------------- |
+| Command            | Action                                                                                                                              | Default                            |
+| :----------------- | :---------------------------------------------------------------------------------------------------------------------------------- | :--------------------------------- |
+| `-selector`        | A colon-delimited type:value selector. Can be used more than once to specify multiple selectors.                                    |                                    |
+| `-canReattest`     | Filter based on string received, 'true': agents that can reattest, 'false': agents that can't reattest, other value will return all |                                    |
+| `-banned`          | Filter based on string received, 'true': banned agents, 'false': not banned agents, other value will return all                     |                                    |
+| `-expiresBefore`   | Filter by expiration time (format: "2006-01-02 15:04:05 -0700 -07")                                                                 |                                    |
+| `-attestationType` | Filters agents to those matching the attestation type, like join_token or x509pop.                                                  |                                    |
 
 ### `spire-server agent show`
 
@@ -540,6 +708,16 @@ Displays the details (including node selectors) of an attested node given its sp
 | `-socketPath` | Path to the SPIRE Server API socket                 | /tmp/spire-server/private/api.sock |
 | `-spiffeID`   | The SPIFFE ID of the agent to show (agent identity) |                                    |
 
+### `spire-server debug getinfo`
+
+Prints debug information about the server, including uptime, registered
+agent/entry/federated bundle counts, and the server's own SVID chain.
+
+| Command       | Action                                   | Default                            |
+|:--------------|:-----------------------------------------|:-----------------------------------|
+| `-output`     | Desired output format (`pretty`, `json`) | `pretty`                           |
+| `-socketPath` | Path to the SPIRE Server API socket      | /tmp/spire-server/private/api.sock |
+
 ### `spire-server healthcheck`
 
 Checks SPIRE server's health.
@@ -549,6 +727,31 @@ Checks SPIRE server's health.
 | `-shallow`    | Perform a less stringent health check |                                    |
 | `-socketPath` | Path to the SPIRE Server API socket   | /tmp/spire-server/private/api.sock |
 | `-verbose`    | Print verbose information             |                                    |
+
+### `spire-server logger get`
+
+Gets the current logging level of the SPIRE Server.
+
+| Command       | Action                              | Default                            |
+|:--------------|:------------------------------------|:-----------------------------------|
+| `-socketPath` | Path to the SPIRE Server API socket | /tmp/spire-server/private/api.sock |
+
+### `spire-server logger set`
+
+Sets the logging level of the SPIRE Server.
+
+| Command       | Action                                                                    | Default                            |
+|:--------------|:--------------------------------------------------------------------------|:-----------------------------------|
+| `-level`      | The new log level, one of (panic, fatal, error, warn, info, debug, trace) |                                    |
+| `-socketPath` | Path to the SPIRE Server API socket                                       | /tmp/spire-server/private/api.sock |
+
+### `spire-server logger reset`
+
+Resets the logging level of the SPIRE Server to the level it was set to at launch.
+
+| Command       | Action                              | Default                            |
+|:--------------|:------------------------------------|:-----------------------------------|
+| `-socketPath` | Path to the SPIRE Server API socket | /tmp/spire-server/private/api.sock |
 
 ### `spire-server validate`
 
@@ -564,13 +767,13 @@ Typically, you may want at least:
 
 Mints an X509-SVID.
 
-| Command       | Action                                                               | Default                                                                                                         |
-|:--------------|:---------------------------------------------------------------------|:----------------------------------------------------------------------------------------------------------------|
-| `-dns`        | A DNS name that will be included in SVID. Can be used more than once |                                                                                                                 |
-| `-socketPath` | Path to the SPIRE Server API socket                                  | /tmp/spire-server/private/api.sock                                                                              |
-| `-spiffeID`   | The SPIFFE ID of the X509-SVID                                       |                                                                                                                 |
+| Command       | Action                                                               | Default                                                                                     |
+| :------------ | :------------------------------------------------------------------- | :------------------------------------------------------------------------------------------ |
+| `-dns`        | A DNS name that will be included in SVID. Can be used more than once |                                                                                             |
+| `-socketPath` | Path to the SPIRE Server API socket                                  | /tmp/spire-server/private/api.sock                                                          |
+| `-spiffeID`   | The SPIFFE ID of the X509-SVID                                       |                                                                                             |
 | `-ttl`        | The TTL of the X509-SVID                                             | First non-zero value from `Entry.x509_svid_ttl`, `Entry.ttl`, `default_x509_svid_ttl`, `1h` |
-| `-write`      | Directory to write output to instead of stdout                       |                                                                                                                 |
+| `-write`      | Directory to write output to instead of stdout                       |                                                                                             |
 
 ### `spire-server jwt mint`
 
@@ -583,6 +786,122 @@ Mints a JWT-SVID.
 | `-spiffeID`   | The SPIFFE ID of the JWT-SVID                                                |                                                                                           |
 | `-ttl`        | The TTL of the JWT-SVID                                                      | First non-zero value from `Entry.jwt_svid_ttl`, `Entry.ttl`, `default_jwt_svid_ttl`, `5m` |
 | `-write`      | File to write token to instead of stdout                                     |                                                                                           |
+
+### `spire-server localauthority jwt activate`
+
+Activates a prepared JWT authority for use, which will cause it to be used for all JWT signing operations serviced by this server going forward.
+
+| Command        | Action                                              | Default                            |
+|:---------------|:----------------------------------------------------|:-----------------------------------|
+| `-authorityID` | The authority ID of the JWT authority to activate   |                                    |
+| `-output`      | Desired output format (`pretty`, `json`)            | `pretty`                           |
+| `-socketPath`  | Path to the SPIRE Server API socket                 | /tmp/spire-server/private/api.sock |
+
+### `spire-server localauthority jwt prepare`
+
+Prepares a new JWT authority for use by generating a new key and injecting it into the bundle.
+
+| Command        | Action                                              | Default                            |
+|:---------------|:----------------------------------------------------|:-----------------------------------|
+| `-output`      | Desired output format (`pretty`, `json`)            | `pretty`                           |
+| `-socketPath`  | Path to the SPIRE Server API socket                 | /tmp/spire-server/private/api.sock |
+
+### `spire-server localauthority jwt revoke`
+
+Revokes the previously active JWT authority by removing it from the bundle and propagating this update throughout the cluster.
+
+| Command        | Action                                              | Default                            |
+|:---------------|:----------------------------------------------------|:-----------------------------------|
+| `-authorityID` | The authority ID of the JWT authority to revoke     |                                    |
+| `-output`      | Desired output format (`pretty`, `json`)            | `pretty`                           |
+| `-socketPath`  | Path to the SPIRE Server API socket                 | /tmp/spire-server/private/api.sock |
+
+### `spire-server localauthority jwt show`
+
+Shows the local JWT authorities.
+
+| Command        | Action                                              | Default                            |
+|:---------------|:----------------------------------------------------|:-----------------------------------|
+| `-output`      | Desired output format (`pretty`, `json`)            | `pretty`                           |
+| `-socketPath`  | Path to the SPIRE Server API socket                 | /tmp/spire-server/private/api.sock |
+
+### `spire-server localauthority jwt taint`
+
+Marks the previously active JWT authority as being tainted.
+
+| Command        | Action                                              | Default                            |
+|:---------------|:----------------------------------------------------|:-----------------------------------|
+| `-authorityID` | The authority ID of the JWT authority to taint      |                                    |
+| `-output`      | Desired output format (`pretty`, `json`)            | `pretty`                           |
+| `-socketPath`  | Path to the SPIRE Server API socket                 | /tmp/spire-server/private/api.sock |
+
+### `spire-server localauthority x509 activate`
+
+Activates a prepared X.509 authority for use, which will cause it to be used for all X.509 signing operations serviced by this server going forward.
+
+| Command        | Action                                              | Default                            |
+|:---------------|:----------------------------------------------------|:-----------------------------------|
+| `-authorityID` | The authority ID of the X.509 authority to activate |                                    |
+| `-output`      | Desired output format (`pretty`, `json`)            | `pretty`                           |
+| `-socketPath`  | Path to the SPIRE Server API socket                 | /tmp/spire-server/private/api.sock |
+
+### `spire-server localauthority x509 prepare`
+
+Prepares a new X.509 authority for use by generating a new key and injecting the resulting CA certificate into the bundle.
+
+| Command        | Action                                              | Default                            |
+|:---------------|:----------------------------------------------------|:-----------------------------------|
+| `-output`      | Desired output format (`pretty`, `json`)            | `pretty`                           |
+| `-socketPath`  | Path to the SPIRE Server API socket                 | /tmp/spire-server/private/api.sock |
+
+### `spire-server localauthority x509 revoke`
+
+Revokes the previously active X.509 authority by removing it from the bundle and propagating this update throughout the cluster.
+
+| Command        | Action                                              | Default                            |
+|:---------------|:----------------------------------------------------|:-----------------------------------|
+| `-authorityID` | The authority ID of the X.509 authority to revoke   |                                    |
+| `-output`      | Desired output format (`pretty`, `json`)            | `pretty`                           |
+| `-socketPath`  | Path to the SPIRE Server API socket                 | /tmp/spire-server/private/api.sock |
+
+### `spire-server localauthority x509 show`
+
+Shows the local X.509 authorities.
+
+| Command        | Action                                              | Default                            |
+|:---------------|:----------------------------------------------------|:-----------------------------------|
+| `-output`      | Desired output format (`pretty`, `json`)            | `pretty`                           |
+| `-socketPath`  | Path to the SPIRE Server API socket                 | /tmp/spire-server/private/api.sock |
+
+### `spire-server localauthority x509 taint`
+
+Marks the previously active X.509 authority as being tainted.
+
+| Command        | Action                                              | Default                            |
+|:---------------|:----------------------------------------------------|:-----------------------------------|
+| `-authorityID` | The authority ID of the X.509 authority to taint    |                                    |
+| `-output`      | Desired output format (`pretty`, `json`)            | `pretty`                           |
+| `-socketPath`  | Path to the SPIRE Server API socket                 | /tmp/spire-server/private/api.sock |
+
+### `spire-server upstreamauthority revoke`
+
+Revokes the previously active X.509 upstream authority by removing it from the bundle and propagating this update throughout the cluster.
+
+| Command         | Action                                                                                                                 | Default                            |
+|:----------------|:-----------------------------------------------------------------------------------------------------------------------|:-----------------------------------|
+| `-output`       | Desired output format (`pretty`, `json`)                                                                               | `pretty`                           |
+| `-socketPath`   | Path to the SPIRE Server API socket                                                                                    | /tmp/spire-server/private/api.sock |
+| `-subjectKeyID` | The X.509 Subject Key Identifier (or SKID) of the authority's CA certificate of the X.509 upstream authority to revoke |                                    |
+
+### `spire-server upstreamauthority taint`
+
+Marks the provided X.509 upstream authority as being tainted.
+
+| Command         | Action                                                                                                                 | Default                            |
+|:----------------|:-----------------------------------------------------------------------------------------------------------------------|:-----------------------------------|
+| `-output`       | Desired output format (`pretty`, `json`)                                                                               | `pretty`                           |
+| `-socketPath`   | Path to the SPIRE Server API socket                                                                                    | /tmp/spire-server/private/api.sock |
+| `-subjectKeyID` | The X.509 Subject Key Identifier (or SKID) of the authority's CA certificate of the upstream X.509 authority to taint  |                                    |
 
 ## JSON object for `-data`
 
@@ -624,6 +943,18 @@ server {
 telemetry {
     Prometheus {
         port = 1234
+        # optional TLS for prometheus
+        tls {
+            use_spire_svid = true
+            authorized_spiffe_ids = [
+                "spiffe://example.org/monitoring/prometheus",
+            ]
+
+            # Alternatively, configure a web certificate directly:
+            # cert_file = "/path/to/cert.pem"
+            # key_file = "/path/to/key.pem"
+            # client_ca_file = "/path/to/ca.pem"
+        }
     }
 }
 

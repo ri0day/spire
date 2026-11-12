@@ -87,9 +87,9 @@ func TestConfigure(t *testing.T) {
 	for _, tt := range []struct {
 		name string
 
+		trustDomain     spiffeid.TrustDomain
 		customConfig    string
 		newClientErr    error
-		trustDomain     spiffeid.TrustDomain
 		expectCode      codes.Code
 		expectMsgPrefix string
 		expectFilePath  string
@@ -98,32 +98,35 @@ func TestConfigure(t *testing.T) {
 	}{
 		{
 			name:           "success",
+			trustDomain:    trustDomain,
 			expectFilePath: "someFile",
 			expectConfig:   &Configuration{ServiceAccountFile: "someFile"},
-			trustDomain:    trustDomain,
 			expectTD:       tdHash,
 		},
 		{
 			name:         "no config file",
-			expectConfig: &Configuration{ServiceAccountFile: ""},
 			trustDomain:  trustDomain,
+			expectConfig: &Configuration{ServiceAccountFile: ""},
 			expectTD:     tdHash,
 		},
 		{
 			name:            "malformed configuration",
+			trustDomain:     trustDomain,
 			customConfig:    "{no a config}",
 			expectCode:      codes.InvalidArgument,
 			expectMsgPrefix: "unable to decode configuration:",
 		},
 		{
 			name:            "failed to create client",
+			trustDomain:     trustDomain,
 			expectConfig:    &Configuration{ServiceAccountFile: "someFile"},
 			newClientErr:    errors.New("oh! no"),
 			expectCode:      codes.Internal,
 			expectMsgPrefix: "failed to create secretmanager client: oh! no",
 		},
 		{
-			name: "contains unused keys",
+			name:        "contains unused keys",
+			trustDomain: trustDomain,
 			customConfig: `
 service_account_file = "some_file"
 invalid1 = "something"
@@ -243,6 +246,50 @@ func TestPutX509SVID(t *testing.T) {
 				Parent: "projects/project1/secrets/secret1",
 				Payload: &secretmanagerpb.SecretPayload{
 					Data: payload,
+				},
+			},
+			clientConfig: &clientConfig{},
+		},
+		{
+			name: "Add payload with multiple roots in the federated bundle",
+			req: &svidstore.X509SVID{
+				SVID:     successReq.SVID,
+				Metadata: successReq.Metadata,
+				FederatedBundles: map[string][]*x509.Certificate{
+					"federated1": {federatedBundle, x509Bundle},
+				},
+			},
+			expectGetSecretReq: &secretmanagerpb.GetSecretRequest{
+				Name: "projects/project1/secrets/secret1",
+			},
+			expectAddSecretVersionReq: &secretmanagerpb.AddSecretVersionRequest{
+				Parent: "projects/project1/secrets/secret1",
+				Payload: &secretmanagerpb.SecretPayload{
+					Data: payloadWithFederatedBundles(t, secret, map[string]string{
+						"federated1": x509FederatedBundlePem + x509BundlePem,
+					}),
+				},
+			},
+			clientConfig: &clientConfig{},
+		},
+		{
+			name: "Add payload with an empty federated bundle",
+			req: &svidstore.X509SVID{
+				SVID:     successReq.SVID,
+				Metadata: successReq.Metadata,
+				FederatedBundles: map[string][]*x509.Certificate{
+					"federated1": {},
+				},
+			},
+			expectGetSecretReq: &secretmanagerpb.GetSecretRequest{
+				Name: "projects/project1/secrets/secret1",
+			},
+			expectAddSecretVersionReq: &secretmanagerpb.AddSecretVersionRequest{
+				Parent: "projects/project1/secrets/secret1",
+				Payload: &secretmanagerpb.SecretPayload{
+					Data: payloadWithFederatedBundles(t, secret, map[string]string{
+						"federated1": "",
+					}),
 				},
 			},
 			clientConfig: &clientConfig{},
@@ -437,6 +484,97 @@ func TestPutX509SVID(t *testing.T) {
 					Replication: &secretmanagerpb.Replication{
 						Replication: &secretmanagerpb.Replication_Automatic_{
 							Automatic: &secretmanagerpb.Replication_Automatic{},
+						},
+					},
+					Labels: map[string]string{
+						"spire-svid": tdHash,
+					},
+				},
+			},
+			expectGetSecretReq: &secretmanagerpb.GetSecretRequest{
+				Name: "projects/project1/secrets/secret1",
+			},
+			expectAddSecretVersionReq: &secretmanagerpb.AddSecretVersionRequest{
+				Parent: "projects/project1/secrets/secret1",
+				Payload: &secretmanagerpb.SecretPayload{
+					Data: payload,
+				},
+			},
+			clientConfig: &clientConfig{
+				getSecretErr: status.Error(codes.NotFound, "secret not found"),
+			},
+		},
+		{
+			name: "Add payload and create regional secret",
+			req: &svidstore.X509SVID{
+				SVID: successReq.SVID,
+				Metadata: []string{
+					"name:secret1",
+					"projectid:project1",
+					"regions:europe-north1",
+				},
+				FederatedBundles: successReq.FederatedBundles,
+			},
+			expectCreateSecretReq: &secretmanagerpb.CreateSecretRequest{
+				Parent:   "projects/project1",
+				SecretId: "secret1",
+				Secret: &secretmanagerpb.Secret{
+					Replication: &secretmanagerpb.Replication{
+						Replication: &secretmanagerpb.Replication_UserManaged_{
+							UserManaged: &secretmanagerpb.Replication_UserManaged{
+								Replicas: []*secretmanagerpb.Replication_UserManaged_Replica{
+									{
+										Location: "europe-north1",
+									},
+								},
+							},
+						},
+					},
+					Labels: map[string]string{
+						"spire-svid": tdHash,
+					},
+				},
+			},
+			expectGetSecretReq: &secretmanagerpb.GetSecretRequest{
+				Name: "projects/project1/secrets/secret1",
+			},
+			expectAddSecretVersionReq: &secretmanagerpb.AddSecretVersionRequest{
+				Parent: "projects/project1/secrets/secret1",
+				Payload: &secretmanagerpb.SecretPayload{
+					Data: payload,
+				},
+			},
+			clientConfig: &clientConfig{
+				getSecretErr: status.Error(codes.NotFound, "secret not found"),
+			},
+		},
+		{
+			name: "Add payload and create secret in multiple regions",
+			req: &svidstore.X509SVID{
+				SVID: successReq.SVID,
+				Metadata: []string{
+					"name:secret1",
+					"projectid:project1",
+					"regions:europe-north1,europe-west1",
+				},
+				FederatedBundles: successReq.FederatedBundles,
+			},
+			expectCreateSecretReq: &secretmanagerpb.CreateSecretRequest{
+				Parent:   "projects/project1",
+				SecretId: "secret1",
+				Secret: &secretmanagerpb.Secret{
+					Replication: &secretmanagerpb.Replication{
+						Replication: &secretmanagerpb.Replication_UserManaged_{
+							UserManaged: &secretmanagerpb.Replication_UserManaged{
+								Replicas: []*secretmanagerpb.Replication_UserManaged_Replica{
+									{
+										Location: "europe-north1",
+									},
+									{
+										Location: "europe-west1",
+									},
+								},
+							},
 						},
 					},
 					Labels: map[string]string{
@@ -691,7 +829,6 @@ func TestPutX509SVID(t *testing.T) {
 			expectMsgPrefix: "svidstore(gcp_secretmanager): failed to add secret version: rpc error: code = DeadlineExceeded desc = some error",
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 			defer cancel()
@@ -730,6 +867,16 @@ func TestPutX509SVID(t *testing.T) {
 			spiretest.AssertProtoEqual(t, tt.expectGetIamPolicyReq, client.getIamPolicyReq)
 		})
 	}
+}
+
+// payloadWithFederatedBundles returns the JSON payload of the given secret
+// using the given federated bundles instead of its own.
+func payloadWithFederatedBundles(t *testing.T, secret *svidstore.Data, federatedBundles map[string]string) []byte {
+	s := *secret
+	s.FederatedBundles = federatedBundles
+	payload, err := json.Marshal(&s)
+	require.NoError(t, err)
+	return payload
 }
 
 func TestDeleteX509SVID(t *testing.T) {
@@ -868,7 +1015,7 @@ func TestDeleteX509SVID(t *testing.T) {
 			err = ss.DeleteX509SVID(ctx, tt.metadata)
 			spiretest.RequireGRPCStatus(t, err, tt.expectCode, tt.expectMsgPrefix)
 
-			// Validate what is send to gcp
+			// Validate what is sent to gcp
 			spiretest.AssertProtoEqual(t, tt.expectDeleteSecretReq, client.deleteSecretReq)
 			spiretest.AssertProtoEqual(t, tt.expectGetSecretReq, client.getSecretReq)
 		})

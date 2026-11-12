@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"maps"
 	"sync"
 	"time"
 
@@ -41,6 +42,15 @@ type TrustDomainConfig struct {
 	// EndpointProfile is the bundle endpoint profile used by the
 	// SPIFFE bundle endpoint server.
 	EndpointProfile EndpointProfileInfo
+
+	// BootstrapBundlePath is an optional path to a bundle used to authenticate
+	// the first https_spiffe fetch when the datastore has no copy of the
+	// federated bundle. It is not used after that fetch succeeds.
+	BootstrapBundlePath string
+
+	// BootstrapBundleFormat is the format of the file at BootstrapBundlePath.
+	// "pem" (default) or "spiffe".
+	BootstrapBundleFormat string
 }
 
 type EndpointProfileInfo interface {
@@ -252,11 +262,9 @@ func (m *Manager) refreshConfigs(ctx context.Context) error {
 			runCh:  make(chan chan error),
 		}
 		m.updaters[td] = updater
-		updater.wg.Add(1)
-		go func(td spiffeid.TrustDomain) {
-			defer updater.wg.Done()
+		updater.wg.Go(func() {
 			m.runUpdater(ctx, td, updater)
-		}(td)
+		})
 	}
 	return nil
 }
@@ -350,8 +358,6 @@ func calculateNextUpdate(b *spiffebundle.Bundle) time.Duration {
 
 func cloneTrustDomainConfigs(configs map[spiffeid.TrustDomain]TrustDomainConfig) map[spiffeid.TrustDomain]TrustDomainConfig {
 	clone := make(map[spiffeid.TrustDomain]TrustDomainConfig, len(configs))
-	for k, v := range configs {
-		clone[k] = v
-	}
+	maps.Copy(clone, configs)
 	return clone
 }

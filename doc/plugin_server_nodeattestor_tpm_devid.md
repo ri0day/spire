@@ -1,10 +1,26 @@
 # Server plugin: NodeAttestor "tpm_devid"
 
-*Must be used in conjunction with the agent-side tpm_devid plugin*
+*Must be used in conjunction with the [agent-side tpm_devid plugin](plugin_agent_nodeattestor_tpm_devid.md)*
 
 The `tpm_devid` plugin attests nodes that own a TPM
 and that have been provisioned with a DevID certificate through an out-of-band
 mechanism.
+
+## Prerequisites
+
+The server must be configured with two trust bundles, both of which are
+required:
+
+- `devid_ca_path`: the CA certificate(s) that signed the agents' DevID (LDevID)
+  certificates. These are the same CA certificates used during the out-of-band
+  node provisioning process.
+- `endorsement_ca_path`: the TPM manufacturer CA certificate(s) that signed the
+  endorsement certificates.
+
+See the [TPM Deployment Walkthrough](tpm_deployment_walkthrough.md) for an
+end-to-end overview including how nodes are provisioned.
+
+## How It Works
 
 The plugin issues two challenges to the agent:
 
@@ -49,5 +65,24 @@ A sample configuration:
 | Selector                    | Example                                                           | Description                                                                              |
 |-----------------------------|-------------------------------------------------------------------|------------------------------------------------------------------------------------------|
 | Subject common name         | `tpm_devid:subject:cn:example.org`                                | The subject's common name.                                                               |
+| Subject attribute           | `tpm_devid:subject:oid:2.5.4.5:server-123`                        | A nonempty string-valued subject attribute, identified by its numeric OID.               |
 | Issuer common name          | `tpm_devid:issuer:cn:authority.org`                               | The issuer's common name.                                                                |
 | SHA1 fingerprint            | `tpm_devid:fingerprint:9ba51e2643bea24e91d24bdec3a1aaf8e967b6e5`  | The SHA1 fingerprint as a hex string for each cert in the PoP chain, excluding the leaf. |
+
+Subject attribute selectors have the form `tpm_devid:subject:oid:<OID>:<value>`.
+They are emitted for standard and custom attributes in the verified DevID
+certificate's subject, alongside the existing selectors. String values are
+preserved exactly, including case and whitespace. Empty strings and non-string
+values are ignored. Repeated attributes with distinct values produce separate
+selectors; identical OID/value pairs produce only one.
+OID selector values exceeding 255 characters (including `subject:oid:<OID>:`)
+are skipped with a warning.
+
+The trusted DevID issuer must validate subject attribute claims before
+signing. Certificate validation and TPM proofs do not independently establish
+the accuracy or uniqueness of those claims.
+
+For example, the subject `serialNumber` attribute uses OID `2.5.4.5`, while the
+common name uses `2.5.4.3`. The subject `serialNumber` is distinct from the
+certificate's own serial number. The existing `subject:cn` selector is still
+emitted, so existing common-name registrations continue to match.

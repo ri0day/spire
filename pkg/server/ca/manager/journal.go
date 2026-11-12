@@ -3,21 +3,18 @@ package manager
 import (
 	"context"
 	"crypto/x509"
-	"encoding/pem"
 	"fmt"
-	"os"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
-	"github.com/spiffe/spire/pkg/common/diskutil"
 	"github.com/spiffe/spire/pkg/common/telemetry"
 	"github.com/spiffe/spire/pkg/common/x509util"
 	"github.com/spiffe/spire/pkg/server/ca"
 	"github.com/spiffe/spire/pkg/server/catalog"
 	"github.com/spiffe/spire/pkg/server/datastore"
 	"github.com/spiffe/spire/proto/private/server/journal"
-	"github.com/zeebo/errs"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -25,19 +22,15 @@ const (
 	// journalCap is the maximum number of entries per type that we'll
 	// hold onto.
 	journalCap = 10
-
-	// journalPEMType is the type in the PEM header
-	journalPEMType = "SPIRE CA JOURNAL"
 )
 
 type journalConfig struct {
-	cat      catalog.Catalog
-	log      logrus.FieldLogger
-	filePath string
+	cat catalog.Catalog
+	log logrus.FieldLogger
 }
 
-// Journal stores X509 CAs and JWT keys on disk as they are rotated by the
-// manager. The data format on disk is a PEM encoded protocol buffer.
+// Journal stores X509 CAs, JWT keys, and WIT keys in the datastore as they are
+// rotated by the manager.
 type Journal struct {
 	config *journalConfig
 
@@ -49,27 +42,11 @@ type Journal struct {
 
 func LoadJournal(ctx context.Context, config *journalConfig) (*Journal, error) {
 	// Look for the CA journal of this server in the datastore.
-	journalDS, err := loadJournalFromDS(ctx, config)
+	j, err := loadJournalFromDS(ctx, config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load journal from datastore: %w", err)
 	}
-	if journalDS != nil {
-		// A CA journal record corresponding to this server was found in the
-		// datastore.
-		return journalDS, nil
-	}
-
-	// There is no CA journal record corresponding to this server in the
-	// datastore. Try to load the journal from disk.
-
-	// TODO: stop trying to load the journal from disk in v1.10 and delete
-	// the journal file if exists.
-	journalDisk, err := loadJournalFromDisk(config)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load journal from disk: %w", err)
-	}
-
-	return journalDisk, nil
+	return j, nil
 }
 
 func (j *Journal) getEntries() *journal.Entries {
@@ -82,48 +59,35 @@ func (j *Journal) AppendX509CA(ctx context.Context, slotID string, issuedAt time
 	j.mu.Lock()
 	defer j.mu.Unlock()
 
-	backup := j.entries.X509CAs
 	j.entries.X509CAs = append(j.entries.X509CAs, &journal.X509CAEntry{
-		SlotId:        slotID,
-		IssuedAt:      issuedAt.Unix(),
-		NotAfter:      x509CA.Certificate.NotAfter.Unix(),
-		Certificate:   x509CA.Certificate.Raw,
-		UpstreamChain: chainDER(x509CA.UpstreamChain),
-		Status:        journal.Status_PREPARED,
-		AuthorityId:   x509util.SubjectKeyIDToString(x509CA.Certificate.SubjectKeyId),
+		SlotId:              slotID,
+		IssuedAt:            issuedAt.Unix(),
+		NotAfter:            x509CA.NotAfter.Unix(),
+		NotAfterIsEffective: true,
+		Certificate:         x509CA.Certificate.Raw,
+		UpstreamChain:       chainDER(x509CA.UpstreamChain),
+		Status:              journal.Status_PREPARED,
+		AuthorityId:         x509util.SubjectKeyIDToString(x509CA.Certificate.SubjectKeyId),
+		UpstreamAuthorityId: x509util.SubjectKeyIDToString(x509CA.Certificate.AuthorityKeyId),
 	})
 
 	exceeded := len(j.entries.X509CAs) - journalCap
 	if exceeded > 0 {
-		// make a new slice so we keep growing the backing array to drop the first
-		x509CAs := make([]*journal.X509CAEntry, journalCap)
-		copy(x509CAs, j.entries.X509CAs[exceeded:])
-		j.entries.X509CAs = x509CAs
+		j.entries.X509CAs = slices.Clone(j.entries.X509CAs[exceeded:])
 	}
 
-	if err := j.save(ctx); err != nil {
-		j.entries.X509CAs = backup
-		return err
-	}
-
-	return nil
+	return j.save(ctx)
 }
 
-// UpdateX509CAStatus updates a stored X509CA entry to have the given status, updating the journal file.
-func (j *Journal) UpdateX509CAStatus(ctx context.Context, issuedAt time.Time, status journal.Status) error {
+// UpdateX509CAStatus updates a stored X509CA entry to have the given status,
+// updating the CA journal.
+func (j *Journal) UpdateX509CAStatus(ctx context.Context, authorityID string, status journal.Status) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 
-	backup := j.entries.X509CAs
-
-	// Once we have the authorityID, we can use it to search for an entry,
-	// but for now, we depend on issuedAt.
-	issuedAtUnix := issuedAt.Unix()
-
 	var found bool
-	for i := len(j.entries.X509CAs) - 1; i >= 0; i-- {
-		entry := j.entries.X509CAs[i]
-		if issuedAtUnix == entry.IssuedAt {
+	for _, entry := range slices.Backward(j.entries.X509CAs) {
+		if authorityID == entry.AuthorityId {
 			found = true
 			entry.Status = status
 			if status == journal.Status_ACTIVE {
@@ -134,15 +98,25 @@ func (j *Journal) UpdateX509CAStatus(ctx context.Context, issuedAt time.Time, st
 	}
 
 	if !found {
-		return fmt.Errorf("no journal entry found issued at: %v", issuedAtUnix)
+		return fmt.Errorf("no journal entry found with authority ID %q", authorityID)
 	}
 
-	if err := j.save(ctx); err != nil {
-		j.entries.X509CAs = backup
-		return err
+	return j.save(ctx)
+}
+
+// UpdateX509CAExpirations updates the expiration of stored X509CA entries.
+func (j *Journal) UpdateX509CAExpirations(ctx context.Context, expirations map[string]time.Time) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+
+	for _, entry := range j.entries.X509CAs {
+		if expiration, ok := expirations[string(entry.Certificate)]; ok {
+			entry.NotAfter = expiration.Unix()
+			entry.NotAfterIsEffective = true
+		}
 	}
 
-	return nil
+	return j.save(ctx)
 }
 
 func (j *Journal) AppendJWTKey(ctx context.Context, slotID string, issuedAt time.Time, jwtKey *ca.JWTKey) error {
@@ -151,10 +125,9 @@ func (j *Journal) AppendJWTKey(ctx context.Context, slotID string, issuedAt time
 
 	pkixBytes, err := x509.MarshalPKIXPublicKey(jwtKey.Signer.Public())
 	if err != nil {
-		return errs.Wrap(err)
+		return err
 	}
 
-	backup := j.entries.JwtKeys
 	j.entries.JwtKeys = append(j.entries.JwtKeys, &journal.JWTKeyEntry{
 		SlotId:      slotID,
 		IssuedAt:    issuedAt.Unix(),
@@ -167,35 +140,21 @@ func (j *Journal) AppendJWTKey(ctx context.Context, slotID string, issuedAt time
 
 	exceeded := len(j.entries.JwtKeys) - journalCap
 	if exceeded > 0 {
-		// make a new slice so we keep growing the backing array to drop the first
-		jwtKeys := make([]*journal.JWTKeyEntry, journalCap)
-		copy(jwtKeys, j.entries.JwtKeys[exceeded:])
-		j.entries.JwtKeys = jwtKeys
+		j.entries.JwtKeys = slices.Clone(j.entries.JwtKeys[exceeded:])
 	}
 
-	if err := j.save(ctx); err != nil {
-		j.entries.JwtKeys = backup
-		return err
-	}
-
-	return nil
+	return j.save(ctx)
 }
 
-// UpdateJWTKeyStatus updates a stored JWTKey entry to have the given status, updating the journal file.
-func (j *Journal) UpdateJWTKeyStatus(ctx context.Context, issuedAt time.Time, status journal.Status) error {
+// UpdateJWTKeyStatus updates a stored JWTKey entry to have the given status,
+// updating the CA journal.
+func (j *Journal) UpdateJWTKeyStatus(ctx context.Context, authorityID string, status journal.Status) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 
-	backup := j.entries.JwtKeys
-
-	// Once we have the authorityID, we can use it to search for an entry,
-	// but for now we depend on issuedAt.
-	issuedAtUnix := issuedAt.Unix()
-
 	var found bool
-	for i := len(j.entries.JwtKeys) - 1; i >= 0; i-- {
-		entry := j.entries.JwtKeys[i]
-		if issuedAtUnix == entry.IssuedAt {
+	for _, entry := range slices.Backward(j.entries.JwtKeys) {
+		if authorityID == entry.AuthorityId {
 			found = true
 			entry.Status = status
 			break
@@ -203,15 +162,59 @@ func (j *Journal) UpdateJWTKeyStatus(ctx context.Context, issuedAt time.Time, st
 	}
 
 	if !found {
-		return fmt.Errorf("no journal entry found issued at: %v", issuedAtUnix)
+		return fmt.Errorf("no journal entry found with authority ID %q", authorityID)
 	}
 
-	if err := j.save(ctx); err != nil {
-		j.entries.JwtKeys = backup
+	return j.save(ctx)
+}
+
+func (j *Journal) AppendWITKey(ctx context.Context, slotID string, issuedAt time.Time, witKey *ca.WITKey) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+
+	pkixBytes, err := x509.MarshalPKIXPublicKey(witKey.Signer.Public())
+	if err != nil {
 		return err
 	}
 
-	return nil
+	j.entries.WitKeys = append(j.entries.WitKeys, &journal.WITKeyEntry{
+		SlotId:      slotID,
+		IssuedAt:    issuedAt.Unix(),
+		Kid:         witKey.Kid,
+		PublicKey:   pkixBytes,
+		NotAfter:    witKey.NotAfter.Unix(),
+		Status:      journal.Status_PREPARED,
+		AuthorityId: witKey.Kid,
+	})
+
+	exceeded := len(j.entries.WitKeys) - journalCap
+	if exceeded > 0 {
+		j.entries.WitKeys = slices.Clone(j.entries.WitKeys[exceeded:])
+	}
+
+	return j.save(ctx)
+}
+
+// UpdateWITKeyStatus updates a stored WITKey entry to have the given status,
+// updating the CA journal.
+func (j *Journal) UpdateWITKeyStatus(ctx context.Context, authorityID string, status journal.Status) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+
+	var found bool
+	for _, entry := range slices.Backward(j.entries.WitKeys) {
+		if authorityID == entry.AuthorityId {
+			found = true
+			entry.Status = status
+			break
+		}
+	}
+
+	if !found {
+		return fmt.Errorf("no journal entry found with authority ID %q", authorityID)
+	}
+
+	return j.save(ctx)
 }
 
 func (j *Journal) setEntries(entries *journal.Entries) {
@@ -222,15 +225,19 @@ func (j *Journal) setEntries(entries *journal.Entries) {
 }
 
 // saveInDatastore saves the provided marshaled entries in the datastore.
-// If caJournalID has not been defined yet (it's value is 0), it first finds
-// the CA journal records that corresponds to this server. In case that there is
-// no CA record for this server, it creates one.
+// If caJournalID has not been defined yet (its value is 0), it first finds
+// the CA journal record that corresponds to this server. In case there is no
+// CA record for this server, it creates one.
 // The ID of the CA journal record that was saved is returned, in addition to
 // the error (if any) of the operation.
 func (j *Journal) saveInDatastore(ctx context.Context, entriesBytes []byte) (caJournalID uint, err error) {
 	// Check if we already identified what's the CA journal for this server in
 	// the datastore. If not, log that we are creating a new CA journal entry.
 	if j.caJournalID == 0 {
+		if j.activeX509AuthorityID == "" {
+			j.config.log.Debug("There is no active X.509 authority yet. Can't save CA journal in the datastore")
+			return 0, nil
+		}
 		j.config.log.Info("Creating a new CA journal entry")
 	}
 
@@ -293,12 +300,11 @@ func (j *Journal) findCAJournal(ctx context.Context) (*datastore.CAJournal, erro
 	return nil, nil
 }
 
-// save saves the CA journal both on disk and in the datastore.
-// TODO: stop saving the CA journal on disk in v1.10.
+// save saves the CA journal in the datastore.
 func (j *Journal) save(ctx context.Context) error {
 	entriesBytes, err := proto.Marshal(j.entries)
 	if err != nil {
-		return errs.Wrap(err)
+		return err
 	}
 
 	caJournalID, err := j.saveInDatastore(ctx, entriesBytes)
@@ -306,15 +312,6 @@ func (j *Journal) save(ctx context.Context) error {
 		return fmt.Errorf("could not save CA journal in the datastore: %w", err)
 	}
 	j.caJournalID = caJournalID
-
-	pemBytes := pem.EncodeToMemory(&pem.Block{
-		Type:  journalPEMType,
-		Bytes: entriesBytes,
-	})
-
-	if err := diskutil.AtomicWritePubliclyReadableFile(j.config.filePath, pemBytes); err != nil {
-		return errs.Wrap(err)
-	}
 
 	return nil
 }
@@ -325,40 +322,6 @@ func chainDER(chain []*x509.Certificate) [][]byte {
 		der = append(der, cert.Raw)
 	}
 	return der
-}
-
-// loadJournalFromDisk loads the journal from disk if it exists.
-// TODO: stop loading the journal from disk in v1.10 and remove this function.
-func loadJournalFromDisk(config *journalConfig) (*Journal, error) {
-	config.log.WithField(telemetry.Path, config.filePath).Debug("Loading journal from disk")
-
-	j := &Journal{
-		config:  config,
-		entries: new(journal.Entries),
-	}
-
-	pemBytes, err := os.ReadFile(config.filePath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			// There is no journal on disk. A new CA journal is created and will
-			// be stored in the next save operation.
-			return j, nil
-		}
-		return nil, errs.Wrap(err)
-	}
-	pemBlock, _ := pem.Decode(pemBytes)
-	if pemBlock == nil {
-		return nil, errs.New("invalid PEM block")
-	}
-	if pemBlock.Type != journalPEMType {
-		return nil, errs.New("invalid PEM block type %q", pemBlock.Type)
-	}
-
-	if err := proto.Unmarshal(pemBlock.Bytes, j.entries); err != nil {
-		return nil, errs.New("unable to unmarshal entries: %v", err)
-	}
-
-	return j, nil
 }
 
 // loadJournalFromDS loads the CA journal from the datastore.
@@ -378,12 +341,13 @@ func loadJournalFromDS(ctx context.Context, config *journalConfig) (*Journal, er
 	}
 	if caJournal == nil {
 		j.config.log.Info("There is not a CA journal record that matches any of the local X509 authority IDs")
-		return nil, nil
+		return j, nil
 	}
 
 	j.caJournalID = caJournal.ID
+	j.activeX509AuthorityID = caJournal.ActiveX509AuthorityID
 	if err := proto.Unmarshal(caJournal.Data, j.entries); err != nil {
-		return nil, errs.New("unable to unmarshal entries from CA journal record: %v", err)
+		return nil, fmt.Errorf("unable to unmarshal entries from CA journal record: %w", err)
 	}
 	return j, nil
 }

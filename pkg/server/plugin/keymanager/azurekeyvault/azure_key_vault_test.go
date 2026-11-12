@@ -3,6 +3,8 @@ package azurekeyvault
 import (
 	"context"
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/sha512"
 	"crypto/x509"
@@ -14,14 +16,15 @@ import (
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
-	"github.com/Azure/azure-sdk-for-go/sdk/keyvault/azkeys"
+	"github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/azkeys"
 	"github.com/andres-erbsen/clock"
 	"github.com/gofrs/uuid/v5"
 	"github.com/sirupsen/logrus"
 	"github.com/sirupsen/logrus/hooks/test"
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	keymanagerv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/plugin/server/keymanager/v1"
 	configv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/service/common/config/v1"
+	"github.com/spiffe/spire/pkg/common/catalog"
 	"github.com/spiffe/spire/pkg/server/plugin/keymanager"
 	keymanagertest "github.com/spiffe/spire/pkg/server/plugin/keymanager/test"
 	"github.com/spiffe/spire/test/plugintest"
@@ -68,8 +71,12 @@ func TestKeyManagerContract(t *testing.T) {
 		km := new(keymanager.V1)
 		keyIdentifierFile := createKeyIdentifierFile(t)
 
-		plugintest.Load(t, builtin(p), km, plugintest.Configuref(`
-			key_metadata_file = %q
+		plugintest.Load(t, builtin(p), km,
+			plugintest.CoreConfig(catalog.CoreConfig{
+				TrustDomain: spiffeid.RequireTrustDomainFromString("example.org"),
+			}),
+			plugintest.Configuref(`
+			key_identifier_file = %q
 			key_vault_uri = "https://spire-server.vault.azure.net/"
 			use_msi=true
 		`, keyIdentifierFile))
@@ -102,10 +109,10 @@ func TestConfigure(t *testing.T) {
 			name:             "pass with keys",
 			configureRequest: configureRequestWithDefaults(t),
 			fakeEntries: []fakeKeyEntry{
-				makeFakeKeyEntry(t, "key-1", trustDomain, validServerID, azkeys.JSONWebKeyTypeRSA, nil, to.Ptr(2048)),
-				makeFakeKeyEntry(t, "key-2", trustDomain, validServerID, azkeys.JSONWebKeyTypeRSA, nil, to.Ptr(4096)),
-				makeFakeKeyEntry(t, "key-3", trustDomain, validServerID, azkeys.JSONWebKeyTypeEC, to.Ptr(azkeys.JSONWebKeyCurveNameP256), nil),
-				makeFakeKeyEntry(t, "key-4", trustDomain, validServerID, azkeys.JSONWebKeyTypeEC, to.Ptr(azkeys.JSONWebKeyCurveNameP384), nil),
+				makeFakeKeyEntry(t, "key-1", trustDomain, validServerID, azkeys.KeyTypeRSA, nil, new(2048)),
+				makeFakeKeyEntry(t, "key-2", trustDomain, validServerID, azkeys.KeyTypeRSA, nil, new(4096)),
+				makeFakeKeyEntry(t, "key-3", trustDomain, validServerID, azkeys.KeyTypeEC, new(azkeys.CurveNameP256), nil),
+				makeFakeKeyEntry(t, "key-4", trustDomain, validServerID, azkeys.KeyTypeEC, new(azkeys.CurveNameP384), nil),
 			},
 		},
 		{
@@ -114,79 +121,67 @@ func TestConfigure(t *testing.T) {
 		},
 		{
 			name:             "pass with identity file",
-			configureRequest: configureRequestWithVars(KeyIdentifierFile, createKeyIdentifierFile(t), validKeyVaultURI, validTenantID, validSubscriptionID, validAppID, validAppSecret, "false"),
+			configureRequest: configureRequestWithVars(KeyIdentifierValue, createKeyIdentifierFile(t), validKeyVaultURI, validTenantID, validSubscriptionID, validAppID, validAppSecret),
 		},
 		{
 			name:             "pass with identity value",
-			configureRequest: configureRequestWithVars(KeyIdentifierValue, "server-id", validKeyVaultURI, validTenantID, validSubscriptionID, validAppID, validAppSecret, "false"),
+			configureRequest: configureRequestWithVars(KeyIdentifierValue, "server-id", validKeyVaultURI, validTenantID, validSubscriptionID, validAppID, validAppSecret),
 		},
 		{
-			name:             "missing key metadata file",
-			configureRequest: configureRequestWithVars(KeyMetadataFile, "", validKeyVaultURI, validTenantID, validSubscriptionID, validAppID, validAppSecret, "false"),
-			err:              "configuration requires server id or server id file path",
+			name:             "missing key identifier file and key identifier value",
+			configureRequest: configureRequestWithVars(KeyIdentifierFile, "", validKeyVaultURI, validTenantID, validSubscriptionID, validAppID, validAppSecret),
+			err:              "configuration requires a key identifier file or a key identifier value",
 			code:             codes.InvalidArgument,
 		},
 		{
-			name:             "key identifier file and key identifier value",
+			name:             "both key identifier file and key identifier value",
 			configureRequest: configureRequestWithString(fmt.Sprintf(`{"access_key_id":"access_key_id","secret_access_key":"secret_access_key","region":"region","key_identifier_file":"key_identifier_file","key_identifier_value":"key_identifier_value","key_policy_file":"","key_vault_uri":"%s"}`, validKeyVaultURI)),
-			err:              "configuration must not contain both server id and server id file path",
+			err:              "configuration can't have a key identifier file and a key identifier value at the same time",
 			code:             codes.InvalidArgument,
 		},
 		{
-			name:             "key metadata file and key identifier file",
-			configureRequest: configureRequestWithString(fmt.Sprintf(`{"access_key_id":"access_key_id","secret_access_key":"secret_access_key","region":"region","key_metadata_file":"key_metadata_file","key_identifier_file":"key_identifier_file","key_policy_file":"","key_vault_uri":"%s"}`, validKeyVaultURI)),
-			err:              "configuration must not contain both 'key_identifier_file' and deprecated 'key_metadata_file'",
-			code:             codes.InvalidArgument,
-		},
-		{
-			name:             "key metadata value too long",
-			configureRequest: configureRequestWithVars(KeyIdentifierValue, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", validKeyVaultURI, validTenantID, validSubscriptionID, validAppID, validAppSecret, "false"),
+			name:             "key identifier value too long",
+			configureRequest: configureRequestWithVars(KeyIdentifierValue, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", validKeyVaultURI, validTenantID, validSubscriptionID, validAppID, validAppSecret),
 			err:              "Key identifier must not be longer than 256 characters",
 			code:             codes.InvalidArgument,
 		},
 		{
 			name:             "missing client authentication config",
-			configureRequest: configureRequestWithVars(KeyMetadataFile, createKeyIdentifierFile(t), validKeyVaultURI, "", "", "", "", "false"),
-		},
-		{
-			name:             "use MSI while app secret is set",
-			configureRequest: configureRequestWithVars(KeyMetadataFile, createKeyIdentifierFile(t), validKeyVaultURI, "", "", "", validAppSecret, "true"),
-			err:              "invalid configuration, cannot use both MSI and app authentication",
-			code:             codes.InvalidArgument,
+			configureRequest: configureRequestWithVars(KeyIdentifierFile, createKeyIdentifierFile(t), validKeyVaultURI, "", "", "", ""),
 		},
 		{
 			name:             "missing Key Vault URI",
-			configureRequest: configureRequestWithVars(KeyMetadataFile, createKeyIdentifierFile(t), "", validTenantID, validSubscriptionID, validAppID, validAppSecret, "false"),
+			configureRequest: configureRequestWithVars(KeyIdentifierFile, createKeyIdentifierFile(t), "", validTenantID, validSubscriptionID, validAppID, validAppSecret),
 			err:              "configuration is missing the Key Vault URI",
 			code:             codes.InvalidArgument,
 		},
 		{
 			name:             "missing tenant ID",
-			configureRequest: configureRequestWithVars(KeyMetadataFile, createKeyIdentifierFile(t), validKeyVaultURI, "", validSubscriptionID, validAppID, validAppSecret, "false"),
+			configureRequest: configureRequestWithVars(KeyIdentifierFile, createKeyIdentifierFile(t), validKeyVaultURI, "", validSubscriptionID, validAppID, validAppSecret),
 			err:              "invalid configuration, missing tenant id",
 			code:             codes.InvalidArgument,
 		},
 		{
 			name:             "missing subscription ID ",
-			configureRequest: configureRequestWithVars(KeyMetadataFile, createKeyIdentifierFile(t), validKeyVaultURI, validTenantID, "", validAppID, validAppSecret, "false"),
+			configureRequest: configureRequestWithVars(KeyIdentifierFile, createKeyIdentifierFile(t), validKeyVaultURI, validTenantID, "", validAppID, validAppSecret),
 			err:              "invalid configuration, missing subscription id",
 			code:             codes.InvalidArgument,
 		},
 		{
-			name:             "missing server id file path",
-			configureRequest: configureRequestWithVars(KeyMetadataFile, "", validKeyVaultURI, validTenantID, validSubscriptionID, validAppID, validAppSecret, "false"),
-			err:              "configuration requires server id or server id file path",
+			name:             "missing key identifier file and key identifier value",
+			configureRequest: configureRequestWithVars(KeyIdentifierFile, "", validKeyVaultURI, validTenantID, validSubscriptionID, validAppID, validAppSecret),
+			err:              "configuration requires a key identifier file or a key identifier value",
 			code:             codes.InvalidArgument,
 		},
 		{
 			name:             "missing application ID",
-			configureRequest: configureRequestWithVars(KeyMetadataFile, createKeyIdentifierFile(t), validKeyVaultURI, validTenantID, validSubscriptionID, "", validAppSecret, "false"),
+			configureRequest: configureRequestWithVars(KeyIdentifierFile, createKeyIdentifierFile(t), validKeyVaultURI, validTenantID, validSubscriptionID, "", validAppSecret),
 			err:              "invalid configuration, missing application id",
 			code:             codes.InvalidArgument,
 		},
 		{
 			name:             "missing application secret",
-			configureRequest: configureRequestWithVars(KeyMetadataFile, createKeyIdentifierFile(t), validKeyVaultURI, validTenantID, validSubscriptionID, validAppID, "", "false"),
+			configureRequest: configureRequestWithVars(KeyIdentifierFile, createKeyIdentifierFile(t), validKeyVaultURI, validTenantID, validSubscriptionID, validAppID, ""),
 			err:              "invalid configuration, missing app secret",
 			code:             codes.InvalidArgument,
 		},
@@ -210,12 +205,11 @@ func TestConfigure(t *testing.T) {
 			code:             codes.Internal,
 			configureRequest: configureRequestWithDefaults(t),
 			fakeEntries: []fakeKeyEntry{
-				makeFakeKeyEntry(t, "key-1", trustDomain, validServerID, azkeys.JSONWebKeyTypeRSA, nil, to.Ptr(2048)),
+				makeFakeKeyEntry(t, "key-1", trustDomain, validServerID, azkeys.KeyTypeRSA, nil, new(2048)),
 			},
 			getKeyErr: "get key error",
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			// setup
 			ts := setupTest(t)
@@ -322,7 +316,6 @@ func TestGenerateKey(t *testing.T) {
 			},
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			// setup
 			ts := setupTest(t)
@@ -639,7 +632,6 @@ func TestSignData(t *testing.T) {
 			},
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			// setup
 			ts := setupTest(t)
@@ -694,7 +686,6 @@ func TestGetPublicKey(t *testing.T) {
 			generatedKeyID: "some-id",
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			// setup
 			ts := setupTest(t)
@@ -736,7 +727,6 @@ func TestGetPublicKeys(t *testing.T) {
 			name: "non existing keys",
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			// setup
 			ts := setupTest(t)
@@ -770,10 +760,10 @@ func TestGetPublicKeys(t *testing.T) {
 }
 
 func TestRefreshKeys(t *testing.T) {
-	entry1 := makeFakeKeyEntry(t, keyNamePrefix+"-"+getUUID(t)+"-spireKey1", trustDomain, validServerID, azkeys.JSONWebKeyTypeRSA, nil, to.Ptr(4096))
-	entry2 := makeFakeKeyEntry(t, keyNamePrefix+"-"+getUUID(t)+"-spireKey2", trustDomain, "another-server-id", azkeys.JSONWebKeyTypeRSA, nil, to.Ptr(4096))
-	entry3 := makeFakeKeyEntry(t, keyNamePrefix+"-"+getUUID(t)+"-spireKey3", "another-td", validServerID, azkeys.JSONWebKeyTypeRSA, nil, to.Ptr(4096))
-	entry4 := makeFakeKeyEntry(t, keyNamePrefix+"-"+getUUID(t)+"-spireKey4", "another-td", "another-server-id", azkeys.JSONWebKeyTypeRSA, nil, to.Ptr(4096))
+	entry1 := makeFakeKeyEntry(t, keyNamePrefix+"-"+getUUID(t)+"-spireKey1", trustDomain, validServerID, azkeys.KeyTypeRSA, nil, new(4096))
+	entry2 := makeFakeKeyEntry(t, keyNamePrefix+"-"+getUUID(t)+"-spireKey2", trustDomain, "another-server-id", azkeys.KeyTypeRSA, nil, new(4096))
+	entry3 := makeFakeKeyEntry(t, keyNamePrefix+"-"+getUUID(t)+"-spireKey3", "another-td", validServerID, azkeys.KeyTypeRSA, nil, new(4096))
+	entry4 := makeFakeKeyEntry(t, keyNamePrefix+"-"+getUUID(t)+"-spireKey4", "another-td", "another-server-id", azkeys.KeyTypeRSA, nil, new(4096))
 
 	for _, tt := range []struct {
 		name             string
@@ -788,7 +778,7 @@ func TestRefreshKeys(t *testing.T) {
 			err:              "update failure",
 			updateKeyErr:     "update failure",
 			fakeEntries: []fakeKeyEntry{
-				makeFakeKeyEntry(t, keyName, trustDomain, validServerID, azkeys.JSONWebKeyTypeRSA, nil, to.Ptr(4096)),
+				makeFakeKeyEntry(t, keyName, trustDomain, validServerID, azkeys.KeyTypeRSA, nil, new(4096)),
 			},
 		},
 		{
@@ -802,7 +792,6 @@ func TestRefreshKeys(t *testing.T) {
 			},
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			// setup
 			ts := setupTest(t)
@@ -849,15 +838,15 @@ func TestRefreshKeys(t *testing.T) {
 }
 
 func TestDisposeKeys(t *testing.T) {
-	entry1 := makeFakeKeyEntry(t, keyName+"-1", trustDomain, "", azkeys.JSONWebKeyTypeRSA, nil, to.Ptr(4096))
-	entry2 := makeFakeKeyEntry(t, keyName+"-2", trustDomain, validServerID, azkeys.JSONWebKeyTypeRSA, nil, to.Ptr(2048))
-	entry3 := makeFakeKeyEntry(t, keyName+"-3", trustDomain, "another_server_id", azkeys.JSONWebKeyTypeEC, to.Ptr(azkeys.JSONWebKeyCurveNameP384), nil)
-	entry4 := makeFakeKeyEntry(t, keyName+"-4", "another-trust-domain", validServerID, azkeys.JSONWebKeyTypeRSA, nil, to.Ptr(4096))
-	entry5 := makeFakeKeyEntry(t, keyName+"-5", "another-trust-domain", "another_server_id", azkeys.JSONWebKeyTypeEC, to.Ptr(azkeys.JSONWebKeyCurveNameP256), nil)
-	entry6 := makeFakeKeyEntry(t, keyName+"-6", trustDomain, "another_server_id", azkeys.JSONWebKeyTypeEC, to.Ptr(azkeys.JSONWebKeyCurveNameP384), nil)
-	entry7 := makeFakeKeyEntry(t, keyName+"-7", trustDomain, "another_server_id", azkeys.JSONWebKeyTypeEC, to.Ptr(azkeys.JSONWebKeyCurveNameP256), nil)
-	entry8 := makeFakeKeyEntry(t, keyName+"-8", trustDomain, "another_server_id", azkeys.JSONWebKeyTypeEC, to.Ptr(azkeys.JSONWebKeyCurveNameP384), nil)
-	entry9 := makeFakeKeyEntry(t, keyName+"-9", "some-other-trust-domain", "another_server_id", azkeys.JSONWebKeyTypeEC, to.Ptr(azkeys.JSONWebKeyCurveNameP384), nil)
+	entry1 := makeFakeKeyEntry(t, keyName+"-1", trustDomain, "", azkeys.KeyTypeRSA, nil, new(4096))
+	entry2 := makeFakeKeyEntry(t, keyName+"-2", trustDomain, validServerID, azkeys.KeyTypeRSA, nil, new(2048))
+	entry3 := makeFakeKeyEntry(t, keyName+"-3", trustDomain, "another_server_id", azkeys.KeyTypeEC, new(azkeys.CurveNameP384), nil)
+	entry4 := makeFakeKeyEntry(t, keyName+"-4", "another-trust-domain", validServerID, azkeys.KeyTypeRSA, nil, new(4096))
+	entry5 := makeFakeKeyEntry(t, keyName+"-5", "another-trust-domain", "another_server_id", azkeys.KeyTypeEC, new(azkeys.CurveNameP256), nil)
+	entry6 := makeFakeKeyEntry(t, keyName+"-6", trustDomain, "another_server_id", azkeys.KeyTypeEC, new(azkeys.CurveNameP384), nil)
+	entry7 := makeFakeKeyEntry(t, keyName+"-7", trustDomain, "another_server_id", azkeys.KeyTypeEC, new(azkeys.CurveNameP256), nil)
+	entry8 := makeFakeKeyEntry(t, keyName+"-8", trustDomain, "another_server_id", azkeys.KeyTypeEC, new(azkeys.CurveNameP384), nil)
+	entry9 := makeFakeKeyEntry(t, keyName+"-9", "some-other-trust-domain", "another_server_id", azkeys.KeyTypeEC, new(azkeys.CurveNameP384), nil)
 	for _, tt := range []struct {
 		name             string
 		configureRequest *configv1.ConfigureRequest
@@ -897,7 +886,6 @@ func TestDisposeKeys(t *testing.T) {
 			},
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			// setup
 			ts := setupTest(t)
@@ -952,6 +940,205 @@ func TestDisposeKeys(t *testing.T) {
 	}
 }
 
+func TestKeyVaultKeyToRawKey(t *testing.T) {
+	ec256Key := testkey.NewEC256(t)
+	ec384Key := testkey.NewEC384(t)
+	rsa2048Key := testkey.NewRSA2048(t)
+	rsa4096Key := testkey.NewRSA4096(t)
+
+	keyOps := getKeyOperations()
+	const fakeKID = "https://fake.vault.azure.net/keys/fake-key/version1"
+
+	for _, tt := range []struct {
+		name      string
+		jwk       *azkeys.JSONWebKey
+		assertKey func(t *testing.T, got any)
+		expectErr string
+	}{
+		{
+			name: "EC P-256",
+			jwk:  toECKey(ec256Key.Public(), fakeKID, azkeys.CurveNameP256, keyOps),
+			assertKey: func(t *testing.T, got any) {
+				pub, ok := got.(*ecdsa.PublicKey)
+				require.True(t, ok, "expected *ecdsa.PublicKey")
+				require.Equal(t, ec256Key.Public(), pub)
+			},
+		},
+		{
+			name: "EC P-384",
+			jwk:  toECKey(ec384Key.Public(), fakeKID, azkeys.CurveNameP384, keyOps),
+			assertKey: func(t *testing.T, got any) {
+				pub, ok := got.(*ecdsa.PublicKey)
+				require.True(t, ok, "expected *ecdsa.PublicKey")
+				require.Equal(t, ec384Key.Public(), pub)
+			},
+		},
+		{
+			name: "RSA 2048",
+			jwk:  toRSAKey(rsa2048Key.Public(), fakeKID, keyOps),
+			assertKey: func(t *testing.T, got any) {
+				pub, ok := got.(*rsa.PublicKey)
+				require.True(t, ok, "expected *rsa.PublicKey")
+				require.Equal(t, rsa2048Key.Public(), pub)
+			},
+		},
+		{
+			name: "RSA 4096",
+			jwk:  toRSAKey(rsa4096Key.Public(), fakeKID, keyOps),
+			assertKey: func(t *testing.T, got any) {
+				pub, ok := got.(*rsa.PublicKey)
+				require.True(t, ok, "expected *rsa.PublicKey")
+				require.Equal(t, rsa4096Key.Public(), pub)
+			},
+		},
+		{
+			name: "EC-HSM P-256 normalized to EC",
+			jwk: func() *azkeys.JSONWebKey {
+				k := toECKey(ec256Key.Public(), fakeKID, azkeys.CurveNameP256, keyOps)
+				k.Kty = new(azkeys.KeyTypeECHSM)
+				return k
+			}(),
+			assertKey: func(t *testing.T, got any) {
+				pub, ok := got.(*ecdsa.PublicKey)
+				require.True(t, ok, "expected *ecdsa.PublicKey")
+				require.Equal(t, ec256Key.Public(), pub)
+			},
+		},
+		{
+			name: "RSA-HSM normalized to RSA",
+			jwk: func() *azkeys.JSONWebKey {
+				k := toRSAKey(rsa2048Key.Public(), fakeKID, keyOps)
+				k.Kty = new(azkeys.KeyTypeRSAHSM)
+				return k
+			}(),
+			assertKey: func(t *testing.T, got any) {
+				pub, ok := got.(*rsa.PublicKey)
+				require.True(t, ok, "expected *rsa.PublicKey")
+				require.Equal(t, rsa2048Key.Public(), pub)
+			},
+		},
+		{
+			name:      "nil Kty returns error",
+			jwk:       &azkeys.JSONWebKey{Kty: nil},
+			expectErr: "key type is missing",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			originalKty := tt.jwk.Kty
+
+			got, err := keyVaultKeyToRawKey(tt.jwk)
+
+			if tt.expectErr != "" {
+				require.ErrorContains(t, err, tt.expectErr)
+				return
+			}
+			require.NoError(t, err)
+			tt.assertKey(t, got)
+
+			// Ensure the original struct was not mutated
+			require.Equal(t, originalKty, tt.jwk.Kty, "original JSONWebKey.Kty must not be modified")
+		})
+	}
+}
+
+func TestKeyTypeFromKeySpec(t *testing.T) {
+	keyOps := getKeyOperations()
+	const fakeKID = "https://fake.vault.azure.net/keys/fake-key/version1"
+
+	makeRSABundle := func(kty azkeys.KeyType, keySize int) azkeys.KeyBundle {
+		return azkeys.KeyBundle{Key: &azkeys.JSONWebKey{
+			Kty:    new(kty),
+			N:      make([]byte, keySize/8),
+			E:      []byte{1, 0, 1},
+			KID:    new(azkeys.ID(fakeKID)),
+			KeyOps: keyOps,
+		}}
+	}
+
+	makeECBundle := func(kty azkeys.KeyType, crv azkeys.CurveName) azkeys.KeyBundle {
+		return azkeys.KeyBundle{Key: &azkeys.JSONWebKey{
+			Kty:    new(kty),
+			Crv:    new(crv),
+			KID:    new(azkeys.ID(fakeKID)),
+			KeyOps: keyOps,
+		}}
+	}
+
+	for _, tt := range []struct {
+		name        string
+		bundle      azkeys.KeyBundle
+		expectType  keymanagerv1.KeyType
+		expectFound bool
+	}{
+		{
+			name:        "RSA 2048",
+			bundle:      makeRSABundle(azkeys.KeyTypeRSA, 2048),
+			expectType:  keymanagerv1.KeyType_RSA_2048,
+			expectFound: true,
+		},
+		{
+			name:        "RSA 4096",
+			bundle:      makeRSABundle(azkeys.KeyTypeRSA, 4096),
+			expectType:  keymanagerv1.KeyType_RSA_4096,
+			expectFound: true,
+		},
+		{
+			name:        "RSA-HSM 2048",
+			bundle:      makeRSABundle(azkeys.KeyTypeRSAHSM, 2048),
+			expectType:  keymanagerv1.KeyType_RSA_2048,
+			expectFound: true,
+		},
+		{
+			name:        "RSA-HSM 4096",
+			bundle:      makeRSABundle(azkeys.KeyTypeRSAHSM, 4096),
+			expectType:  keymanagerv1.KeyType_RSA_4096,
+			expectFound: true,
+		},
+		{
+			name:        "EC P-256",
+			bundle:      makeECBundle(azkeys.KeyTypeEC, azkeys.CurveNameP256),
+			expectType:  keymanagerv1.KeyType_EC_P256,
+			expectFound: true,
+		},
+		{
+			name:        "EC P-384",
+			bundle:      makeECBundle(azkeys.KeyTypeEC, azkeys.CurveNameP384),
+			expectType:  keymanagerv1.KeyType_EC_P384,
+			expectFound: true,
+		},
+		{
+			name:        "EC-HSM P-256",
+			bundle:      makeECBundle(azkeys.KeyTypeECHSM, azkeys.CurveNameP256),
+			expectType:  keymanagerv1.KeyType_EC_P256,
+			expectFound: true,
+		},
+		{
+			name:        "EC-HSM P-384",
+			bundle:      makeECBundle(azkeys.KeyTypeECHSM, azkeys.CurveNameP384),
+			expectType:  keymanagerv1.KeyType_EC_P384,
+			expectFound: true,
+		},
+		{
+			name:        "unsupported RSA key size",
+			bundle:      makeRSABundle(azkeys.KeyTypeRSA, 1024),
+			expectType:  keymanagerv1.KeyType_UNSPECIFIED_KEY_TYPE,
+			expectFound: false,
+		},
+		{
+			name:        "unsupported EC curve",
+			bundle:      makeECBundle(azkeys.KeyTypeEC, azkeys.CurveNameP521),
+			expectType:  keymanagerv1.KeyType_UNSPECIFIED_KEY_TYPE,
+			expectFound: false,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := keyTypeFromKeySpec(tt.bundle)
+			require.Equal(t, tt.expectFound, ok)
+			require.Equal(t, tt.expectType, got)
+		})
+	}
+}
+
 func setupTest(t *testing.T) *pluginTest {
 	log, logHook := test.NewNullLogger()
 	log.Level = logrus.DebugLevel
@@ -976,7 +1163,7 @@ func setupTest(t *testing.T) *pluginTest {
 
 func configureRequestWithDefaults(t *testing.T) *configv1.ConfigureRequest {
 	return &configv1.ConfigureRequest{
-		HclConfiguration:  serializedConfiguration(KeyMetadataFile, createKeyIdentifierFile(t), validKeyVaultURI, validTenantID, validSubscriptionID, validAppID, validAppSecret, ""),
+		HclConfiguration:  serializedConfiguration(KeyIdentifierFile, createKeyIdentifierFile(t), validKeyVaultURI, validTenantID, validSubscriptionID, validAppID, validAppSecret),
 		CoreConfiguration: &configv1.CoreConfiguration{TrustDomain: trustDomain},
 	}
 }
@@ -990,12 +1177,11 @@ func getUUID(t *testing.T) string {
 type KeyIdentifierConfigName string
 
 const (
-	KeyMetadataFile    KeyIdentifierConfigName = "key_metadata_file"
 	KeyIdentifierFile  KeyIdentifierConfigName = "key_identifier_file"
 	KeyIdentifierValue KeyIdentifierConfigName = "key_identifier_value"
 )
 
-func serializedConfiguration(keyIdentifierConfigName KeyIdentifierConfigName, keyIdentifierConfigValue, keyVaultURI, tenantID, subscriptionID, appID, appSecret, useMsi string) string {
+func serializedConfiguration(keyIdentifierConfigName KeyIdentifierConfigName, keyIdentifierConfigValue, keyVaultURI, tenantID, subscriptionID, appID, appSecret string) string {
 	return fmt.Sprintf(`{
 		"%s":"%s",
 		"key_vault_uri":"%s",
@@ -1003,7 +1189,6 @@ func serializedConfiguration(keyIdentifierConfigName KeyIdentifierConfigName, ke
 		"subscription_id":"%s",
 		"app_id":"%s",
 		"app_secret":"%s",
-		"use_msi":%s
 		}`,
 		keyIdentifierConfigName,
 		keyIdentifierConfigValue,
@@ -1011,20 +1196,20 @@ func serializedConfiguration(keyIdentifierConfigName KeyIdentifierConfigName, ke
 		tenantID,
 		subscriptionID,
 		appID,
-		appSecret,
-		useMsi)
+		appSecret)
 }
 
-func configureRequestWithVars(keyIdentifierConfigName KeyIdentifierConfigName, keyIdentifierConfigValue, keyVaultURI, tenantID, subscriptionID, appID, appSecret, useMsi string) *configv1.ConfigureRequest {
+func configureRequestWithVars(keyIdentifierConfigName KeyIdentifierConfigName, keyIdentifierConfigValue, keyVaultURI, tenantID, subscriptionID, appID, appSecret string) *configv1.ConfigureRequest {
 	return &configv1.ConfigureRequest{
-		HclConfiguration:  serializedConfiguration(keyIdentifierConfigName, keyIdentifierConfigValue, keyVaultURI, tenantID, subscriptionID, appID, appSecret, useMsi),
 		CoreConfiguration: &configv1.CoreConfiguration{TrustDomain: trustDomain},
+		HclConfiguration:  serializedConfiguration(keyIdentifierConfigName, keyIdentifierConfigValue, keyVaultURI, tenantID, subscriptionID, appID, appSecret),
 	}
 }
 
 func configureRequestWithString(config string) *configv1.ConfigureRequest {
 	return &configv1.ConfigureRequest{
-		HclConfiguration: config,
+		CoreConfiguration: &configv1.CoreConfiguration{TrustDomain: trustDomain},
+		HclConfiguration:  config,
 	}
 }
 
@@ -1039,22 +1224,22 @@ func createKeyIdentifierFile(t *testing.T) string {
 	return tempFilePath
 }
 
-func makeFakeKeyEntry(t *testing.T, keyName, trustDomain, serverID string, keyType azkeys.JSONWebKeyType, curveName *azkeys.JSONWebKeyCurveName, rsaKeySize *int) fakeKeyEntry {
+func makeFakeKeyEntry(t *testing.T, keyName, trustDomain, serverID string, keyType azkeys.KeyType, curveName *azkeys.CurveName, rsaKeySize *int) fakeKeyEntry {
 	var publicKey *azkeys.JSONWebKey
 	var privateKey crypto.Signer
 	keyOperations := getKeyOperations()
 	kmsKeyID := validKeyVaultURI + path.Join("keys", fmt.Sprintf("%s-%s-%s", keyNamePrefix, fmt.Sprintf("%s-%s", getUUID(t), keyName), spireKeyID))
 	switch {
-	case keyType == azkeys.JSONWebKeyTypeEC && *curveName == azkeys.JSONWebKeyCurveNameP256:
+	case keyType == azkeys.KeyTypeEC && *curveName == azkeys.CurveNameP256:
 		privateKey = testkey.NewEC256(t)
 		publicKey = toECKey(privateKey.Public(), kmsKeyID, *curveName, keyOperations)
-	case keyType == azkeys.JSONWebKeyTypeEC && *curveName == azkeys.JSONWebKeyCurveNameP384:
+	case keyType == azkeys.KeyTypeEC && *curveName == azkeys.CurveNameP384:
 		privateKey = testkey.NewEC384(t)
 		publicKey = toECKey(privateKey.Public(), kmsKeyID, *curveName, keyOperations)
-	case keyType == azkeys.JSONWebKeyTypeRSA && *rsaKeySize == 2048:
+	case keyType == azkeys.KeyTypeRSA && *rsaKeySize == 2048:
 		privateKey = testkey.NewRSA2048(t)
 		publicKey = toRSAKey(privateKey.Public(), kmsKeyID, keyOperations)
-	case keyType == azkeys.JSONWebKeyTypeRSA && *rsaKeySize == 4096:
+	case keyType == azkeys.KeyTypeRSA && *rsaKeySize == 4096:
 		privateKey = testkey.NewRSA4096(t)
 		publicKey = toRSAKey(privateKey.Public(), kmsKeyID, keyOperations)
 	default:
@@ -1062,14 +1247,14 @@ func makeFakeKeyEntry(t *testing.T, keyName, trustDomain, serverID string, keyTy
 	}
 
 	keyAttr := &azkeys.KeyAttributes{
-		Enabled: to.Ptr(true),
+		Enabled: new(true),
 		Created: &unixEpoch,
 		Updated: &unixEpoch,
 	}
 
 	tags := make(map[string]*string)
-	tags[tagNameServerTrustDomain] = to.Ptr(trustDomain)
-	tags[tagNameServerID] = to.Ptr(serverID)
+	tags[tagNameServerTrustDomain] = new(trustDomain)
+	tags[tagNameServerID] = new(serverID)
 	keyBundle := &azkeys.KeyBundle{
 		Attributes: keyAttr,
 		Key:        publicKey,

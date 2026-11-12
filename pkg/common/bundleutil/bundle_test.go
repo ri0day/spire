@@ -16,6 +16,7 @@ import (
 	testlog "github.com/sirupsen/logrus/hooks/test"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/spire-api-sdk/proto/spire/api/types"
+	"github.com/spiffe/spire/pkg/common/x509util"
 	"github.com/spiffe/spire/proto/spire/common"
 	"github.com/spiffe/spire/test/spiretest"
 	"github.com/spiffe/spire/test/testca"
@@ -28,6 +29,8 @@ type bundleTest struct {
 	certExpired      *x509.Certificate
 	jwtKeyExpired    *common.PublicKey
 	jwtKeyNotExpired *common.PublicKey
+	witKeyExpired    *common.PublicKey
+	witKeyNotExpired *common.PublicKey
 }
 
 func TestPruneBundle(t *testing.T) {
@@ -51,6 +54,7 @@ func TestPruneBundle(t *testing.T) {
 			bundle: createBundle(
 				[]*x509.Certificate{test.certNotExpired, test.certExpired},
 				[]*common.PublicKey{test.jwtKeyNotExpired, test.jwtKeyExpired},
+				[]*common.PublicKey{test.witKeyNotExpired, test.witKeyExpired},
 			),
 			expiration:  time.Time{},
 			expectedErr: "expiration time is zero value",
@@ -60,6 +64,7 @@ func TestPruneBundle(t *testing.T) {
 			bundle: createBundle(
 				[]*x509.Certificate{test.certExpired},
 				[]*common.PublicKey{test.jwtKeyNotExpired, test.jwtKeyExpired},
+				[]*common.PublicKey{test.witKeyNotExpired, test.witKeyExpired},
 			),
 			expiration:  test.currentTime,
 			expectedErr: "would prune all certificates",
@@ -69,25 +74,67 @@ func TestPruneBundle(t *testing.T) {
 			bundle: createBundle(
 				[]*x509.Certificate{test.certNotExpired, test.certExpired},
 				[]*common.PublicKey{test.jwtKeyExpired},
+				[]*common.PublicKey{test.witKeyNotExpired, test.witKeyExpired},
 			),
 			expiration:  test.currentTime,
 			expectedErr: "would prune all JWT signing keys",
+		},
+		{
+			name: "ok if no JWT keys in bundle",
+			bundle: createBundle(
+				[]*x509.Certificate{test.certNotExpired, test.certExpired},
+				nil,
+				[]*common.PublicKey{test.witKeyNotExpired, test.witKeyExpired},
+			),
+			newBundle: createBundle(
+				[]*x509.Certificate{test.certNotExpired},
+				nil,
+				[]*common.PublicKey{test.witKeyNotExpired},
+			),
+			expiration: test.currentTime,
+			changed:    true,
+		},
+		{
+			name: "fail if all WIT expired",
+			bundle: createBundle(
+				[]*x509.Certificate{test.certNotExpired, test.certExpired},
+				[]*common.PublicKey{test.jwtKeyNotExpired},
+				[]*common.PublicKey{test.witKeyExpired},
+			),
+			expiration:  test.currentTime,
+			expectedErr: "would prune all WIT signing keys",
+		},
+		{
+			name: "ok if no WIT keys in bundle",
+			bundle: createBundle(
+				[]*x509.Certificate{test.certNotExpired, test.certExpired},
+				[]*common.PublicKey{test.jwtKeyNotExpired, test.jwtKeyExpired},
+				nil,
+			),
+			newBundle: createBundle(
+				[]*x509.Certificate{test.certNotExpired},
+				[]*common.PublicKey{test.jwtKeyNotExpired},
+				nil,
+			),
+			expiration: test.currentTime,
+			changed:    true,
 		},
 		{
 			name: "succeeds",
 			bundle: createBundle(
 				[]*x509.Certificate{test.certNotExpired, test.certExpired},
 				[]*common.PublicKey{test.jwtKeyNotExpired, test.jwtKeyExpired},
+				[]*common.PublicKey{test.witKeyNotExpired, test.witKeyExpired},
 			),
 			newBundle: createBundle(
 				[]*x509.Certificate{test.certNotExpired},
 				[]*common.PublicKey{test.jwtKeyNotExpired},
+				[]*common.PublicKey{test.witKeyNotExpired},
 			),
 			expiration: test.currentTime,
 			changed:    true,
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			log, _ := testlog.NewNullLogger()
 			newBundle, changed, err := PruneBundle(tt.bundle, tt.expiration, log)
@@ -154,6 +201,42 @@ func TestCommonBundleFromProto(t *testing.T) {
 			},
 		},
 		{
+			name: "tainted authority",
+			bundle: &types.Bundle{
+				TrustDomain: td.Name(),
+				RefreshHint: 10,
+				X509Authorities: []*types.X509Certificate{
+					{
+						Asn1:    rootCA.Raw,
+						Tainted: true,
+					},
+				},
+				JwtAuthorities: []*types.JWTKey{
+					{
+						PublicKey: pkixBytes,
+						KeyId:     "key-id-1",
+						ExpiresAt: 1590514224,
+						Tainted:   true,
+					},
+				},
+				SequenceNumber: 42,
+			},
+			expectBundle: &common.Bundle{
+				TrustDomainId:  td.IDString(),
+				RefreshHint:    10,
+				SequenceNumber: 42,
+				RootCas:        []*common.Certificate{{DerBytes: rootCA.Raw, TaintedKey: true}},
+				JwtSigningKeys: []*common.PublicKey{
+					{
+						PkixBytes:  pkixBytes,
+						Kid:        "key-id-1",
+						NotAfter:   1590514224,
+						TaintedKey: true,
+					},
+				},
+			},
+		},
+		{
 			name: "Empty key ID",
 			bundle: &types.Bundle{
 				TrustDomain: td.Name(),
@@ -180,7 +263,6 @@ func TestCommonBundleFromProto(t *testing.T) {
 			expectError: `bundle has an invalid trust domain "invalid TD": trust domain characters are limited to lowercase letters, numbers, dots, dashes, and underscores`,
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			bundle, err := CommonBundleFromProto(tt.bundle)
 
@@ -205,10 +287,13 @@ func TestSPIFFEBundleToProto(t *testing.T) {
 	bundle := spiffebundle.FromX509Authorities(td, ca.X509Authorities())
 	err = bundle.AddJWTAuthority("key-id-1", ca.X509Authorities()[0].PublicKey)
 	require.NoError(t, err)
+	err = bundle.AddWITAuthority("wit-key-id-1", ca.X509Authorities()[0].PublicKey)
+	require.NoError(t, err)
 	bundle.SetRefreshHint(time.Second * 10)
 	bundle.SetSequenceNumber(42)
 	bundleNoRefreshHint := spiffebundle.FromX509Authorities(td, ca.X509Authorities())
 	bundleInvalidKey := spiffebundle.FromJWTAuthorities(td, map[string]crypto.PublicKey{"some-key": "invalid format"})
+	bundleInvalidWITKey := spiffebundle.FromWITAuthorities(td, map[string]crypto.PublicKey{"some-key": "invalid format"})
 
 	tests := []struct {
 		name     string
@@ -217,7 +302,7 @@ func TestSPIFFEBundleToProto(t *testing.T) {
 		expErr   error
 	}{
 		{
-			name:   "success with jwt and x509 authorities",
+			name:   "success with jwt, wit and x509 authorities",
 			bundle: bundle,
 			expProto: &common.Bundle{
 				TrustDomainId:  td.IDString(),
@@ -228,6 +313,12 @@ func TestSPIFFEBundleToProto(t *testing.T) {
 					{
 						PkixBytes: pkixBytes,
 						Kid:       "key-id-1",
+					},
+				},
+				WitSigningKeys: []*common.PublicKey{
+					{
+						PkixBytes: pkixBytes,
+						Kid:       "wit-key-id-1",
 					},
 				},
 			},
@@ -245,7 +336,12 @@ func TestSPIFFEBundleToProto(t *testing.T) {
 		{
 			name:   "fail with error marshalling jwt public key",
 			bundle: bundleInvalidKey,
-			expErr: errors.New("failed to marshal public key: x509: unsupported public key type: string"),
+			expErr: errors.New("failed to marshal JWT public key: x509: unsupported public key type: string"),
+		},
+		{
+			name:   "fail with error marshalling wit public key",
+			bundle: bundleInvalidWITKey,
+			expErr: errors.New("failed to marshal WIT public key: x509: unsupported public key type: string"),
 		},
 	}
 	for _, tt := range tests {
@@ -271,6 +367,8 @@ func TestSPIFFEBundleFromProto(t *testing.T) {
 	bundle := spiffebundle.FromX509Authorities(td, ca.X509Authorities())
 	err = bundle.AddJWTAuthority("key-id-1", ca.X509Authorities()[0].PublicKey)
 	require.NoError(t, err)
+	err = bundle.AddWITAuthority("wit-key-id-1", ca.X509Authorities()[0].PublicKey)
+	require.NoError(t, err)
 	bundle.SetRefreshHint(time.Second * 10)
 	bundle.SetSequenceNumber(42)
 	bundleZeroedRefreshHint := spiffebundle.FromX509Authorities(td, ca.X509Authorities())
@@ -284,7 +382,7 @@ func TestSPIFFEBundleFromProto(t *testing.T) {
 		expErr    error
 	}{
 		{
-			name: "success with jwt and x509 authorities",
+			name: "success with jwt, wit and x509 authorities",
 			proto: &common.Bundle{
 				TrustDomainId:  td.IDString(),
 				RootCas:        []*common.Certificate{{DerBytes: rootCA.Raw}},
@@ -294,6 +392,12 @@ func TestSPIFFEBundleFromProto(t *testing.T) {
 					{
 						PkixBytes: pkixBytes,
 						Kid:       "key-id-1",
+					},
+				},
+				WitSigningKeys: []*common.PublicKey{
+					{
+						PkixBytes: pkixBytes,
+						Kid:       "wit-key-id-1",
 					},
 				},
 			},
@@ -347,6 +451,22 @@ func TestSPIFFEBundleFromProto(t *testing.T) {
 				"private:false defaultValue:<nil> tag:<nil> stringType:0 timeType:0 set:false omitEmpty:false} " +
 				"publicKeyInfo @2"),
 		},
+		{
+			name: "fail with error parsing wit authority",
+			proto: &common.Bundle{
+				TrustDomainId: td.IDString(),
+				RootCas:       []*common.Certificate{{DerBytes: rootCA.Raw}},
+				WitSigningKeys: []*common.PublicKey{
+					{
+						PkixBytes: []byte("invalid"),
+					},
+				},
+			},
+			expErr: errors.New("unable to parse WIT signing key 0: asn1: structure error: tags don't match (16 vs" +
+				" {class:1 tag:9 length:110 isCompound:true}) {optional:false explicit:false application:false " +
+				"private:false defaultValue:<nil> tag:<nil> stringType:0 timeType:0 set:false omitEmpty:false} " +
+				"publicKeyInfo @2"),
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -362,9 +482,42 @@ func TestSPIFFEBundleFromProto(t *testing.T) {
 	}
 }
 
-func createBundle(certs []*x509.Certificate, jwtKeys []*common.PublicKey) *common.Bundle {
+func TestFindX509Authorities(t *testing.T) {
+	td := spiffeid.RequireTrustDomainFromString("example.org")
+
+	skID1 := x509util.SubjectKeyIDToString([]byte("ca1"))
+	ca1 := &x509.Certificate{
+		SubjectKeyId: []byte("ca1"),
+	}
+	ca2 := &x509.Certificate{
+		SubjectKeyId: []byte("ca2"),
+	}
+	skID3 := x509util.SubjectKeyIDToString([]byte("ca3"))
+	ca3 := &x509.Certificate{
+		SubjectKeyId: []byte("ca3"),
+	}
+	testBundle := spiffebundle.FromX509Authorities(td, []*x509.Certificate{ca1, ca2, ca3})
+
+	runTest := func(skIDs []string, expectErr string, expectResp ...*x509.Certificate) {
+		found, err := FindX509Authorities(testBundle, skIDs)
+		if expectErr != "" {
+			require.EqualError(t, err, expectErr)
+			require.Nil(t, found)
+			return
+		}
+		require.NoError(t, err)
+		require.Equal(t, expectResp, found)
+	}
+
+	runTest([]string{skID1}, "", ca1)
+	runTest([]string{skID1, skID3}, "", ca1, ca3)
+	runTest([]string{skID1, "foo"}, `no X.509 authority found with SubjectKeyID "foo"`)
+}
+
+func createBundle(certs []*x509.Certificate, jwtKeys []*common.PublicKey, witKeys []*common.PublicKey) *common.Bundle {
 	bundle := BundleProtoFromRootCAs("spiffe://foo", certs)
 	bundle.JwtSigningKeys = jwtKeys
+	bundle.WitSigningKeys = witKeys
 	return bundle
 }
 
@@ -391,5 +544,7 @@ func setupTest(t *testing.T) *bundleTest {
 		certExpired:      certExpired,
 		jwtKeyExpired:    &common.PublicKey{NotAfter: expiredKeyTime.Unix()},
 		jwtKeyNotExpired: &common.PublicKey{NotAfter: nonExpiredKeyTime.Unix()},
+		witKeyExpired:    &common.PublicKey{NotAfter: expiredKeyTime.Unix()},
+		witKeyNotExpired: &common.PublicKey{NotAfter: nonExpiredKeyTime.Unix()},
 	}
 }

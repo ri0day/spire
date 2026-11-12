@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -17,7 +18,6 @@ import (
 	"github.com/spiffe/spire/test/fakes/fakedatastore"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/zeebo/errs"
 )
 
 func TestManagerPeriodicBundleRefresh(t *testing.T) {
@@ -66,7 +66,6 @@ func TestManagerPeriodicBundleRefresh(t *testing.T) {
 	}
 
 	for _, testCase := range testCases {
-		testCase := testCase
 		t.Run(testCase.name, func(t *testing.T) {
 			test := newManagerTest(t, source,
 				func(spiffeid.TrustDomain) *spiffebundle.Bundle {
@@ -181,8 +180,14 @@ func TestManagerConfigPeriodicRefresh(t *testing.T) {
 	})
 
 	// Wait until the config is refreshed and a bundle refresh happens
-	test.AdvanceTime(bundleutil.MinimumRefreshHint + time.Millisecond)
+	test.AdvanceTime(configRefreshInterval + time.Millisecond)
 	test.WaitForConfigRefresh()
+	test.WaitForBundleRefresh(bundleutil.MinimumRefreshHint) // td3
+	assert.Equal(t, 1, test.UpdateCount(td1))
+	assert.Equal(t, 1, test.UpdateCount(td2))
+	assert.Equal(t, 1, test.UpdateCount(td3))
+
+	test.AdvanceTime(bundleutil.MinimumRefreshHint + time.Millisecond)
 	test.WaitForBundleRefresh(bundleutil.MinimumRefreshHint) // td2
 	test.WaitForBundleRefresh(bundleutil.MinimumRefreshHint) // td3
 
@@ -193,7 +198,7 @@ func TestManagerConfigPeriodicRefresh(t *testing.T) {
 	}, test.GetTrustDomainConfigs())
 	assert.Equal(t, 1, test.UpdateCount(td1))
 	assert.Equal(t, 2, test.UpdateCount(td2))
-	assert.Equal(t, 1, test.UpdateCount(td3))
+	assert.Equal(t, 2, test.UpdateCount(td3))
 }
 
 func TestManagerConfigManualRefresh(t *testing.T) {
@@ -278,7 +283,7 @@ func newManagerTest(t *testing.T, source TrustDomainConfigSource, localBundles, 
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				errCh <- errs.New("%+v", r)
+				errCh <- fmt.Errorf("%+v", r)
 			}
 		}()
 		errCh <- test.manager.Run(ctx)

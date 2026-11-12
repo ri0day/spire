@@ -3,6 +3,7 @@ package spireplugin
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -17,8 +18,11 @@ import (
 	"github.com/spiffe/spire/pkg/common/catalog"
 	"github.com/spiffe/spire/pkg/common/coretypes/bundle"
 	"github.com/spiffe/spire/pkg/common/coretypes/jwtkey"
+	"github.com/spiffe/spire/pkg/common/coretypes/witkey"
 	"github.com/spiffe/spire/pkg/common/coretypes/x509certificate"
 	"github.com/spiffe/spire/pkg/common/idutil"
+	"github.com/spiffe/spire/pkg/common/pluginconf"
+	"github.com/spiffe/spire/pkg/common/tlspolicy"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -30,8 +34,6 @@ const (
 	internalPollFreq = time.Second
 )
 
-var clk clock.Clock = clock.New()
-
 type Configuration struct {
 	ServerAddr        string             `hcl:"server_address" json:"server_address"`
 	ServerPort        string             `hcl:"server_port" json:"server_port"`
@@ -39,8 +41,26 @@ type Configuration struct {
 	Experimental      experimentalConfig `hcl:"experimental"`
 }
 
+func buildConfig(coreConfig catalog.CoreConfig, hclText string, status *pluginconf.Status) *Configuration {
+	newConfig := new(Configuration)
+	if err := hcl.Decode(newConfig, hclText); err != nil {
+		status.ReportError("plugin configuration is malformed")
+		return nil
+	}
+
+	if newConfig.ServerAddr == "" {
+		status.ReportError("server_address is required")
+	}
+	if newConfig.ServerPort == "" {
+		status.ReportError("server_port is required")
+	}
+	validateWorkloadAPIConfig(newConfig, status)
+	return newConfig
+}
+
 type experimentalConfig struct {
 	WorkloadAPINamedPipeName string `hcl:"workload_api_named_pipe_name" json:"workload_api_named_pipe_name"`
+	RequirePQKEM             bool   `hcl:"require_pq_kem" json:"require_pq_kem"`
 }
 
 func BuiltIn() catalog.BuiltIn {
@@ -58,6 +78,7 @@ type Plugin struct {
 	upstreamauthorityv1.UnsafeUpstreamAuthorityServer
 	configv1.UnsafeConfigServer
 
+	clk clock.Clock
 	log hclog.Logger
 
 	mtx         sync.RWMutex
@@ -69,47 +90,38 @@ type Plugin struct {
 
 	pollMtx                sync.Mutex
 	stopPolling            context.CancelFunc
+	pollDone               <-chan struct{}
 	currentPollSubscribers uint64
 
 	bundleMtx     sync.RWMutex
 	bundleVersion uint64
 	currentBundle *plugintypes.Bundle
+	// bundleUpdated is closed and replaced each time the bundle changes,
+	// allowing subscribers to be notified immediately rather than waiting for
+	// the internalPollFreq ticker.
+	bundleUpdated chan struct{}
 }
 
 func New() *Plugin {
 	return &Plugin{
+		clk:           clock.New(),
 		currentBundle: &plugintypes.Bundle{},
+		bundleUpdated: make(chan struct{}),
 	}
 }
 
 func (p *Plugin) Configure(_ context.Context, req *configv1.ConfigureRequest) (*configv1.ConfigureResponse, error) {
-	// Parse HCL config payload into config struct
-	config := new(Configuration)
-
-	if err := hcl.Decode(config, req.HclConfiguration); err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "unable to decode configuration: %v", err)
-	}
-
-	if req.CoreConfiguration == nil {
-		return nil, status.Error(codes.InvalidArgument, "core configuration is required")
-	}
-
-	if req.CoreConfiguration.TrustDomain == "" {
-		return nil, status.Error(codes.InvalidArgument, "trust_domain is required")
+	newConfig, _, err := pluginconf.Build(req, buildConfig)
+	if err != nil {
+		return nil, err
 	}
 
 	p.mtx.Lock()
 	defer p.mtx.Unlock()
 
-	// Create trust domain
-	td, err := spiffeid.TrustDomainFromString(req.CoreConfiguration.TrustDomain)
-	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "trust_domain is malformed: %v", err)
-	}
-	p.trustDomain = td
-
-	// Set config
-	p.config = config
+	// Swap Running Config
+	p.trustDomain, _ = spiffeid.TrustDomainFromString(req.CoreConfiguration.TrustDomain)
+	p.config = newConfig
 
 	// Create spire-server client
 	serverAddr := fmt.Sprintf("%s:%s", p.config.ServerAddr, p.config.ServerPort)
@@ -118,14 +130,29 @@ func (p *Plugin) Configure(_ context.Context, req *configv1.ConfigureRequest) (*
 		return nil, status.Errorf(codes.InvalidArgument, "unable to set Workload API address: %v", err)
 	}
 
-	serverID, err := idutil.ServerID(td)
+	serverID, err := idutil.ServerID(p.trustDomain)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "unable to build server ID: %v", err)
 	}
 
-	p.serverClient = newServerClient(serverID, serverAddr, workloadAPIAddr, p.log)
+	tlsPolicy := tlspolicy.Policy{
+		RequirePQKEM: p.config.Experimental.RequirePQKEM,
+	}
+
+	tlspolicy.LogPolicy(tlsPolicy, p.log)
+
+	p.serverClient = newServerClient(serverID, serverAddr, workloadAPIAddr, p.log, tlsPolicy)
 
 	return &configv1.ConfigureResponse{}, nil
+}
+
+func (p *Plugin) Validate(_ context.Context, req *configv1.ValidateRequest) (*configv1.ValidateResponse, error) {
+	_, notes, err := pluginconf.Build(req, buildConfig)
+
+	return &configv1.ValidateResponse{
+		Valid: err == nil,
+		Notes: notes,
+	}, nil
 }
 
 func (p *Plugin) SetLogger(log hclog.Logger) {
@@ -139,52 +166,117 @@ func (p *Plugin) MintX509CAAndSubscribe(request *upstreamauthorityv1.MintX509CAR
 	}
 	defer p.unsubscribeToPolling()
 
-	certChain, roots, err := p.serverClient.newDownstreamX509CA(stream.Context(), request.Csr)
+	// TODO: downstream RPC is not returning authority metadata, like tainted bit
+	// avoid using it for now in favor of a call to get bundle RPC
+	certChain, _, err := p.serverClient.newDownstreamX509CA(stream.Context(), request.Csr, request.PreferredTtl)
 	if err != nil {
 		return status.Errorf(codes.Internal, "unable to request a new Downstream X509CA: %v", err)
 	}
 
-	var bundles []*plugintypes.X509Certificate
-	for _, cert := range roots {
-		pluginCert, err := x509certificate.ToPluginProto(cert)
-		if err != nil {
-			return status.Errorf(codes.Internal, "failed to parse X.509 authorities: %v", err)
-		}
+	serverBundle, err := p.serverClient.getBundle(stream.Context())
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to fetch bundle from upstream server: %v", err)
+	}
 
-		bundles = append(bundles, pluginCert)
+	bundles, err := x509certificate.ToPluginFromAPIProtos(serverBundle.X509Authorities)
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to parse X.509 authorities: %v", err)
 	}
 
 	// Set X509 Authorities
 	p.setBundleX509Authorities(bundles)
 
-	rootCAs := []*plugintypes.X509Certificate{}
-
-	x509CAChain, err := x509certificate.ToPluginProtos(certChain)
+	x509CAChain, err := x509certificate.ToPluginFromCertificates(certChain)
 	if err != nil {
 		return status.Errorf(codes.Internal, "unable to form response X.509 CA chain: %v", err)
 	}
 
-	ticker := clk.Ticker(internalPollFreq)
+	err = stream.Send(&upstreamauthorityv1.MintX509CAResponse{
+		X509CaChain:       x509CAChain,
+		UpstreamX509Roots: bundles,
+	})
+	if err != nil {
+		p.log.Error("Cannot send X.509 CA chain and roots", "error", err)
+		return err
+	}
+
+	return nil
+}
+
+func (p *Plugin) SubscribeToLocalBundle(req *upstreamauthorityv1.SubscribeToLocalBundleRequest, stream upstreamauthorityv1.UpstreamAuthority_SubscribeToLocalBundleServer) error {
+	err := p.subscribeToPolling(stream.Context())
+	if err != nil {
+		return err
+	}
+	defer p.unsubscribeToPolling()
+
+	serverBundle, err := p.serverClient.getBundle(stream.Context())
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to fetch bundle from upstream server: %v", err)
+	}
+
+	bundles, err := x509certificate.ToPluginFromAPIProtos(serverBundle.X509Authorities)
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to parse X.509 authorities: %v", err)
+	}
+	rootCAs := bundles
+
+	var jwtKeys []*plugintypes.JWTKey
+	for _, jwtKey := range serverBundle.JwtAuthorities {
+		pluginKey, err := jwtkey.ToPluginFromAPIProto(jwtKey)
+		if err != nil {
+			return err
+		}
+		jwtKeys = append(jwtKeys, pluginKey)
+	}
+
+	witKeys, err := witkey.ToPluginFromAPIProtos(serverBundle.WitAuthorities)
+	if err != nil {
+		return err
+	}
+
+	err = stream.Send(&upstreamauthorityv1.SubscribeToLocalBundleResponse{
+		UpstreamX509Roots: rootCAs,
+		UpstreamJwtKeys:   jwtKeys,
+		UpstreamWitKeys:   witKeys,
+	})
+	if err != nil {
+		return err
+	}
+
+	p.setBundleX509Authorities(rootCAs)
+	p.setBundleJWTAuthorities(jwtKeys)
+	p.setBundleWITAuthorities(witKeys)
+
+	ticker := p.clk.Ticker(internalPollFreq)
 	defer ticker.Stop()
 	for {
-		newRootCAs := p.getBundle().X509Authorities
-		// Send response with new X509 authorities
-		if !areRootsEqual(rootCAs, newRootCAs) {
-			rootCAs = newRootCAs
-			err := stream.Send(&upstreamauthorityv1.MintX509CAResponse{
-				X509CaChain:       x509CAChain,
-				UpstreamX509Roots: rootCAs,
+		// Capture the notification channel before reading the bundle.
+		// If the bundle is updated after getBundleUpdateCh() returns but
+		// before the select below, the old channel will already be closed
+		// and the select will fire immediately rather than sleeping until
+		// the next internalPollFreq tick.
+		updateCh := p.getBundleUpdateCh()
+
+		currentBundle := p.getBundle()
+		newRootCAs := currentBundle.X509Authorities
+		newJWTKeys := currentBundle.JwtAuthorities
+		newWITKeys := currentBundle.WitAuthorities
+		if !areProtosEqual(rootCAs, newRootCAs) || !areProtosEqual(jwtKeys, newJWTKeys) || !areProtosEqual(witKeys, newWITKeys) {
+			err := stream.Send(&upstreamauthorityv1.SubscribeToLocalBundleResponse{
+				UpstreamX509Roots: newRootCAs,
+				UpstreamJwtKeys:   newJWTKeys,
+				UpstreamWitKeys:   newWITKeys,
 			})
-			if err != nil {
-				p.log.Error("Cannot send X.509 CA chain and roots", "error", err)
-				return err
-			}
-			if len(x509CAChain) > 0 {
-				x509CAChain = nil
+			if err == nil {
+				rootCAs = newRootCAs
+				jwtKeys = newJWTKeys
+				witKeys = newWITKeys
 			}
 		}
 		select {
 		case <-ticker.C:
+		case <-updateCh:
 		case <-stream.Context().Done():
 			return nil
 		}
@@ -221,34 +313,67 @@ func (p *Plugin) PublishJWTKeyAndSubscribe(req *upstreamauthorityv1.PublishJWTKe
 	// Set JWT authority
 	p.setBundleJWTAuthorities(jwtKeys)
 
-	keys := []*plugintypes.JWTKey{}
-	ticker := clk.Ticker(internalPollFreq)
-	defer ticker.Stop()
-	for {
-		newKeys := p.getBundle().JwtAuthorities
-		// Send response when new JWT authority
-		if !arePublicKeysEqual(keys, newKeys) {
-			keys = newKeys
-			err := stream.Send(&upstreamauthorityv1.PublishJWTKeyResponse{
-				UpstreamJwtKeys: keys,
-			})
-			if err != nil {
-				p.log.Error("Cannot send upstream JWT keys", "error", err)
-				return err
-			}
-		}
-		select {
-		case <-ticker.C:
-		case <-stream.Context().Done():
-			return nil
-		}
+	err = stream.Send(&upstreamauthorityv1.PublishJWTKeyResponse{
+		UpstreamJwtKeys: jwtKeys,
+	})
+	if err != nil {
+		p.log.Error("Cannot send upstream JWT keys", "error", err)
+		return err
 	}
+	return nil
+}
+
+func (p *Plugin) PublishWITKeyAndSubscribe(req *upstreamauthorityv1.PublishWITKeyRequest, stream upstreamauthorityv1.UpstreamAuthority_PublishWITKeyAndSubscribeServer) error {
+	err := p.subscribeToPolling(stream.Context())
+	if err != nil {
+		return err
+	}
+	defer p.unsubscribeToPolling()
+
+	witKey, err := witkey.ToAPIFromPluginProto(req.WitKey)
+	if err != nil {
+		return status.Errorf(codes.Internal, "unable to parse WITKey into api WITKey: %v", err)
+	}
+
+	resp, err := p.serverClient.publishWITAuthority(stream.Context(), witKey)
+	if err != nil {
+		return err
+	}
+
+	witKeys, err := witkey.ToPluginFromAPIProtos(resp)
+	if err != nil {
+		return err
+	}
+
+	p.setBundleWITAuthorities(witKeys)
+
+	err = stream.Send(&upstreamauthorityv1.PublishWITKeyResponse{
+		UpstreamWitKeys: witKeys,
+	})
+	if err != nil {
+		p.log.Error("Cannot send upstream WIT keys", "error", err)
+		return err
+	}
+	return nil
 }
 
 func (p *Plugin) pollBundleUpdates(ctx context.Context) {
-	ticker := clk.Ticker(upstreamPollFreq)
+	ticker := p.clk.Ticker(upstreamPollFreq)
 	defer ticker.Stop()
+	defer func() {
+		p.serverClient.release()
+		if ctx.Err() != nil {
+			p.log.Debug("Poll bundle updates context done", "reason", ctx.Err())
+		}
+	}()
+
 	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
 		preFetchCallVersion := p.getBundleVersion()
 		resp, err := p.serverClient.getBundle(ctx)
 		if err != nil {
@@ -263,13 +388,17 @@ func (p *Plugin) pollBundleUpdates(ctx context.Context) {
 		select {
 		case <-ticker.C:
 		case <-ctx.Done():
-			p.serverClient.release()
-			p.log.Debug("Poll bundle updates context done", "reason", ctx.Err())
 			return
 		}
 	}
 }
 
+// setBundleIfVersionMatches updates currentBundle only when bundleVersion
+// still equals expectedVersion. This prevents a fetch that started before a
+// local mutation (setBundle*Authorities) from overwriting the newer local
+// state. bundleVersion is intentionally not incremented here; it is only
+// incremented by the local-mutation helpers so that it remains a reliable
+// guard against concurrent upstream fetches.
 func (p *Plugin) setBundleIfVersionMatches(b *types.Bundle, expectedVersion uint64) error {
 	p.bundleMtx.Lock()
 	defer p.bundleMtx.Unlock()
@@ -280,6 +409,7 @@ func (p *Plugin) setBundleIfVersionMatches(b *types.Bundle, expectedVersion uint
 			return err
 		}
 		p.currentBundle = currentBundle
+		p.signalBundleUpdate()
 	}
 
 	return nil
@@ -291,11 +421,36 @@ func (p *Plugin) getBundle() *plugintypes.Bundle {
 	return p.currentBundle
 }
 
+// getBundleUpdateCh returns the current bundle update notification channel.
+// When the bundle is updated, this channel is closed and a new one is created.
+func (p *Plugin) getBundleUpdateCh() <-chan struct{} {
+	p.bundleMtx.RLock()
+	defer p.bundleMtx.RUnlock()
+	return p.bundleUpdated
+}
+
+// signalBundleUpdate closes the current bundleUpdated channel and replaces it
+// with a new one, waking any goroutines waiting on the previous channel.
+// Must be called with bundleMtx write lock held.
+func (p *Plugin) signalBundleUpdate() {
+	close(p.bundleUpdated)
+	p.bundleUpdated = make(chan struct{})
+}
+
 func (p *Plugin) setBundleJWTAuthorities(keys []*plugintypes.JWTKey) {
 	p.bundleMtx.Lock()
 	defer p.bundleMtx.Unlock()
 	p.currentBundle.JwtAuthorities = keys
 	p.bundleVersion++
+	p.signalBundleUpdate()
+}
+
+func (p *Plugin) setBundleWITAuthorities(keys []*plugintypes.WITKey) {
+	p.bundleMtx.Lock()
+	defer p.bundleMtx.Unlock()
+	p.currentBundle.WitAuthorities = keys
+	p.bundleVersion++
+	p.signalBundleUpdate()
 }
 
 func (p *Plugin) setBundleX509Authorities(rootCAs []*plugintypes.X509Certificate) {
@@ -303,6 +458,7 @@ func (p *Plugin) setBundleX509Authorities(rootCAs []*plugintypes.X509Certificate
 	defer p.bundleMtx.Unlock()
 	p.currentBundle.X509Authorities = rootCAs
 	p.bundleVersion++
+	p.signalBundleUpdate()
 }
 
 func (p *Plugin) getBundleVersion() uint64 {
@@ -328,8 +484,12 @@ func (p *Plugin) unsubscribeToPolling() {
 	defer p.pollMtx.Unlock()
 	p.currentPollSubscribers--
 	if p.currentPollSubscribers == 0 {
-		// TODO: may we release server here?
 		p.stopPolling()
+		// Wait for the polling goroutine to fully exit so its deferred
+		// release() call — which nils out bundleClient — cannot race with
+		// a future startPolling call.
+		<-p.pollDone
+		p.pollDone = nil
 	}
 }
 
@@ -341,30 +501,17 @@ func (p *Plugin) startPolling(streamCtx context.Context) error {
 		return err
 	}
 
-	go p.pollBundleUpdates(pollCtx)
+	done := make(chan struct{})
+	p.pollDone = done
+	go func() {
+		defer close(done)
+		p.pollBundleUpdates(pollCtx)
+	}()
 	return nil
 }
 
-func areRootsEqual(a, b []*plugintypes.X509Certificate) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i, root := range a {
-		if !proto.Equal(root, b[i]) {
-			return false
-		}
-	}
-	return true
-}
-
-func arePublicKeysEqual(a, b []*plugintypes.JWTKey) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i, pk := range a {
-		if !proto.Equal(pk, b[i]) {
-			return false
-		}
-	}
-	return true
+func areProtosEqual[T proto.Message](a, b []T) bool {
+	return slices.EqualFunc(a, b, func(x, y T) bool {
+		return proto.Equal(x, y)
+	})
 }

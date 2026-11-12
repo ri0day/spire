@@ -25,39 +25,32 @@ import (
 	"github.com/spiffe/spire/pkg/common/telemetry"
 	telemetry_agent "github.com/spiffe/spire/pkg/common/telemetry/agent"
 	telemetry_common "github.com/spiffe/spire/pkg/common/telemetry/common"
+	"github.com/spiffe/spire/pkg/common/tlspolicy"
 	"github.com/spiffe/spire/pkg/common/util"
 	"github.com/spiffe/spire/pkg/common/x509util"
-	"github.com/zeebo/errs"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
 )
-
-const (
-	roundRobinServiceConfig = `{ "loadBalancingConfig": [ { "round_robin": {} } ] }`
-)
-
-type AttestationResult struct {
-	SVID         []*x509.Certificate
-	Key          keymanager.Key
-	Bundle       *spiffebundle.Bundle
-	Reattestable bool
-}
 
 type Attestor interface {
 	Attest(ctx context.Context) (*AttestationResult, error)
 }
 
 type Config struct {
-	Catalog           catalog.Catalog
-	Metrics           telemetry.Metrics
-	JoinToken         string
-	TrustDomain       spiffeid.TrustDomain
-	TrustBundle       []*x509.Certificate
-	InsecureBootstrap bool
-	Storage           storage.Storage
-	Log               logrus.FieldLogger
-	ServerAddress     string
-	NodeAttestor      nodeattestor.NodeAttestor
+	Catalog              catalog.Catalog
+	Metrics              telemetry.Metrics
+	JoinToken            string
+	TrustDomain          spiffeid.TrustDomain
+	BootstrapTrustBundle []*x509.Certificate
+	InsecureBootstrap    bool
+	Storage              storage.Storage
+	Log                  logrus.FieldLogger
+	ServerAddress        string
+	NodeAttestor         nodeattestor.NodeAttestor
+	TLSPolicy            tlspolicy.Policy
+
+	// LoadBalancingConfig is an optional, opaque payload used as the
+	// loadBalancingConfig field of the gRPC service config.
+	LoadBalancingConfig string
 }
 
 type attestor struct {
@@ -99,7 +92,7 @@ func (a *attestor) Attest(ctx context.Context) (res *AttestationResult, err erro
 		// This is a bizarre case where we have an SVID but were unable to
 		// load a bundle from the cache which suggests some tampering with the
 		// cache on disk.
-		return nil, errs.New("SVID loaded but no bundle in cache")
+		return nil, errors.New("SVID loaded but no bundle in cache")
 	default:
 		log.WithField(telemetry.SPIFFEID, svid[0].URIs[0].String()).Info("SVID loaded")
 	}
@@ -156,12 +149,12 @@ func (a *attestor) loadBundle() (*spiffebundle.Bundle, error) {
 	bundle, err := a.c.Storage.LoadBundle()
 	if errors.Is(err, storage.ErrNotCached) {
 		if a.c.InsecureBootstrap {
-			if len(a.c.TrustBundle) > 0 {
+			if len(a.c.BootstrapTrustBundle) > 0 {
 				a.c.Log.Warn("Trust bundle will be ignored; performing insecure bootstrap")
 			}
 			return nil, nil
 		}
-		bundle = a.c.TrustBundle
+		bundle = a.c.BootstrapTrustBundle
 	} else if err != nil {
 		return nil, fmt.Errorf("load bundle: %w", err)
 	}
@@ -193,7 +186,7 @@ func (a *attestor) getBundle(ctx context.Context, conn *grpc.ClientConn) (*spiff
 }
 
 func (a *attestor) getSVID(ctx context.Context, conn *grpc.ClientConn, csr []byte, attestor nodeattestor.NodeAttestor) ([]*x509.Certificate, bool, error) {
-	// make sure all of the streams are cancelled if something goes awry
+	// make sure all the streams are cancelled if something goes awry
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -226,7 +219,7 @@ func (a *attestor) newSVID(ctx context.Context, key keymanager.Key, bundle *spif
 	defer counter.Done(&err)
 	telemetry_common.AddAttestorType(counter, a.c.NodeAttestor.Name())
 
-	conn, err := a.serverConn(ctx, bundle)
+	conn, err := a.serverConn(bundle)
 	if err != nil {
 		return nil, nil, false, fmt.Errorf("create attestation client: %w", err)
 	}
@@ -250,19 +243,21 @@ func (a *attestor) newSVID(ctx context.Context, key keymanager.Key, bundle *spif
 	return newSVID, newBundle, reattestable, nil
 }
 
-func (a *attestor) serverConn(ctx context.Context, bundle *spiffebundle.Bundle) (*grpc.ClientConn, error) {
+func (a *attestor) serverConn(bundle *spiffebundle.Bundle) (*grpc.ClientConn, error) {
 	if bundle != nil {
-		return client.DialServer(ctx, client.DialServerConfig{
-			Address:     a.c.ServerAddress,
-			TrustDomain: a.c.TrustDomain,
-			GetBundle:   bundle.X509Authorities,
+		return client.NewServerGRPCClient(client.ServerClientConfig{
+			Address:             a.c.ServerAddress,
+			TrustDomain:         a.c.TrustDomain,
+			GetBundle:           bundle.X509Authorities,
+			TLSPolicy:           a.c.TLSPolicy,
+			LoadBalancingConfig: a.c.LoadBalancingConfig,
 		})
 	}
 
 	if !a.c.InsecureBootstrap {
 		// We shouldn't get here since loadBundle() should fail if the bundle
 		// is empty, but just in case...
-		return nil, errs.New("no bundle and not doing insecure bootstrap")
+		return nil, errors.New("no bundle and not doing insecure bootstrap")
 	}
 
 	// Insecure bootstrapping. Do not verify the server chain but rather do a
@@ -271,12 +266,12 @@ func (a *attestor) serverConn(ctx context.Context, bundle *spiffebundle.Bundle) 
 	// reached what appears to be the right trust domain server.
 	tlsConfig := &tls.Config{
 		InsecureSkipVerify: true, //nolint: gosec // this is required in order to do non-hostname based verification
-		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error { //nolint:gosec // we don't need SessionTicketsDisabled
 			a.c.Log.Warn("Insecure bootstrap enabled; skipping server certificate verification")
 			if len(rawCerts) == 0 {
 				// This is not really possible without a catastrophic bug
 				// creeping into the TLS stack.
-				return errs.New("server chain is unexpectedly empty")
+				return errors.New("server chain is unexpectedly empty")
 			}
 
 			expectedServerID, err := idutil.ServerID(a.c.TrustDomain)
@@ -289,19 +284,13 @@ func (a *attestor) serverConn(ctx context.Context, bundle *spiffebundle.Bundle) 
 				return err
 			}
 			if len(serverCert.URIs) != 1 || serverCert.URIs[0].String() != expectedServerID.String() {
-				return errs.New("expected server SPIFFE ID %q; got %q", expectedServerID, serverCert.URIs)
+				return fmt.Errorf("expected server SPIFFE ID %q; got %q", expectedServerID, serverCert.URIs)
 			}
 			return nil
 		},
 	}
 
-	return grpc.DialContext(ctx, a.c.ServerAddress,
-		grpc.WithDefaultServiceConfig(roundRobinServiceConfig),
-		grpc.WithDisableServiceConfig(),
-		grpc.FailOnNonTempDialError(true),
-		grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)),
-		grpc.WithReturnConnectionError(),
-	)
+	return grpc.NewClient(a.c.ServerAddress, client.DialOptions(a.c.ServerAddress, a.c.LoadBalancingConfig, tlsConfig)...)
 }
 
 type ServerStream struct {

@@ -13,6 +13,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -20,6 +22,9 @@ import (
 	"github.com/sirupsen/logrus/hooks/test"
 	"github.com/spiffe/go-spiffe/v2/bundle/spiffebundle"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"github.com/spiffe/spire/pkg/common/diskcertmanager"
+	"github.com/spiffe/spire/pkg/common/pemutil"
+	"github.com/spiffe/spire/pkg/common/tlspolicy"
 	"github.com/spiffe/spire/pkg/server/endpoints/bundle/internal/acmetest"
 	"github.com/spiffe/spire/test/fakes/fakeserverkeymanager"
 	"github.com/spiffe/spire/test/spiretest"
@@ -30,6 +35,53 @@ import (
 const (
 	serverCertLifetime = time.Hour
 )
+
+func TestBundleListenerTLSPolicy(t *testing.T) {
+	serverCert, serverKey := createServerCertificate(t)
+	auth := testSPIFFEAuth(serverCert, serverKey)
+
+	policy, err := tlspolicy.NewPolicy(false, &tlspolicy.TLSConfig{
+		MinTLSVersion: "VersionTLS13",
+		CipherSuites: []string{
+			"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+		},
+		CurvePreferences: []string{
+			"X25519MLKEM768",
+			"secp256r1",
+		},
+	}, nil)
+	require.NoError(t, err)
+	tlsConfig, err := buildListenerTLSConfig(&Server{c: ServerConfig{ServerAuth: auth, TLSPolicy: policy}})
+	require.NoError(t, err)
+	require.Equal(t, uint16(tls.VersionTLS13), tlsConfig.MinVersion)
+	require.Nil(t, tlsConfig.CipherSuites)
+	require.Equal(t, []tls.CurveID{tls.X25519MLKEM768, tls.CurveP256}, tlsConfig.CurvePreferences)
+}
+
+func TestBundleListenerWithEmptyTLSPolicy(t *testing.T) {
+	serverCert, serverKey := createServerCertificate(t)
+	auth := testSPIFFEAuth(serverCert, serverKey)
+
+	policy, err := tlspolicy.NewPolicy(false, nil, nil)
+	require.NoError(t, err)
+	tlsConfig, err := buildListenerTLSConfig(&Server{c: ServerConfig{ServerAuth: auth, TLSPolicy: policy}})
+	require.NoError(t, err)
+	require.Equal(t, uint16(tls.VersionTLS12), tlsConfig.MinVersion)
+	require.Nil(t, tlsConfig.CipherSuites)
+	require.Nil(t, tlsConfig.CurvePreferences)
+}
+
+func TestBundleListenerTLSPolicyInvalid(t *testing.T) {
+	_, err := tlspolicy.NewPolicy(false, &tlspolicy.TLSConfig{MinTLSVersion: "VersionTLS99"}, nil)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "invalid minTLSVersion")
+}
+
+func TestServerTLSPolicyAppliedAtStartup(t *testing.T) {
+	_, err := tlspolicy.NewPolicy(false, &tlspolicy.TLSConfig{MinTLSVersion: "VersionTLS99"}, nil)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "invalid minTLSVersion")
+}
 
 func TestServer(t *testing.T) {
 	serverCert, serverKey := createServerCertificate(t)
@@ -142,7 +194,6 @@ func TestServer(t *testing.T) {
 	}
 
 	for _, testCase := range testCases {
-		testCase := testCase
 		t.Run(testCase.name, func(t *testing.T) {
 			addr, done := newTestServer(t,
 				testGetter(testCase.bundle),
@@ -167,6 +218,9 @@ func TestServer(t *testing.T) {
 			require.NoError(t, err)
 
 			require.Equal(t, testCase.status, resp.StatusCode)
+			if testCase.status == http.StatusMethodNotAllowed {
+				require.Equal(t, http.MethodGet, resp.Header.Get("Allow"))
+			}
 			if testCase.status == http.StatusOK {
 				// we expect a JSON payload for 200
 				require.JSONEq(t, testCase.body, string(actual))
@@ -177,6 +231,60 @@ func TestServer(t *testing.T) {
 	}
 }
 
+func TestDiskCertManagerAuth(t *testing.T) {
+	dir := spiretest.TempDir(t)
+	serverCert, serverKey := createServerCertificate(t)
+
+	serverCertPem := pemutil.EncodeCertificate(serverCert)
+	err := os.WriteFile(filepath.Join(dir, "server.crt"), serverCertPem, 0o600)
+	require.NoError(t, err)
+
+	serverKeyPem, err := pemutil.EncodePKCS8PrivateKey(serverKey)
+	require.NoError(t, err)
+	err = os.WriteFile(filepath.Join(dir, "server.key"), serverKeyPem, 0o600)
+	require.NoError(t, err)
+
+	trustDomain := spiffeid.RequireTrustDomainFromString("domain.test")
+	bundle := spiffebundle.New(trustDomain)
+
+	rootCAs := x509.NewCertPool()
+	rootCAs.AddCert(serverCert)
+
+	client := http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				RootCAs:    rootCAs,
+				ServerName: "domain.test",
+				MinVersion: tls.VersionTLS12,
+			},
+		},
+	}
+
+	diskCertManager, err := diskcertmanager.New(
+		&diskcertmanager.Config{
+			CertFilePath:     filepath.Join(dir, "server.crt"),
+			KeyFilePath:      filepath.Join(dir, "server.key"),
+			FileSyncInterval: time.Minute,
+		},
+		nil,
+		nil,
+	)
+	require.NoError(t, err)
+
+	addr, done := newTestServer(t,
+		testGetter(bundle),
+		diskCertManager,
+		time.Minute,
+	)
+	defer done()
+
+	req, err := http.NewRequest("GET", fmt.Sprintf("https://%s", addr), nil)
+	require.NoError(t, err)
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+}
+
 func TestACMEAuth(t *testing.T) {
 	dir := spiretest.TempDir(t)
 
@@ -184,26 +292,26 @@ func TestACMEAuth(t *testing.T) {
 	bundle := spiffebundle.New(trustDomain)
 	km := fakeserverkeymanager.New(t)
 
-	ca := acmetest.NewCAServer([]string{"tls-alpn-01"}, []string{"domain.test"})
-
-	client := http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				RootCAs:    ca.Roots,
-				ServerName: "domain.test",
-				MinVersion: tls.VersionTLS12,
-			},
-		},
-	}
-
 	// Perform the initial challenge to obtain a new certificate but without
 	// the TOS being accepted. This should fail. We require the ToSAccepted
 	// configurable to be set in order to function.
 	t.Run("new-account-tos-not-accepted", func(t *testing.T) {
+		ca := acmetest.NewCAServer(t).Start()
+
+		client := http.Client{
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{
+					RootCAs:    ca.Roots(),
+					ServerName: "domain.test",
+					MinVersion: tls.VersionTLS12,
+				},
+			},
+		}
+
 		log, hook := test.NewNullLogger()
 		addr, done := newTestServer(t, testGetter(bundle),
 			ACMEAuth(log, km, ACMEConfig{
-				DirectoryURL: ca.URL,
+				DirectoryURL: ca.URL(),
 				DomainName:   "domain.test",
 				CacheDir:     dir,
 				Email:        "admin@domain.test",
@@ -224,8 +332,8 @@ func TestACMEAuth(t *testing.T) {
 			assert.Equal(t, "ACME Terms of Service have not been accepted. See the `tos_accepted` configurable", entry.Message)
 			assert.Equal(t, logrus.WarnLevel, entry.Level)
 			assert.Equal(t, logrus.Fields{
-				"directory_url": ca.URL,
-				"tos_url":       ca.URL + "/tos",
+				"directory_url": ca.URL(),
+				"tos_url":       ca.URL() + "/tos",
 				"email":         "admin@domain.test",
 			}, entry.Data)
 		}
@@ -233,10 +341,22 @@ func TestACMEAuth(t *testing.T) {
 
 	// Perform the initial challenge to obtain a new certificate.
 	t.Run("initial", func(t *testing.T) {
+		ca := acmetest.NewCAServer(t).Start()
+
+		client := http.Client{
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{
+					RootCAs:    ca.Roots(),
+					ServerName: "domain.test",
+					MinVersion: tls.VersionTLS12,
+				},
+			},
+		}
+
 		log, hook := test.NewNullLogger()
 		addr, done := newTestServer(t, testGetter(bundle),
 			ACMEAuth(log, km, ACMEConfig{
-				DirectoryURL: ca.URL,
+				DirectoryURL: ca.URL(),
 				DomainName:   "domain.test",
 				CacheDir:     dir,
 				Email:        "admin@domain.test",
@@ -271,33 +391,19 @@ func TestACMEAuth(t *testing.T) {
 			assert.Equal(t, "ACME Terms of Service accepted", entry.Message)
 			assert.Equal(t, logrus.InfoLevel, entry.Level)
 			assert.Equal(t, logrus.Fields{
-				"directory_url": ca.URL,
-				"tos_url":       ca.URL + "/tos",
+				"directory_url": ca.URL(),
+				"tos_url":       ca.URL() + "/tos",
 				"email":         "admin@domain.test",
 			}, entry.Data)
 		}
-	})
 
-	// Now test that the cached credentials are used. This test resolves the
-	// domain to bogus address so that the challenge would fail if it were tried
-	// as a way of telling that the challenge was not attempted
-	t.Run("cached", func(t *testing.T) {
-		log, _ := test.NewNullLogger()
-		addr, done := newTestServer(t, testGetter(bundle),
-			ACMEAuth(log, km, ACMEConfig{
-				DirectoryURL: ca.URL,
-				DomainName:   "domain.test",
-				CacheDir:     dir,
-				Email:        "admin@domain.test",
-				ToSAccepted:  true,
-			}),
-			5*time.Minute,
-		)
-		defer done()
+		// Now test that the cached credentials are used. This test resolves the
+		// domain to bogus address so that the challenge would fail if it were tried
+		// as a way of telling that the challenge was not attempted
 
 		ca.Resolve("domain.test", "127.0.0.1:0")
 
-		resp, err := client.Get(fmt.Sprintf("https://%s", addr))
+		resp, err = client.Get(fmt.Sprintf("https://%s", addr))
 		require.NoError(t, err)
 		resp.Body.Close()
 	})
@@ -368,10 +474,10 @@ func createServerCertificate(t *testing.T) (*x509.Certificate, crypto.Signer) {
 	now := time.Now()
 	return spiretest.SelfSignCertificate(t, &x509.Certificate{
 		SerialNumber: big.NewInt(0),
-		DNSNames:     []string{"localhost"},
+		DNSNames:     []string{"localhost", "domain.test"},
 		IPAddresses:  []net.IP{net.IPv4(127, 0, 0, 1)},
 		NotBefore:    now,
 		NotAfter:     now.Add(serverCertLifetime),
-		URIs:         []*url.URL{{Scheme: "domain.test", Host: "domain.test", Path: "/spire/server"}},
+		URIs:         []*url.URL{{Scheme: "https", Host: "domain.test", Path: "/spire/server"}},
 	})
 }

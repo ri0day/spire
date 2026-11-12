@@ -55,6 +55,13 @@ func (rs *RotationStrategy) JWTSVIDExpiresSoon(svid *client.JWTSVID, now time.Ti
 	return shouldRotateJWT(now, svid.IssuedAt, svid.ExpiresAt)
 }
 
+// WITSVIDExpiresSoon determines if a WIT-SVID with the given lifetime should be
+// rotated, based on the presented current time. Also returns true if the
+// WIT-SVID is already expired.
+func WITSVIDExpiresSoon(issuedAt, expiresAt, now time.Time) bool {
+	return shouldRotateJWT(now, issuedAt, expiresAt)
+}
+
 // JWTSVIDExpired returns true if the given SVID is expired.
 func JWTSVIDExpired(svid *client.JWTSVID, now time.Time) bool {
 	return !now.Before(svid.ExpiresAt)
@@ -102,8 +109,8 @@ func halfLife(lifetime time.Duration) time.Duration {
 func calculateJitteredHalfLife(lifetime time.Duration) time.Duration {
 	halfLife := halfLife(lifetime)
 	delta := jitterHalfLifeDelta(halfLife)
-	min := halfLife - delta
-	return time.Duration(rand.Int63n(int64(delta)*2) + int64(min)) //nolint // gosec: no need for cryptographic randomness here
+	minHalfLife := halfLife - delta
+	return time.Duration(rand.Int63n(int64(delta)*2) + int64(minHalfLife)) //nolint // gosec: no need for cryptographic randomness here
 }
 
 // calculateJitteredAvailabilityTarget calculates jitter of the availability target.

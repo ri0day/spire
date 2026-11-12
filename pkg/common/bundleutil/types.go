@@ -1,12 +1,13 @@
 package bundleutil
 
 import (
-	"github.com/go-jose/go-jose/v3"
+	"github.com/go-jose/go-jose/v4"
 )
 
 const (
 	x509SVIDUse = "x509-svid"
 	jwtSVIDUse  = "jwt-svid"
+	witSVIDUse  = "wit-svid"
 )
 
 type bundleDoc struct {

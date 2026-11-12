@@ -6,8 +6,22 @@ import (
 	"github.com/spiffe/spire/proto/spire/common"
 )
 
+type Selectors []*common.Selector
+
 func sortEntriesByID(entries []*common.RegistrationEntry) {
 	sort.Slice(entries, func(a, b int) bool {
 		return entries[a].EntryId < entries[b].EntryId
+	})
+}
+
+// identity is implemented by the per-SVID-type identities held in a workload
+// update.
+type identity interface {
+	GetEntry() *common.RegistrationEntry
+}
+
+func sortIdentities[T identity](identities []T) {
+	sort.Slice(identities, func(a, b int) bool {
+		return identities[a].GetEntry().EntryId < identities[b].GetEntry().EntryId
 	})
 }

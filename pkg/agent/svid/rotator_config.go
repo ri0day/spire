@@ -7,29 +7,29 @@ import (
 	"time"
 
 	"github.com/andres-erbsen/clock"
-	"github.com/imkira/go-observer"
 	"github.com/sirupsen/logrus"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/spire/pkg/agent/client"
-	"github.com/spiffe/spire/pkg/agent/common/backoff"
 	"github.com/spiffe/spire/pkg/agent/manager/cache"
 	"github.com/spiffe/spire/pkg/agent/plugin/keymanager"
 	"github.com/spiffe/spire/pkg/agent/plugin/nodeattestor"
+	"github.com/spiffe/spire/pkg/common/backoff"
+	"github.com/spiffe/spire/pkg/common/observer"
 	"github.com/spiffe/spire/pkg/common/rotationutil"
 	"github.com/spiffe/spire/pkg/common/telemetry"
+	"github.com/spiffe/spire/pkg/common/tlspolicy"
 )
 
 const DefaultRotatorInterval = 5 * time.Second
 
 type RotatorConfig struct {
-	SVIDKeyManager         keymanager.SVIDKeyManager
-	Log                    logrus.FieldLogger
-	Metrics                telemetry.Metrics
-	TrustDomain            spiffeid.TrustDomain
-	ServerAddr             string
-	NodeAttestor           nodeattestor.NodeAttestor
-	Reattestable           bool
-	DisableReattestToRenew bool
+	SVIDKeyManager keymanager.SVIDKeyManager
+	Log            logrus.FieldLogger
+	Metrics        telemetry.Metrics
+	TrustDomain    spiffeid.TrustDomain
+	ServerAddr     string
+	NodeAttestor   nodeattestor.NodeAttestor
+	Reattestable   bool
 
 	// Initial SVID and key
 	SVID    []*x509.Certificate
@@ -44,6 +44,13 @@ type RotatorConfig struct {
 	Clk clock.Clock
 
 	RotationStrategy *rotationutil.RotationStrategy
+
+	// TLSPolicy determines the post-quantum-safe policy for TLS connections.
+	TLSPolicy tlspolicy.Policy
+
+	// LoadBalancingConfig is an optional, opaque payload used as the
+	// loadBalancingConfig field of the gRPC service config.
+	LoadBalancingConfig string
 }
 
 func NewRotator(c *RotatorConfig) (Rotator, client.Client) {
@@ -86,6 +93,8 @@ func newRotator(c *RotatorConfig) (*rotator, client.Client) {
 			}
 			return s.SVID, s.Key, rootCAs
 		},
+		TLSPolicy:           c.TLSPolicy,
+		LoadBalancingConfig: c.LoadBalancingConfig,
 	}
 	client := client.New(cfg)
 

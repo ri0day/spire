@@ -4,17 +4,23 @@ import (
 	"context"
 	"crypto"
 	"crypto/x509"
+	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/sirupsen/logrus"
+	"github.com/spiffe/go-spiffe/v2/bundle/spiffebundle"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/spire/pkg/agent/client"
 	"github.com/spiffe/spire/pkg/agent/manager/cache"
 	"github.com/spiffe/spire/pkg/agent/workloadkey"
 	"github.com/spiffe/spire/pkg/common/bundleutil"
+	"github.com/spiffe/spire/pkg/common/rotationutil"
 	"github.com/spiffe/spire/pkg/common/telemetry"
 	telemetry_agent "github.com/spiffe/spire/pkg/common/telemetry/agent"
 	"github.com/spiffe/spire/pkg/common/util"
+	"github.com/spiffe/spire/pkg/common/x509util"
 	"github.com/spiffe/spire/proto/spire/common"
 )
 
@@ -24,39 +30,109 @@ type csrRequest struct {
 	CurrentSVIDExpiresAt time.Time
 }
 
-type SVIDCache interface {
+// taintedAuthorities carries the tainted authority key IDs reported by the
+// server. They drive SVID rotation but are not part of the cache's entry
+// state, so they are kept out of cache.UpdateEntries.
+type taintedAuthorities struct {
+	X509 []string
+	JWT  map[string]struct{}
+}
+
+// Implemented by both the LRU cache and the store cache as the common
+// interface for updating cached X509-SVIDs.
+type x509SVIDCache interface {
 	// UpdateEntries updates entries on cache
 	UpdateEntries(update *cache.UpdateEntries, checkSVID func(*common.RegistrationEntry, *common.RegistrationEntry, *cache.X509SVID) bool)
 
-	// UpdateSVIDs updates SVIDs on provided records
-	UpdateSVIDs(update *cache.UpdateSVIDs)
+	// UpdateX509SVIDs updates SVIDs on provided records
+	UpdateX509SVIDs(update map[string]*cache.X509SVID)
 
 	// GetStaleEntries gets a list of records that need update SVIDs
 	GetStaleEntries() []*cache.StaleEntry
 }
 
-func (m *manager) syncSVIDs(ctx context.Context) (err error) {
-	// perform syncSVIDs only if using LRU cache
-	if m.c.SVIDCacheMaxSize > 0 {
-		m.cache.SyncSVIDsWithSubscribers()
-		return m.updateSVIDs(ctx, m.c.Log.WithField(telemetry.CacheType, "workload"), m.cache)
+func (m *manager) syncX509SVIDs(ctx context.Context) error {
+	m.x509Cache.SyncSVIDsWithSubscribers()
+	return m.updateX509SVIDs(ctx, m.c.Log.WithField(telemetry.CacheType, telemetry_agent.CacheTypeWorkload), m.x509Cache)
+}
+
+func (m *manager) syncWITSVIDs(ctx context.Context) error {
+	if m.witCache == nil {
+		return ErrWITSVIDsDisabled
 	}
+	m.witCache.SyncSVIDsWithSubscribers()
+	return m.updateWITSVIDs(ctx, m.c.Log.WithField(telemetry.CacheType, telemetry_agent.CacheTypeWorkload).WithField(telemetry.SVIDType, telemetry_agent.SVIDTypeWIT))
+}
+
+// processTaintedAuthorities verifies if a new authority is tainted and forces rotation in all caches if required.
+func (m *manager) processTaintedAuthorities(ctx context.Context, bundle *spiffebundle.Bundle, tainted *taintedAuthorities) error {
+	newTaintedX509Authorities := getNewItemsFromSlice(m.processedTaintedX509Authorities, tainted.X509)
+	if len(newTaintedX509Authorities) > 0 {
+		m.c.Log.WithField(telemetry.SubjectKeyIDs, strings.Join(newTaintedX509Authorities, ",")).
+			Debug("New tainted X.509 authorities found")
+
+		taintedX509Authorities, err := bundleutil.FindX509Authorities(bundle, newTaintedX509Authorities)
+		if err != nil {
+			return fmt.Errorf("failed to search X.509 authorities: %w", err)
+		}
+
+		// Taint all regular X.509 SVIDs
+		m.x509Cache.TaintX509SVIDs(ctx, taintedX509Authorities)
+
+		// Taint all SVIDStore SVIDs
+		m.svidStoreCache.TaintX509SVIDs(ctx, taintedX509Authorities)
+
+		// Notify rotator about new tainted authorities
+		if err := m.svid.NotifyTaintedAuthorities(taintedX509Authorities); err != nil {
+			return err
+		}
+
+		for _, subjectKeyID := range newTaintedX509Authorities {
+			m.processedTaintedX509Authorities[subjectKeyID] = struct{}{}
+		}
+	}
+
+	newTaintedJWTAuthorities := getNewItemsFromMap(m.processedTaintedJWTAuthorities, tainted.JWT)
+	if len(newTaintedJWTAuthorities) > 0 {
+		m.c.Log.WithField(telemetry.JWTAuthorityKeyIDs, strings.Join(newTaintedJWTAuthorities, ",")).
+			Debug("New tainted JWT authorities found")
+
+		// Taint JWT-SVIDs in the cache
+		m.jwtCache.TaintJWTSVIDs(ctx, tainted.JWT)
+
+		for _, subjectKeyID := range newTaintedJWTAuthorities {
+			m.processedTaintedJWTAuthorities[subjectKeyID] = struct{}{}
+		}
+	}
+
 	return nil
 }
 
 // synchronize fetches the authorized entries from the server, updates the
-// cache, and fetches missing/expiring SVIDs.
+// caches, and fetches missing/expiring X509-SVIDs.
 func (m *manager) synchronize(ctx context.Context) (err error) {
-	cacheUpdate, storeUpdate, err := m.fetchEntries(ctx)
+	cacheUpdate, storeUpdate, tainted, err := m.fetchEntries(ctx)
 	if err != nil {
 		return err
 	}
 
-	if err := m.updateCache(ctx, cacheUpdate, m.c.Log.WithField(telemetry.CacheType, "workload"), "", m.cache); err != nil {
-		return err
+	// Update the shared bundle cache as soon as the latest bundles are
+	// available. This keeps bundle consumers (rotator, broker, bundle
+	// observer) in sync even if a later step (e.g. SVID fetching) fails, and
+	// avoids a stale bundle view relative to the workload cache, which is
+	// updated by updateX509SVIDCache below.
+	m.bundleCache.Update(cacheUpdate.Bundles)
+
+	// Process all tainted authorities. The bundle is shared between both caches using regular cache data.
+	var errs []error
+	errs = append(errs, m.processTaintedAuthorities(ctx, cacheUpdate.Bundles[m.c.TrustDomain], tainted))
+	errs = append(errs, m.updateX509SVIDCache(ctx, cacheUpdate, m.c.Log.WithField(telemetry.CacheType, telemetry_agent.CacheTypeWorkload), "", m.x509Cache))
+	errs = append(errs, m.updateX509SVIDCache(ctx, storeUpdate, m.c.Log.WithField(telemetry.CacheType, telemetry_agent.CacheTypeSVIDStore), telemetry_agent.CacheTypeSVIDStore, m.svidStoreCache))
+	if m.witCache != nil {
+		m.updateWITSVIDCacheEntries(cacheUpdate, m.c.Log.WithField(telemetry.CacheType, telemetry_agent.CacheTypeWorkload).WithField(telemetry.SVIDType, telemetry_agent.SVIDTypeWIT))
 	}
 
-	if err := m.updateCache(ctx, storeUpdate, m.c.Log.WithField(telemetry.CacheType, "svid_store"), "svid_store", m.svidStoreCache); err != nil {
+	if err := errors.Join(errs...); err != nil {
 		return err
 	}
 
@@ -65,13 +141,16 @@ func (m *manager) synchronize(ctx context.Context) (err error) {
 	return nil
 }
 
-func (m *manager) updateCache(ctx context.Context, update *cache.UpdateEntries, log logrus.FieldLogger, cacheType string, c SVIDCache) error {
+func (m *manager) updateX509SVIDCache(ctx context.Context, update *cache.UpdateEntries, log logrus.FieldLogger, cacheType string, c x509SVIDCache) error {
 	// update the cache and build a list of CSRs that need to be processed
 	// in this interval.
 	//
 	// the values in `update` now belong to the cache. DO NOT MODIFY.
 	var expiring int
 	var outdated int
+	// Serialize with in-flight signings so an SVID minted for a previous
+	// entry revision cannot be stored after the entry is updated.
+	m.updateSVIDMu.Lock()
 	c.UpdateEntries(update, func(existingEntry, newEntry *common.RegistrationEntry, svid *cache.X509SVID) bool {
 		switch {
 		case svid == nil:
@@ -94,21 +173,22 @@ func (m *manager) updateCache(ctx context.Context, update *cache.UpdateEntries, 
 
 		return true
 	})
+	m.updateSVIDMu.Unlock()
 
 	// TODO: this values are not real, we may remove
 	if expiring > 0 {
-		telemetry_agent.AddCacheManagerExpiredSVIDsSample(m.c.Metrics, cacheType, float32(expiring))
+		telemetry_agent.AddCacheManagerExpiredSVIDsSample(m.c.Metrics, cacheType, telemetry_agent.SVIDTypeX509, float32(expiring))
 		log.WithField(telemetry.ExpiringSVIDs, expiring).Debug("Updating expiring SVIDs in cache")
 	}
 	if outdated > 0 {
-		telemetry_agent.AddCacheManagerOutdatedSVIDsSample(m.c.Metrics, cacheType, float32(outdated))
+		telemetry_agent.AddCacheManagerOutdatedSVIDsSample(m.c.Metrics, cacheType, telemetry_agent.SVIDTypeX509, float32(outdated))
 		log.WithField(telemetry.OutdatedSVIDs, outdated).Debug("Updating SVIDs with outdated attributes in cache")
 	}
 
-	return m.updateSVIDs(ctx, log, c)
+	return m.updateX509SVIDs(ctx, log, c)
 }
 
-func (m *manager) updateSVIDs(ctx context.Context, log logrus.FieldLogger, c SVIDCache) error {
+func (m *manager) updateX509SVIDs(ctx context.Context, log logrus.FieldLogger, c x509SVIDCache) error {
 	m.updateSVIDMu.Lock()
 	defer m.updateSVIDMu.Unlock()
 
@@ -134,17 +214,128 @@ func (m *manager) updateSVIDs(ctx context.Context, log logrus.FieldLogger, c SVI
 			})
 		}
 
-		update, err := m.fetchSVIDs(ctx, csrs)
+		svids, err := m.fetchX509SVIDs(ctx, csrs)
 		if err != nil {
 			return err
 		}
 		// the values in `update` now belong to the cache. DO NOT MODIFY.
-		c.UpdateSVIDs(update)
+		c.UpdateX509SVIDs(svids)
 	}
 	return nil
 }
 
-func (m *manager) fetchSVIDs(ctx context.Context, csrs []csrRequest) (_ *cache.UpdateSVIDs, err error) {
+func (m *manager) updateWITSVIDCacheEntries(update *cache.UpdateEntries, log logrus.FieldLogger) {
+	// the values in `update` now belong to the cache. DO NOT MODIFY.
+	var expiring int
+	// See updateX509SVIDCache.
+	m.updateSVIDMu.Lock()
+	m.witCache.UpdateEntries(update, func(_, newEntry *common.RegistrationEntry, svid *cache.WITSVID) bool {
+		switch {
+		case svid == nil:
+			// no SVID
+		case rotationutil.WITSVIDExpiresSoon(svid.IssuedAt, svid.ExpiresOn, m.c.Clk.Now()):
+			expiring++
+		default:
+			// SVID is good
+			return false
+		}
+
+		return true
+	})
+	m.updateSVIDMu.Unlock()
+
+	if expiring > 0 {
+		telemetry_agent.AddCacheManagerExpiredSVIDsSample(m.c.Metrics, telemetry_agent.CacheTypeWorkload, telemetry_agent.SVIDTypeWIT, float32(expiring))
+		log.WithField(telemetry.ExpiringSVIDs, expiring).Debug("Updating expiring SVIDs in cache")
+	}
+}
+
+func (m *manager) updateWITSVIDs(ctx context.Context, log logrus.FieldLogger) error {
+	m.updateSVIDMu.Lock()
+	defer m.updateSVIDMu.Unlock()
+
+	staleEntries := m.witCache.GetStaleEntries()
+	if len(staleEntries) == 0 {
+		return nil
+	}
+
+	sizeLimit := m.witSizeLimitedBackoff.NextBackOff()
+	log.WithFields(logrus.Fields{
+		telemetry.Count: len(staleEntries),
+		telemetry.Limit: sizeLimit,
+	}).Debug("Renewing stale entries")
+
+	if len(staleEntries) > sizeLimit {
+		staleEntries = staleEntries[:sizeLimit]
+	}
+
+	svids, err := m.fetchWITSVIDs(ctx, staleEntries)
+	if err != nil {
+		return err
+	}
+	// the values in `svids` now belong to the cache. DO NOT MODIFY.
+	m.witCache.UpdateWITSVIDs(svids)
+	return nil
+}
+
+func (m *manager) fetchWITSVIDs(ctx context.Context, staleEntries []*cache.StaleEntry) (_ map[string]*cache.WITSVID, err error) {
+	counter := telemetry_agent.StartManagerFetchSVIDsUpdatesCall(m.c.Metrics)
+	defer counter.Done(&err)
+
+	signingAlgorithm, err := m.c.WorkloadKeyType.SigningAlgorithm()
+	if err != nil {
+		return nil, err
+	}
+
+	privateKeys := make(map[string]crypto.Signer, len(staleEntries))
+	publicKeys := make(map[string]crypto.PublicKey, len(staleEntries))
+	for _, staleEntry := range staleEntries {
+		entry := staleEntry.Entry
+		log := m.c.Log.WithFields(logrus.Fields{
+			telemetry.SPIFFEID:       entry.SpiffeId,
+			telemetry.RegistrationID: entry.EntryId,
+		})
+		if staleEntry.SVIDExpiresAt.IsZero() {
+			log.Info("Creating WIT-SVID")
+		} else {
+			log.WithField(telemetry.ExpiresAt, staleEntry.SVIDExpiresAt.Format(time.RFC3339)).Info("Renewing WIT-SVID")
+		}
+
+		privateKey, err := m.c.WorkloadKeyType.GenerateSigner()
+		if err != nil {
+			return nil, err
+		}
+		privateKeys[entry.EntryId] = privateKey
+		publicKeys[entry.EntryId] = privateKey.Public()
+	}
+
+	svidsOut, err := m.client.NewWITSVIDs(ctx, publicKeys, signingAlgorithm)
+	if err != nil {
+		// Reduce the batch size for the next invocation
+		m.witSizeLimitedBackoff.Failure()
+		return nil, err
+	}
+	m.witSizeLimitedBackoff.Success()
+
+	byEntryID := make(map[string]*cache.WITSVID, len(svidsOut))
+	for entryID, svid := range svidsOut {
+		privateKey, ok := privateKeys[entryID]
+		if !ok {
+			continue
+		}
+
+		byEntryID[entryID] = &cache.WITSVID{
+			Token:      svid.Token,
+			PrivateKey: privateKey,
+			IssuedAt:   svid.IssuedAt,
+			ExpiresOn:  svid.ExpiresAt,
+		}
+	}
+
+	return byEntryID, nil
+}
+
+func (m *manager) fetchX509SVIDs(ctx context.Context, csrs []csrRequest) (_ map[string]*cache.X509SVID, err error) {
 	// Put all the CSRs in an array to make just one call with all the CSRs.
 	counter := telemetry_agent.StartManagerFetchSVIDsUpdatesCall(m.c.Metrics)
 	defer counter.Done(&err)
@@ -223,39 +414,50 @@ func (m *manager) fetchSVIDs(ctx context.Context, csrs []csrRequest) (_ *cache.U
 		}
 	}
 
-	return &cache.UpdateSVIDs{
-		X509SVIDs: byEntryID,
-	}, nil
+	return byEntryID, nil
 }
 
 // fetchEntries fetches entries that the agent is entitled to, divided in lists, one for regular entries and
 // another one for storable entries
-func (m *manager) fetchEntries(ctx context.Context) (_ *cache.UpdateEntries, _ *cache.UpdateEntries, err error) {
+func (m *manager) fetchEntries(ctx context.Context) (_ *cache.UpdateEntries, _ *cache.UpdateEntries, _ *taintedAuthorities, err error) {
 	// Put all the CSRs in an array to make just one call with all the CSRs.
 	counter := telemetry_agent.StartManagerFetchEntriesUpdatesCall(m.c.Metrics)
 	defer counter.Done(&err)
 
-	var update *client.Update
-	if m.c.UseSyncAuthorizedEntries {
-		stats, err := m.client.SyncUpdates(ctx, m.syncedEntries, m.syncedBundles)
-		if err != nil {
-			return nil, nil, err
-		}
-		telemetry_agent.SetSyncStats(m.c.Metrics, stats)
-		update = &client.Update{
-			Entries: m.syncedEntries,
-			Bundles: m.syncedBundles,
-		}
-	} else {
-		update, err = m.client.FetchUpdates(ctx)
-		if err != nil {
-			return nil, nil, err
-		}
+	stats, err := m.client.SyncUpdates(ctx, m.syncedEntries, m.syncedBundles)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	telemetry_agent.SetSyncStats(m.c.Metrics, stats)
+	update := &client.Update{
+		Entries: m.syncedEntries,
+		Bundles: m.syncedBundles,
 	}
 
 	bundles, err := parseBundles(update.Bundles)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
+	}
+
+	// Get all Subject Key IDs and KeyIDs of tainted authorities
+	var taintedX509Authorities []string
+	taintedJWTAuthorities := make(map[string]struct{})
+	if b, ok := update.Bundles[m.c.TrustDomain.IDString()]; ok {
+		for _, rootCA := range b.RootCas {
+			if rootCA.TaintedKey {
+				cert, err := x509.ParseCertificate(rootCA.DerBytes)
+				if err != nil {
+					return nil, nil, nil, fmt.Errorf("failed to parse tainted x509 authority: %w", err)
+				}
+				subjectKeyID := x509util.SubjectKeyIDToString(cert.SubjectKeyId)
+				taintedX509Authorities = append(taintedX509Authorities, subjectKeyID)
+			}
+		}
+		for _, jwtKey := range b.JwtSigningKeys {
+			if jwtKey.TaintedKey {
+				taintedJWTAuthorities[jwtKey.Kid] = struct{}{}
+			}
+		}
 	}
 
 	cacheEntries := make(map[string]*common.RegistrationEntry)
@@ -271,12 +473,15 @@ func (m *manager) fetchEntries(ctx context.Context) (_ *cache.UpdateEntries, _ *
 	}
 
 	return &cache.UpdateEntries{
-			Bundles:             bundles,
-			RegistrationEntries: cacheEntries,
-		}, &cache.UpdateEntries{
-			Bundles:             bundles,
-			RegistrationEntries: storeEntries,
-		}, nil
+		Bundles:             bundles,
+		RegistrationEntries: cacheEntries,
+	}, &cache.UpdateEntries{
+		Bundles:             bundles,
+		RegistrationEntries: storeEntries,
+	}, &taintedAuthorities{
+		X509: taintedX509Authorities,
+		JWT:  taintedJWTAuthorities,
+	}, nil
 }
 
 func newCSR(spiffeID spiffeid.ID, keyType workloadkey.KeyType) (crypto.Signer, []byte, error) {
@@ -306,4 +511,26 @@ func parseBundles(bundles map[string]*common.Bundle) (map[spiffeid.TrustDomain]*
 		out[td] = bundle
 	}
 	return out, nil
+}
+
+func getNewItemsFromSlice(current map[string]struct{}, items []string) []string {
+	var newItems []string
+	for _, subjectKeyID := range items {
+		if _, ok := current[subjectKeyID]; !ok {
+			newItems = append(newItems, subjectKeyID)
+		}
+	}
+
+	return newItems
+}
+
+func getNewItemsFromMap(current map[string]struct{}, items map[string]struct{}) []string {
+	var newItems []string
+	for subjectKeyID := range items {
+		if _, ok := current[subjectKeyID]; !ok {
+			newItems = append(newItems, subjectKeyID)
+		}
+	}
+
+	return newItems
 }

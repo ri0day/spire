@@ -18,17 +18,12 @@ type Flag string
 // representations. It is loaded directly from the config file.
 type RawConfig []string
 
-// To add a feature flag, decleare it here along with its config name.
+// To add a feature flag, declare it here along with its config name.
 // Then, add it to the `flags` package-level singleton map below, setting the
 // appropriate default value. Flags should always be opt-in and default to
 // false, with the only exception being flags that are in the process of being
 // deprecated.
 const (
-	// FlagForcedRotation controls whether or not the new APIs and
-	// extensions related to forced rotation and revocation are
-	// enabled or not. See #1934 for more information.
-	FlagForcedRotation Flag = "forced_rotation"
-
 	// FlagTestFlag is defined purely for testing purposes.
 	FlagTestFlag Flag = "i_am_a_test_flag"
 )
@@ -40,8 +35,7 @@ var (
 		mtx    *sync.RWMutex
 	}{
 		flags: map[Flag]bool{
-			FlagForcedRotation: false,
-			FlagTestFlag:       false,
+			FlagTestFlag: false,
 		},
 		loaded: false,
 		mtx:    new(sync.RWMutex),
@@ -104,7 +98,7 @@ func Unload() error {
 	return nil
 }
 
-// IsSet can be used to determine whether or not a particular feature flag is
+// IsSet can be used to determine whether a particular feature flag is
 // set.
 func IsSet(f Flag) bool {
 	singleton.mtx.RLock()

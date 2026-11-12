@@ -35,7 +35,7 @@ func TestGetLogger(t *testing.T) {
 				CurrentLevel: apitype.LogLevel_PANIC,
 				LaunchLevel:  apitype.LogLevel_PANIC,
 			},
-			// no outputted log messages, as the are at INFO level
+			// no outputted log messages, as they are at INFO level
 			expectedLogs: nil,
 		},
 		{
@@ -46,7 +46,7 @@ func TestGetLogger(t *testing.T) {
 				CurrentLevel: apitype.LogLevel_FATAL,
 				LaunchLevel:  apitype.LogLevel_FATAL,
 			},
-			// no outputted log messages, as the are at INFO level
+			// no outputted log messages, as they are at INFO level
 			expectedLogs: nil,
 		},
 		{
@@ -57,7 +57,7 @@ func TestGetLogger(t *testing.T) {
 				CurrentLevel: apitype.LogLevel_ERROR,
 				LaunchLevel:  apitype.LogLevel_ERROR,
 			},
-			// no outputted log messages, as the are at INFO level
+			// no outputted log messages, as they are at INFO level
 			expectedLogs: nil,
 		},
 		{
@@ -68,7 +68,7 @@ func TestGetLogger(t *testing.T) {
 				CurrentLevel: apitype.LogLevel_WARN,
 				LaunchLevel:  apitype.LogLevel_WARN,
 			},
-			// no outputted log messages, as the are at INFO level
+			// no outputted log messages, as they are at INFO level
 			expectedLogs: nil,
 		},
 		{
@@ -141,7 +141,6 @@ func TestGetLogger(t *testing.T) {
 			},
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			test := setupServiceTest(t, tt.launchLevel)
 			defer test.Cleanup()
@@ -390,7 +389,6 @@ func TestSetLoggerThenGetLogger(t *testing.T) {
 			},
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			test := setupServiceTest(t, tt.launchLevel)
 			defer test.Cleanup()
@@ -638,7 +636,6 @@ func TestResetLogger(t *testing.T) {
 			},
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			test := setupServiceTest(t, tt.launchLevel)
 			defer test.Cleanup()
@@ -729,7 +726,6 @@ func TestUnsetSetLogLevelRequest(t *testing.T) {
 			},
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			test := setupServiceTest(t, tt.launchLevel)
 			defer test.Cleanup()
@@ -772,8 +768,8 @@ func setupServiceTest(t *testing.T, launchLevel logrus.Level) *serviceTest {
 	}
 	server := grpctest.StartServer(t, registerFn,
 		grpctest.OverrideContext(overrideContext),
-		grpctest.Middleware(middleware.WithAuditLog(false)))
-	conn := server.Dial(t)
+		grpctest.Middleware(middleware.WithAuditLog(false, false)))
+	conn := server.NewGRPCClient(t)
 	// Remove configuration logs
 	logHook.Reset()
 

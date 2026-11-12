@@ -9,14 +9,13 @@ import (
 	"time"
 
 	"github.com/andres-erbsen/clock"
-	"github.com/go-jose/go-jose/v3"
+	"github.com/go-jose/go-jose/v4"
 	"github.com/sirupsen/logrus"
 	"github.com/spiffe/go-spiffe/v2/bundle/jwtbundle"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/go-spiffe/v2/workloadapi"
 	"github.com/spiffe/spire/pkg/common/telemetry"
 	"github.com/spiffe/spire/pkg/common/util"
-	"github.com/zeebo/errs"
 )
 
 const (
@@ -56,19 +55,19 @@ func NewWorkloadAPISource(config WorkloadAPISourceConfig) (*WorkloadAPISource, e
 	if config.Addr != nil {
 		o, err := util.GetWorkloadAPIClientOption(config.Addr)
 		if err != nil {
-			return nil, errs.Wrap(err)
+			return nil, err
 		}
 		opts = append(opts, o)
 	}
 
 	trustDomain, err := spiffeid.TrustDomainFromString(config.TrustDomain)
 	if err != nil {
-		return nil, errs.Wrap(err)
+		return nil, err
 	}
 
 	client, err := workloadapi.New(context.Background(), opts...)
 	if err != nil {
-		return nil, errs.Wrap(err)
+		return nil, err
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -79,7 +78,9 @@ func NewWorkloadAPISource(config WorkloadAPISourceConfig) (*WorkloadAPISource, e
 		trustDomain: trustDomain,
 	}
 
-	go s.pollEvery(ctx, client, config.PollInterval)
+	s.wg.Go(func() {
+		s.pollEvery(ctx, client, config.PollInterval)
+	})
 	return s, nil
 }
 
@@ -105,9 +106,6 @@ func (s *WorkloadAPISource) LastSuccessfulPoll() time.Time {
 }
 
 func (s *WorkloadAPISource) pollEvery(ctx context.Context, client *workloadapi.Client, interval time.Duration) {
-	s.wg.Add(1)
-	defer s.wg.Done()
-
 	defer client.Close()
 
 	s.log.WithField("interval", interval).Debug("Polling started")

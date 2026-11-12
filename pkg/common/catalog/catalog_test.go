@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"github.com/spiffe/spire/pkg/common/catalog"
 	"github.com/spiffe/spire/pkg/common/catalog/testplugin"
 	"github.com/spiffe/spire/pkg/common/plugin"
+	"github.com/spiffe/spire/pkg/common/telemetry"
 	"github.com/spiffe/spire/test/spiretest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -104,6 +106,8 @@ type loadTest struct {
 	expectErr             string
 	expectPluginClient    bool
 	expectServiceClient   bool
+	expectLogEntries      []spiretest.LogEntry
+	epilogue              func(t *testing.T, cat *catalog.Catalog)
 }
 
 func testPlugin(t *testing.T, pluginPath string) {
@@ -195,6 +199,46 @@ func testPlugin(t *testing.T, pluginPath string) {
 			expectServiceClient: true,
 		})
 	})
+	t.Run("deprecated service logs alert", func(t *testing.T) {
+		testLoad(t, pluginPath, loadTest{
+			mutateServiceRepo: func(serviceRepo *ServiceRepo) {
+				serviceRepo.versions = []catalog.Version{SomeServiceVersion{deprecated: true}}
+			},
+			expectPluginClient:  true,
+			expectServiceClient: true,
+			expectLogEntries: []spiretest.LogEntry{
+				{
+					Level:   logrus.WarnLevel,
+					Message: "Service is deprecated and will be removed in a future release",
+					Data: logrus.Fields{
+						telemetry.Alert:                 "true",
+						telemetry.AlertType:             telemetry.DeprecatedServiceAlertType,
+						telemetry.DeprecatedServiceName: SomeServiceVersion{}.New().GRPCServiceName(),
+					},
+				},
+			},
+		})
+	})
+	t.Run("deprecated service with message logs alert", func(t *testing.T) {
+		testLoad(t, pluginPath, loadTest{
+			mutateServiceRepo: func(serviceRepo *ServiceRepo) {
+				serviceRepo.versions = []catalog.Version{SomeServiceVersion{deprecated: true, deprecatedMessage: "use SomeOtherService instead"}}
+			},
+			expectPluginClient:  true,
+			expectServiceClient: true,
+			expectLogEntries: []spiretest.LogEntry{
+				{
+					Level:   logrus.WarnLevel,
+					Message: "Service is deprecated and will be removed in a future release: use SomeOtherService instead",
+					Data: logrus.Fields{
+						telemetry.Alert:                 "true",
+						telemetry.AlertType:             telemetry.DeprecatedServiceAlertType,
+						telemetry.DeprecatedServiceName: SomeServiceVersion{}.New().GRPCServiceName(),
+					},
+				},
+			},
+		})
+	})
 	t.Run("unknown type", func(t *testing.T) {
 		testLoad(t, pluginPath, loadTest{
 			mutateConfig: func(config *catalog.Config) {
@@ -213,21 +257,54 @@ func testPlugin(t *testing.T, pluginPath string) {
 			},
 		})
 	})
-	t.Run("configure success", func(t *testing.T) {
+	t.Run("configure from fixed success", func(t *testing.T) {
 		testLoad(t, pluginPath, loadTest{
 			registerConfigService: true,
 			mutateConfig: func(config *catalog.Config) {
-				config.PluginConfigs[0].Data = "GOOD"
+				config.PluginConfigs[0].DataSource = catalog.FixedData("GOOD")
 			},
 			expectPluginClient:  true,
 			expectServiceClient: true,
+		})
+	})
+	t.Run("configure and reconfigure from file success", func(t *testing.T) {
+		configPath := filepath.Join(spiretest.TempDir(t), "plugin.conf")
+		require.NoError(t, os.WriteFile(configPath, []byte("GOOD1"), 0600))
+
+		testLoad(t, pluginPath, loadTest{
+			registerConfigService: true,
+			mutateConfig: func(config *catalog.Config) {
+				config.PluginConfigs[0].DataSource = catalog.FileData(configPath)
+			},
+			expectPluginClient:  true,
+			expectServiceClient: true,
+			expectLogEntries: []spiretest.LogEntry{
+				{
+					Level:   logrus.InfoLevel,
+					Message: "CONFIGURED",
+					Data: logrus.Fields{
+						"config": "GOOD1",
+					},
+				},
+				{
+					Level:   logrus.InfoLevel,
+					Message: "CONFIGURED",
+					Data: logrus.Fields{
+						"config": "GOOD2",
+					},
+				},
+			},
+			epilogue: func(t *testing.T, cat *catalog.Catalog) {
+				require.NoError(t, os.WriteFile(configPath, []byte("GOOD2"), 0600))
+				cat.Reconfigure(context.Background())
+			},
 		})
 	})
 	t.Run("configure failure", func(t *testing.T) {
 		testLoad(t, pluginPath, loadTest{
 			registerConfigService: true,
 			mutateConfig: func(config *catalog.Config) {
-				config.PluginConfigs[0].Data = "BAD"
+				config.PluginConfigs[0].DataSource = catalog.FixedData("BAD")
 			},
 			expectErr: `failed to configure plugin "test": rpc error: code = InvalidArgument desc = bad config`,
 		})
@@ -235,7 +312,7 @@ func testPlugin(t *testing.T, pluginPath string) {
 	t.Run("configure interface not registered but data supplied", func(t *testing.T) {
 		testLoad(t, pluginPath, loadTest{
 			mutateConfig: func(config *catalog.Config) {
-				config.PluginConfigs[0].Data = "GOOD"
+				config.PluginConfigs[0].DataSource = catalog.FixedData("GOOD")
 			},
 			expectErr: `failed to configure plugin "test": no supported configuration interface found`,
 		})
@@ -281,7 +358,7 @@ func testPlugin(t *testing.T, pluginPath string) {
 		t.Run("no maximum", func(t *testing.T) {
 			testLoad(t, pluginPath, loadTest{
 				mutateConfig: func(config *catalog.Config) {
-					for i := 0; i < 10; i++ {
+					for range 10 {
 						config.PluginConfigs = append(config.PluginConfigs, config.PluginConfigs[0])
 					}
 				},
@@ -355,26 +432,53 @@ func testLoad(t *testing.T, pluginPath string, tt loadTest) {
 		tt.mutateServiceRepo(serviceRepo)
 	}
 
-	closer, err := catalog.Load(context.Background(), config, repo)
-	if closer != nil {
+	cat, err := catalog.Load(context.Background(), config, repo)
+	if cat != nil {
 		defer func() {
-			closer.Close()
+			cat.Close()
+
+			wantEntries := slices.Clone(tt.expectLogEntries)
 			if tt.expectPluginClient {
 				// Assert that the plugin io.Closer was invoked by looking at
 				// the logs. It's hard to use the full log entry since there
 				// is a bunch of unrelated, per-test-run type stuff in there,
 				// so just inspect the log messages.
-				assertContainsLogMessage(t, hook.AllEntries(), "CLOSED")
+
+				wantEntries = append(wantEntries, spiretest.LogEntry{
+					Level:   logrus.InfoLevel,
+					Message: "CLOSED",
+				})
 			}
+
+			// Prune out data that isn't contained in the wanted entries.
+			// Otherwise, the tests get pretty coupled to the log fields, which
+			// isn't what these tests are particularly concerned with.
+			wantData := make(map[string]bool)
+			for _, wantEntry := range wantEntries {
+				for k := range wantEntry.Data {
+					wantData[k] = true
+				}
+			}
+			var allEntries []*logrus.Entry
+			for _, entry := range hook.AllEntries() {
+				// Only keep fields that are present in the wanted entries
+				for k := range entry.Data {
+					if !wantData[k] {
+						delete(entry.Data, k)
+					}
+				}
+				allEntries = append(allEntries, entry)
+			}
+			spiretest.AssertLogsContainEntries(t, allEntries, wantEntries)
 		}()
 	}
 
 	if tt.expectErr != "" {
 		require.ErrorContains(t, err, tt.expectErr, "load should have failed")
-		assert.Nil(t, closer, "closer should have been nil")
+		assert.Nil(t, cat, "catalog should have been nil")
 	} else {
 		require.NoError(t, err, "load should not have failed")
-		assert.NotNil(t, closer, "closer should not have been nil")
+		assert.NotNil(t, cat, "catalog should not have been nil")
 	}
 
 	if tt.expectPluginClient {
@@ -409,6 +513,10 @@ func testLoad(t *testing.T, pluginPath string, tt loadTest) {
 		}
 	} else {
 		assert.Nil(t, someService, "service client should not have been initialized")
+	}
+
+	if tt.epilogue != nil {
+		tt.epilogue(t, cat)
 	}
 }
 
@@ -521,12 +629,13 @@ func (f *SomePluginFacade) PluginEcho(_ context.Context, in string) (string, err
 }
 
 type SomePluginVersion struct {
-	deprecated bool
+	deprecated        bool
+	deprecatedMessage string
 }
 
 func (v SomePluginVersion) New() catalog.Facade { return new(SomePluginFacade) }
 
-func (v SomePluginVersion) Deprecated() bool { return v.deprecated }
+func (v SomePluginVersion) Deprecated() (bool, string) { return v.deprecated, v.deprecatedMessage }
 
 type SomeService interface {
 	catalog.PluginInfo
@@ -547,18 +656,19 @@ func (f *SomeServiceFacade) ServiceEcho(_ context.Context, in string) (string, e
 }
 
 type SomeServiceVersion struct {
-	deprecated bool
+	deprecated        bool
+	deprecatedMessage string
 }
 
 func (v SomeServiceVersion) New() catalog.Facade { return new(SomeServiceFacade) }
 
-func (v SomeServiceVersion) Deprecated() bool { return v.deprecated }
+func (v SomeServiceVersion) Deprecated() (bool, string) { return v.deprecated, v.deprecatedMessage }
 
 type badVersion struct{}
 
 func (v badVersion) New() catalog.Facade { return badFacade{} }
 
-func (v badVersion) Deprecated() bool { return false }
+func (v badVersion) Deprecated() (bool, string) { return false, "" }
 
 type badFacade struct{}
 
@@ -566,11 +676,3 @@ func (badFacade) GRPCServiceName() string                 { return "bad" }
 func (badFacade) InitClient(grpc.ClientConnInterface) any { return nil }
 func (badFacade) InitInfo(catalog.PluginInfo)             {}
 func (badFacade) InitLog(logrus.FieldLogger)              {}
-
-func assertContainsLogMessage(t *testing.T, entries []*logrus.Entry, message string) {
-	messages := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		messages = append(messages, entry.Message)
-	}
-	assert.Contains(t, messages, message)
-}

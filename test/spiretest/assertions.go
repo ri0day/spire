@@ -15,7 +15,7 @@ import (
 )
 
 var (
-	protoMessageType = reflect.TypeOf((*proto.Message)(nil)).Elem()
+	protoMessageType = reflect.TypeFor[proto.Message]()
 )
 
 func RequireErrorContains(tb testing.TB, err error, contains string) {
@@ -123,10 +123,45 @@ func AssertProtoListEqual(tb testing.TB, expected, actual any) bool {
 	if !assert.Equal(tb, ev.Len(), av.Len(), "expected %d elements in list; got %d", ev.Len(), av.Len()) {
 		return false
 	}
-	for i := 0; i < ev.Len(); i++ {
+	for i := range ev.Len() {
 		e := ev.Index(i).Interface().(proto.Message)
 		a := av.Index(i).Interface().(proto.Message)
 		if !AssertProtoEqual(tb, e, a, "proto %d in list is not equal", i) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func CheckProtoListEqual(tb testing.TB, expected, actual any) bool {
+	tb.Helper()
+	ev := reflect.ValueOf(expected)
+	et := ev.Type()
+	av := reflect.ValueOf(actual)
+	at := av.Type()
+
+	if et.Kind() != reflect.Slice {
+		return false
+	}
+	if !et.Elem().Implements(protoMessageType) {
+		return false
+	}
+
+	if at.Kind() != reflect.Slice {
+		return false
+	}
+	if !at.Elem().Implements(protoMessageType) {
+		return false
+	}
+
+	if ev.Len() != av.Len() {
+		return false
+	}
+	for i := range ev.Len() {
+		e := ev.Index(i).Interface().(proto.Message)
+		a := av.Index(i).Interface().(proto.Message)
+		if !CheckProtoEqual(tb, e, a) {
 			return false
 		}
 	}
@@ -144,6 +179,11 @@ func RequireProtoEqual(tb testing.TB, expected, actual proto.Message, msgAndArgs
 func AssertProtoEqual(tb testing.TB, expected, actual proto.Message, msgAndArgs ...any) bool {
 	tb.Helper()
 	return assert.Empty(tb, cmp.Diff(expected, actual, protocmp.Transform()), msgAndArgs...)
+}
+
+func CheckProtoEqual(tb testing.TB, expected, actual proto.Message) bool {
+	tb.Helper()
+	return cmp.Diff(expected, actual, protocmp.Transform()) == ""
 }
 
 func RequireErrorPrefix(tb testing.TB, err error, prefix string) {

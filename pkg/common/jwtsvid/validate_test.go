@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-jose/go-jose/v3"
-	"github.com/go-jose/go-jose/v3/cryptosigner"
-	"github.com/go-jose/go-jose/v3/jwt"
+	"github.com/go-jose/go-jose/v4"
+	"github.com/go-jose/go-jose/v4/cryptosigner"
+	"github.com/go-jose/go-jose/v4/jwt"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/spire/pkg/common/cryptoutil"
 	"github.com/spiffe/spire/test/clock"
@@ -76,7 +76,6 @@ func (s *TokenSuite) TestDifferentKeys() {
 	}
 
 	for _, testCase := range testCases {
-		testCase := testCase // alias loop variable as it is used in the closure
 		s.T().Run(testCase.kid, func(t *testing.T) {
 			token := s.signJWTSVID(fakeSpiffeID, fakeAudience, time.Now().Add(time.Hour), testCase.key, testCase.kid)
 
@@ -98,10 +97,11 @@ func (s *TokenSuite) TestValidateWithAudienceList() {
 }
 
 func (s *TokenSuite) TestValidateBadAlgorithm() {
-	token := s.signToken(jose.HS256, []byte("BLAH"), jwt.Claims{})
+	key := make([]byte, 256)
+	token := s.signToken(jose.HS256, key, jwt.Claims{})
 
 	spiffeID, claims, err := ValidateToken(ctx, token, s.bundle, fakeAudience[0:1])
-	s.Require().EqualError(err, `unsupported token signature algorithm "HS256"`)
+	s.Require().EqualError(err, `unable to parse JWT token: unexpected signature algorithm "HS256"; expected ["ES256" "ES384" "ES512" "RS256" "RS384" "RS512" "PS256" "PS384" "PS512"]`)
 	s.Require().Empty(spiffeID)
 	s.Require().Nil(claims)
 }
@@ -135,10 +135,20 @@ func (s *TokenSuite) TestValidateNoSubject() {
 	s.Require().Nil(claims)
 }
 
+func (s *TokenSuite) TestValidateNoExpiry() {
+	token := s.signJWTSVID(fakeSpiffeID, fakeAudience, time.Time{}, ec256Key, "ec256Key")
+
+	spiffeID, claims, err := ValidateToken(ctx, token, s.bundle, fakeAudience[0:1])
+	s.Require().EqualError(err, "token missing exp claim")
+	s.Require().Empty(spiffeID)
+	s.Require().Nil(claims)
+}
+
 func (s *TokenSuite) TestValidateSubjectNotForDomain() {
 	token := s.signToken(jose.ES256, jose.JSONWebKey{Key: ec256Key, KeyID: "ec256Key"}, jwt.Claims{
 		Subject:  "spiffe://other.org/foo",
 		Audience: []string{"audience"},
+		Expiry:   jwt.NewNumericDate(time.Now().Add(time.Hour)),
 	})
 
 	spiffeID, claims, err := ValidateToken(ctx, token, s.bundle, []string{"FOO"})
@@ -150,6 +160,7 @@ func (s *TokenSuite) TestValidateSubjectNotForDomain() {
 func (s *TokenSuite) TestValidateNoAudience() {
 	token := s.signToken(jose.ES256, jose.JSONWebKey{Key: ec256Key, KeyID: "ec256Key"}, jwt.Claims{
 		Subject: fakeSpiffeID.String(),
+		Expiry:  jwt.NewNumericDate(time.Now().Add(time.Hour)),
 	})
 
 	spiffeID, claims, err := ValidateToken(ctx, token, s.bundle, []string{"FOO"})
@@ -193,7 +204,7 @@ func (s *TokenSuite) signToken(alg jose.SignatureAlgorithm, key any, claims jwt.
 		}, nil)
 	s.Require().NoError(err)
 
-	token, err := jwt.Signed(signer).Claims(claims).CompactSerialize()
+	token, err := jwt.Signed(signer).Claims(claims).Serialize()
 	s.Require().NoError(err)
 	return token
 }
@@ -201,9 +212,12 @@ func (s *TokenSuite) signToken(alg jose.SignatureAlgorithm, key any, claims jwt.
 func (s *TokenSuite) signJWTSVID(id spiffeid.ID, audience []string, expires time.Time, signer crypto.Signer, kid string) string {
 	claims := jwt.Claims{
 		Subject:  id.String(),
-		Expiry:   jwt.NewNumericDate(expires),
 		Audience: audience,
 		IssuedAt: jwt.NewNumericDate(s.clock.Now()),
+	}
+
+	if !expires.IsZero() {
+		claims.Expiry = jwt.NewNumericDate(expires)
 	}
 
 	alg, err := cryptoutil.JoseAlgFromPublicKey(signer.Public())
@@ -221,7 +235,7 @@ func (s *TokenSuite) signJWTSVID(id spiffeid.ID, audience []string, expires time
 	)
 	s.Require().NoError(err)
 
-	signedToken, err := jwt.Signed(jwtSigner).Claims(claims).CompactSerialize()
+	signedToken, err := jwt.Signed(jwtSigner).Claims(claims).Serialize()
 	s.Require().NoError(err)
 	return signedToken
 }

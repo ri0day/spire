@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
@@ -15,18 +16,18 @@ import (
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
-	"github.com/Azure/azure-sdk-for-go/sdk/keyvault/azkeys"
+	"github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/azkeys"
 	"github.com/andres-erbsen/clock"
+	"github.com/go-jose/go-jose/v4"
 	"github.com/gofrs/uuid/v5"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/hcl"
-	"github.com/lestrrat-go/jwx/v2/jwk"
 	keymanagerv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/plugin/server/keymanager/v1"
 	configv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/service/common/config/v1"
 	"github.com/spiffe/spire/pkg/common/catalog"
 	"github.com/spiffe/spire/pkg/common/diskutil"
+	"github.com/spiffe/spire/pkg/common/pluginconf"
 	"golang.org/x/crypto/cryptobyte"
 	"golang.org/x/crypto/cryptobyte/asn1"
 	"google.golang.org/grpc/codes"
@@ -77,7 +78,6 @@ type pluginHooks struct {
 
 // Config provides configuration context for the plugin.
 type Config struct {
-	KeyMetadataFile    string `hcl:"key_metadata_file" json:"key_metadata_file"`
 	KeyIdentifierFile  string `hcl:"key_identifier_file" json:"key_identifier_file"`
 	KeyIdentifierValue string `hcl:"key_identifier_value" json:"key_identifier_value"`
 	KeyVaultURI        string `hcl:"key_vault_uri" json:"key_vault_uri"`
@@ -85,10 +85,35 @@ type Config struct {
 	SubscriptionID     string `hcl:"subscription_id" json:"subscription_id"`
 	AppID              string `hcl:"app_id" json:"app_id"`
 	AppSecret          string `hcl:"app_secret" json:"app_secret"`
+}
 
-	// Deprecated: use_msi is deprecated and will be removed in a future release.
-	// Will be used implicitly if other mechanisms to authenticate fail.
-	UseMSI bool `hcl:"use_msi" json:"use_msi"`
+func buildConfig(coreConfig catalog.CoreConfig, hclText string, status *pluginconf.Status) *Config {
+	newConfig := new(Config)
+
+	if err := hcl.Decode(newConfig, hclText); err != nil {
+		status.ReportErrorf("unable to decode configuration: %v", err)
+		return nil
+	}
+
+	if newConfig.KeyVaultURI == "" {
+		status.ReportError("configuration is missing the Key Vault URI")
+	}
+
+	if newConfig.KeyIdentifierValue != "" {
+		if len(newConfig.KeyIdentifierValue) > 256 {
+			status.ReportError("Key identifier must not be longer than 256 characters")
+		}
+	}
+
+	if newConfig.KeyIdentifierFile == "" && newConfig.KeyIdentifierValue == "" {
+		status.ReportError("configuration requires a key identifier file or a key identifier value")
+	}
+
+	if newConfig.KeyIdentifierFile != "" && newConfig.KeyIdentifierValue != "" {
+		status.ReportError("configuration can't have a key identifier file and a key identifier value at the same time")
+	}
+
+	return newConfig
 }
 
 // Plugin is the main representation of this keymanager plugin
@@ -136,21 +161,14 @@ func (p *Plugin) SetLogger(log hclog.Logger) {
 }
 
 func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) (*configv1.ConfigureResponse, error) {
-	config, err := parseAndValidateConfig(req.HclConfiguration)
+	newConfig, _, err := pluginconf.Build(req, buildConfig)
 	if err != nil {
 		return nil, err
 	}
 
-	serverID := config.KeyIdentifierValue
-	if serverID == "" && config.KeyMetadataFile != "" {
-		p.log.Warn("'key_metadata_file' is deprecated in favor of 'key_identifier_file' and will be removed in a future version")
-		serverID, err = getOrCreateServerID(config.KeyMetadataFile)
-		if err != nil {
-			return nil, err
-		}
-	}
-	if serverID == "" && config.KeyIdentifierFile != "" {
-		serverID, err = getOrCreateServerID(config.KeyIdentifierFile)
+	serverID := newConfig.KeyIdentifierValue
+	if serverID == "" {
+		serverID, err = getOrCreateServerID(newConfig.KeyIdentifierFile)
 		if err != nil {
 			return nil, err
 		}
@@ -160,43 +178,35 @@ func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) 
 	var client cloudKeyManagementService
 
 	switch {
-	case config.SubscriptionID != "", config.AppID != "", config.AppSecret != "", config.TenantID != "":
-		if config.UseMSI {
-			return nil, status.Errorf(codes.InvalidArgument, "invalid configuration, cannot use both MSI and app authentication")
-		}
-		if config.TenantID == "" {
+	case newConfig.SubscriptionID != "", newConfig.AppID != "", newConfig.AppSecret != "", newConfig.TenantID != "":
+		if newConfig.TenantID == "" {
 			return nil, status.Errorf(codes.InvalidArgument, "invalid configuration, missing tenant id")
 		}
-		if config.SubscriptionID == "" {
+		if newConfig.SubscriptionID == "" {
 			return nil, status.Errorf(codes.InvalidArgument, "invalid configuration, missing subscription id")
 		}
-		if config.AppID == "" {
+		if newConfig.AppID == "" {
 			return nil, status.Errorf(codes.InvalidArgument, "invalid configuration, missing application id")
 		}
-		if config.AppSecret == "" {
+		if newConfig.AppSecret == "" {
 			return nil, status.Errorf(codes.InvalidArgument, "invalid configuration, missing app secret")
 		}
 
-		creds, err := azidentity.NewClientSecretCredential(config.TenantID, config.AppID, config.AppSecret, nil)
+		creds, err := azidentity.NewClientSecretCredential(newConfig.TenantID, newConfig.AppID, newConfig.AppSecret, nil)
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "unable to get client credential: %v", err)
 		}
 
-		client, err = p.hooks.newKeyVaultClient(creds, config.KeyVaultURI)
+		client, err = p.hooks.newKeyVaultClient(creds, newConfig.KeyVaultURI)
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "failed to create Key Vault client with client credentials: %v", err)
 		}
-
-	case config.UseMSI:
-		p.log.Warn("use_msi is deprecated and will be removed in a future release")
-		fallthrough // use default credential which attempts to fetch credentials using MSI
-
 	default:
 		cred, err := p.hooks.fetchCredential()
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "unable to fetch client credential: %v", err)
 		}
-		client, err = p.hooks.newKeyVaultClient(cred, config.KeyVaultURI)
+		client, err = p.hooks.newKeyVaultClient(cred, newConfig.KeyVaultURI)
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "failed to create Key Vault client with MSI credential: %v", err)
 		}
@@ -209,7 +219,7 @@ func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) 
 		trustDomain:    req.CoreConfiguration.TrustDomain,
 	}
 
-	p.log.Debug("Fetching keys from Azure Key Vault", "key_vault_uri", config.KeyVaultURI)
+	p.log.Debug("Fetching keys from Azure Key Vault", "key_vault_uri", newConfig.KeyVaultURI)
 	keyEntries, err := fetcher.fetchKeyEntries(ctx)
 	if err != nil {
 		return nil, err
@@ -223,8 +233,8 @@ func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) 
 	p.trustDomain = req.CoreConfiguration.TrustDomain
 	p.serverID = serverID
 	p.keyTags = make(map[string]*string)
-	p.keyTags[tagNameServerTrustDomain] = to.Ptr(req.CoreConfiguration.TrustDomain)
-	p.keyTags[tagNameServerID] = to.Ptr(serverID)
+	p.keyTags[tagNameServerTrustDomain] = new(req.CoreConfiguration.TrustDomain)
+	p.keyTags[tagNameServerID] = new(serverID)
 
 	// Cancel previous tasks in case of re-configure.
 	if p.cancelTasks != nil {
@@ -238,6 +248,15 @@ func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) 
 	go p.disposeKeysTask(ctx)
 
 	return &configv1.ConfigureResponse{}, nil
+}
+
+func (p *Plugin) Validate(ctx context.Context, req *configv1.ValidateRequest) (*configv1.ValidateResponse, error) {
+	_, notes, err := pluginconf.Build(req, buildConfig)
+
+	return &configv1.ValidateResponse{
+		Valid: err == nil,
+		Notes: notes,
+	}, nil
 }
 
 // refreshKeysTask will update the keys in the cache every 6 hours.
@@ -283,7 +302,7 @@ func (p *Plugin) refreshKeys(ctx context.Context) error {
 
 		// Update the key with the same key to only change the Updated timestamp
 		_, err = p.keyVaultClient.UpdateKey(ctx, keyName, keyVersion, azkeys.UpdateKeyParameters{
-			KeyOps: []*azkeys.JSONWebKeyOperation{to.Ptr(azkeys.JSONWebKeyOperationSign), to.Ptr(azkeys.JSONWebKeyOperationVerify)},
+			KeyOps: []*azkeys.KeyOperation{new(azkeys.KeyOperationSign), new(azkeys.KeyOperationVerify)},
 		}, nil)
 		if err != nil {
 			p.log.Error("Failed to refresh key", keyIDTag, entry.KeyID, reasonTag, err)
@@ -292,7 +311,7 @@ func (p *Plugin) refreshKeys(ctx context.Context) error {
 	}
 
 	if errs != nil {
-		return fmt.Errorf(strings.Join(errs, ": "))
+		return errors.New(strings.Join(errs, ": "))
 	}
 	return nil
 }
@@ -328,7 +347,7 @@ func (p *Plugin) notifyDisposeKeys(err error) {
 
 func (p *Plugin) disposeKeys(ctx context.Context) error {
 	p.log.Debug("Looking for keys in trust domain to dispose")
-	pager := p.keyVaultClient.NewListKeysPager(nil)
+	pager := p.keyVaultClient.NewListKeyPropertiesPager(nil)
 	now := p.hooks.clk.Now()
 	maxStaleTime := now.Add(-maxStaleDuration)
 	for pager.More() {
@@ -471,7 +490,7 @@ func (p *Plugin) SignData(ctx context.Context, req *keymanagerv1.SignDataRequest
 	}
 
 	signResponse, err := p.keyVaultClient.Sign(ctx, keyName, keyVersion, azkeys.SignParameters{
-		Algorithm: to.Ptr(signingAlgo),
+		Algorithm: &signingAlgo,
 		Value:     req.Data,
 	}, nil)
 	if err != nil {
@@ -521,23 +540,41 @@ func keyVaultSignatureToASN1Encoded(keyVaultSigResult []byte, keyType keymanager
 // For example *ecdsa.PublicKey or *rsa.PublicKey etc
 func keyVaultKeyToRawKey(keyVaultKey *azkeys.JSONWebKey) (any, error) {
 	// Marshal the key to JSON
+	// Azure Managed HSM returns "RSA-HSM" or "EC-HSM" as the key type.
+	// Normalize by stripping the "-HSM" suffix so go-jose can parse the JWK.
+	if keyVaultKey.Kty == nil {
+		return nil, status.Error(codes.Internal, "key type is missing")
+	}
+
+	var normalizedKty azkeys.KeyType
+	switch *keyVaultKey.Kty {
+	case azkeys.KeyTypeRSAHSM:
+		normalizedKty = azkeys.KeyTypeRSA
+	case azkeys.KeyTypeECHSM:
+		normalizedKty = azkeys.KeyTypeEC
+	}
+	if normalizedKty != "" {
+		// Create a copy of the key to avoid mutating the original keyVaultKey ref.
+		keyCopy := *keyVaultKey
+		keyCopy.Kty = &normalizedKty
+		keyVaultKey = &keyCopy
+	}
 	jwkJSON, err := keyVaultKey.MarshalJSON()
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to marshal key: %v", err)
 	}
 
 	// Parse JWK
-	key, err := jwk.ParseKey(jwkJSON)
-	if err != nil {
+	var key jose.JSONWebKey
+	if err := json.Unmarshal(jwkJSON, &key); err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to parse key: %v", err)
 	}
 
-	var rawkey any
-	// Raw returns the public key represented by this JWK (in this case, *rsa.PublicKey or *ecdsa.PublicKey)
-	if err := key.Raw(&rawkey); err != nil {
+	if key.Key == nil {
 		return nil, status.Errorf(codes.Internal, "failed to convert Key Vault key to raw key: %v", err)
 	}
-	return rawkey, nil
+
+	return key.Key, nil
 }
 
 // GetPublicKey returns the public key for a given key
@@ -609,8 +646,7 @@ func (p *Plugin) scheduleDeleteTask(ctx context.Context) {
 				continue
 			}
 
-			var respErr *azcore.ResponseError
-			if errors.As(err, &respErr) {
+			if respErr, ok := errors.AsType[*azcore.ResponseError](err); ok {
 				if respErr.StatusCode == http.StatusNotFound {
 					log.Error("Failed to schedule key deletion", reasonTag, "No such key")
 					p.notifyDelete(err)
@@ -639,34 +675,26 @@ func (p *Plugin) notifyDelete(err error) {
 	}
 }
 
-// min returns the minimum of the provided time durations.
-func min(x, y time.Duration) time.Duration {
-	if x < y {
-		return x
-	}
-	return y
-}
-
 func getCreateKeyParameters(keyType keymanagerv1.KeyType, keyTags map[string]*string) (*azkeys.CreateKeyParameters, error) {
 	result := &azkeys.CreateKeyParameters{}
 	switch keyType {
 	case keymanagerv1.KeyType_RSA_2048:
-		result.Kty = to.Ptr(azkeys.JSONWebKeyTypeRSA)
-		result.KeySize = to.Ptr(int32(2048))
+		result.Kty = new(azkeys.KeyTypeRSA)
+		result.KeySize = new(int32(2048))
 	case keymanagerv1.KeyType_RSA_4096:
-		result.Kty = to.Ptr(azkeys.JSONWebKeyTypeRSA)
-		result.KeySize = to.Ptr(int32(4096))
+		result.Kty = new(azkeys.KeyTypeRSA)
+		result.KeySize = new(int32(4096))
 	case keymanagerv1.KeyType_EC_P256:
-		result.Kty = to.Ptr(azkeys.JSONWebKeyTypeEC)
-		result.Curve = to.Ptr(azkeys.JSONWebKeyCurveNameP256)
+		result.Kty = new(azkeys.KeyTypeEC)
+		result.Curve = new(azkeys.CurveNameP256)
 	case keymanagerv1.KeyType_EC_P384:
-		result.Kty = to.Ptr(azkeys.JSONWebKeyTypeEC)
-		result.Curve = to.Ptr(azkeys.JSONWebKeyCurveNameP384)
+		result.Kty = new(azkeys.KeyTypeEC)
+		result.Curve = new(azkeys.CurveNameP384)
 	default:
 		return nil, status.Errorf(codes.Internal, "unsupported key type: %v", keyType)
 	}
 	// Specify the key operations as Sign and Verify
-	result.KeyOps = append(result.KeyOps, to.Ptr(azkeys.JSONWebKeyOperationSign), to.Ptr(azkeys.JSONWebKeyOperationVerify))
+	result.KeyOps = append(result.KeyOps, new(azkeys.KeyOperationSign), new(azkeys.KeyOperationVerify))
 	// Set the key tags
 	result.Tags = keyTags
 	return result, nil
@@ -683,36 +711,6 @@ func (p *Plugin) generateKeyName(spireKeyID string) (keyName string, err error) 
 	}
 
 	return fmt.Sprintf("%s-%s-%s", keyNamePrefix, uniqueID, spireKeyID), nil
-}
-
-// parseAndValidateConfig returns an error if any configuration provided does not meet acceptable criteria
-func parseAndValidateConfig(c string) (*Config, error) {
-	config := new(Config)
-
-	if err := hcl.Decode(config, c); err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "unable to decode configuration: %v", err)
-	}
-
-	if config.KeyVaultURI == "" {
-		return nil, status.Error(codes.InvalidArgument, "configuration is missing the Key Vault URI")
-	}
-
-	if config.KeyIdentifierValue != "" {
-		if len(config.KeyIdentifierValue) > 256 {
-			return nil, status.Error(codes.InvalidArgument, "Key identifier must not be longer than 256 characters")
-		}
-	}
-	if config.KeyMetadataFile == "" && config.KeyIdentifierFile == "" && config.KeyIdentifierValue == "" {
-		return nil, status.Error(codes.InvalidArgument, "configuration requires server id or server id file path")
-	}
-	if (config.KeyMetadataFile != "" || config.KeyIdentifierFile != "") && config.KeyIdentifierValue != "" {
-		return nil, status.Error(codes.InvalidArgument, "configuration must not contain both server id and server id file path")
-	}
-	if config.KeyMetadataFile != "" && config.KeyIdentifierFile != "" {
-		return nil, status.Error(codes.InvalidArgument, "configuration must not contain both 'key_identifier_file' and deprecated 'key_metadata_file'")
-	}
-
-	return config, nil
 }
 
 func getOrCreateServerID(idPath string) (string, error) {
@@ -774,7 +772,7 @@ func makeFingerprint(pkixData []byte) string {
 	return hex.EncodeToString(s[:])
 }
 
-func signingAlgorithmForKeyVault(keyType keymanagerv1.KeyType, signerOpts any) (azkeys.JSONWebKeySignatureAlgorithm, error) {
+func signingAlgorithmForKeyVault(keyType keymanagerv1.KeyType, signerOpts any) (azkeys.SignatureAlgorithm, error) {
 	var (
 		hashAlgo keymanagerv1.HashAlgorithm
 		isPSS    bool
@@ -801,21 +799,21 @@ func signingAlgorithmForKeyVault(keyType keymanagerv1.KeyType, signerOpts any) (
 	case hashAlgo == keymanagerv1.HashAlgorithm_UNSPECIFIED_HASH_ALGORITHM:
 		return "", errors.New("hash algorithm is required")
 	case keyType == keymanagerv1.KeyType_EC_P256 && hashAlgo == keymanagerv1.HashAlgorithm_SHA256:
-		return azkeys.JSONWebKeySignatureAlgorithmES256, nil
+		return azkeys.SignatureAlgorithmES256, nil
 	case keyType == keymanagerv1.KeyType_EC_P384 && hashAlgo == keymanagerv1.HashAlgorithm_SHA384:
-		return azkeys.JSONWebKeySignatureAlgorithmES384, nil
+		return azkeys.SignatureAlgorithmES384, nil
 	case isRSA && !isPSS && hashAlgo == keymanagerv1.HashAlgorithm_SHA256:
-		return azkeys.JSONWebKeySignatureAlgorithmRS256, nil
+		return azkeys.SignatureAlgorithmRS256, nil
 	case isRSA && !isPSS && hashAlgo == keymanagerv1.HashAlgorithm_SHA384:
-		return azkeys.JSONWebKeySignatureAlgorithmRS384, nil
+		return azkeys.SignatureAlgorithmRS384, nil
 	case isRSA && !isPSS && hashAlgo == keymanagerv1.HashAlgorithm_SHA512:
-		return azkeys.JSONWebKeySignatureAlgorithmRS512, nil
+		return azkeys.SignatureAlgorithmRS512, nil
 	case isRSA && isPSS && hashAlgo == keymanagerv1.HashAlgorithm_SHA256:
-		return azkeys.JSONWebKeySignatureAlgorithmPS256, nil
+		return azkeys.SignatureAlgorithmPS256, nil
 	case isRSA && isPSS && hashAlgo == keymanagerv1.HashAlgorithm_SHA384:
-		return azkeys.JSONWebKeySignatureAlgorithmPS384, nil
+		return azkeys.SignatureAlgorithmPS384, nil
 	case isRSA && isPSS && hashAlgo == keymanagerv1.HashAlgorithm_SHA512:
-		return azkeys.JSONWebKeySignatureAlgorithmPS512, nil
+		return azkeys.SignatureAlgorithmPS512, nil
 	default:
 		return "", fmt.Errorf("unsupported combination of key type: %v and hashing algorithm: %v", keyType, hashAlgo)
 	}

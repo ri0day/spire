@@ -27,6 +27,7 @@ import (
 	configv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/service/common/config/v1"
 	"github.com/spiffe/spire/pkg/common/catalog"
 	"github.com/spiffe/spire/pkg/common/diskutil"
+	"github.com/spiffe/spire/pkg/common/pluginconf"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 	"google.golang.org/grpc/codes"
@@ -49,6 +50,19 @@ const (
 	maxStaleDuration              = time.Hour * 24 * 14 // Two weeks.
 
 	cryptoKeyNamePrefix = "spire-key"
+
+	// maxCryptoKeyIDLength is the maximum length of a Cloud KMS CryptoKey ID,
+	// which must match the regular expression [a-zA-Z0-9_-]{1,63}.
+	// See https://cloud.google.com/kms/docs/reference/rest/v1/projects.locations.keyRings.cryptoKeys/create.
+	maxCryptoKeyIDLength = 63
+
+	// maxSPIREKeyIDLength is the length of the longest SPIRE key ID the server
+	// appends when building a CryptoKey ID (e.g. "JWT-Signer-A", "WIT-Signer-A").
+	// CryptoKey IDs have the form spire-key-<serverID>-<spireKeyID>, so the
+	// server ID must be short enough to leave room for the prefix and this
+	// suffix within maxCryptoKeyIDLength.
+	maxSPIREKeyIDLength = len("JWT-Signer-A")
+
 	labelNameServerID   = "spire-server-id"
 	labelNameLastUpdate = "spire-last-update"
 	labelNameServerTD   = "spire-server-td"
@@ -117,8 +131,7 @@ type Plugin struct {
 
 // Config provides configuration context for the plugin.
 type Config struct {
-	// File path location where key metadata used by the plugin is persisted.
-	KeyMetadataFile   string `hcl:"key_metadata_file" json:"key_metadata_file"`
+	// File path location where information about generated keys will be persisted.
 	KeyIdentifierFile string `hcl:"key_identifier_file" json:"key_identifier_file"`
 
 	// Key metadata used by the plugin.
@@ -136,6 +149,40 @@ type Config struct {
 	// API. If not specified, the value of the GOOGLE_APPLICATION_CREDENTIALS
 	// environment variable is used.
 	ServiceAccountFile string `hcl:"service_account_file" json:"service_account_file"`
+}
+
+func buildConfig(coreConfig catalog.CoreConfig, hclText string, status *pluginconf.Status) *Config {
+	newConfig := new(Config)
+	if err := hcl.Decode(newConfig, hclText); err != nil {
+		status.ReportErrorf("unable to decode configuration: %v", err)
+	}
+
+	if newConfig.KeyRing == "" {
+		status.ReportError("configuration is missing the key ring")
+	}
+
+	if newConfig.KeyIdentifierFile == "" && newConfig.KeyIdentifierValue == "" {
+		status.ReportError("configuration requires a key identifier file or a key identifier value")
+	}
+
+	if newConfig.KeyIdentifierFile != "" && newConfig.KeyIdentifierValue != "" {
+		status.ReportError("configuration can't have a key identifier file and a key identifier value at the same time")
+	}
+
+	if newConfig.KeyIdentifierValue != "" {
+		if !validateCharacters(newConfig.KeyIdentifierValue) {
+			status.ReportError("Key identifier must contain only letters, numbers, underscores (_), and dashes (-)")
+		}
+		// The generated CryptoKey ID is spire-key-<serverID>-<spireKeyID>, and
+		// Cloud KMS caps CryptoKey IDs at maxCryptoKeyIDLength. Reserve room for
+		// the prefix, the two separators, and the longest SPIRE key ID suffix.
+		maxKeyIdentifierLength := maxCryptoKeyIDLength - len(cryptoKeyNamePrefix) - len("--") - maxSPIREKeyIDLength
+		if len(newConfig.KeyIdentifierValue) > maxKeyIdentifierLength {
+			status.ReportError(fmt.Sprintf("Key identifier must not be longer than %d characters", maxKeyIdentifierLength))
+		}
+	}
+
+	return newConfig
 }
 
 // New returns an instantiated plugin.
@@ -167,21 +214,14 @@ func (p *Plugin) Close() error {
 
 // Configure sets up the plugin.
 func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) (*configv1.ConfigureResponse, error) {
-	config, err := parseAndValidateConfig(req.HclConfiguration)
+	newConfig, _, err := pluginconf.Build(req, buildConfig)
 	if err != nil {
 		return nil, err
 	}
 
-	var serverID = config.KeyIdentifierValue
-	if serverID == "" && config.KeyMetadataFile != "" {
-		p.log.Warn("'key_metadata_file' is deprecated in favor of 'key_identifier_file' and will be removed in a future version")
-		serverID, err = getOrCreateServerID(config.KeyMetadataFile)
-		if err != nil {
-			return nil, err
-		}
-	}
-	if serverID == "" && config.KeyIdentifierFile != "" {
-		serverID, err = getOrCreateServerID(config.KeyIdentifierFile)
+	serverID := newConfig.KeyIdentifierValue
+	if serverID == "" {
+		serverID, err = getOrCreateServerID(newConfig.KeyIdentifierFile)
 		if err != nil {
 			return nil, err
 		}
@@ -189,8 +229,8 @@ func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) 
 	p.log.Debug("Loaded server id", "server_id", serverID)
 
 	var customPolicy *iam.Policy3
-	if config.KeyPolicyFile != "" {
-		if customPolicy, err = parsePolicyFile(config.KeyPolicyFile); err != nil {
+	if newConfig.KeyPolicyFile != "" {
+		if customPolicy, err = parsePolicyFile(newConfig.KeyPolicyFile); err != nil {
 			return nil, status.Errorf(codes.Internal, "could not parse policy file: %v", err)
 		}
 	}
@@ -208,8 +248,8 @@ func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) 
 	})
 
 	var opts []option.ClientOption
-	if config.ServiceAccountFile != "" {
-		opts = append(opts, option.WithCredentialsFile(config.ServiceAccountFile))
+	if newConfig.ServiceAccountFile != "" {
+		opts = append(opts, option.WithAuthCredentialsFile(option.ServiceAccount, newConfig.ServiceAccountFile))
 	}
 
 	kc, err := p.hooks.newKMSClient(ctx, opts...)
@@ -218,13 +258,14 @@ func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) 
 	}
 
 	fetcher := &keyFetcher{
-		keyRing:   config.KeyRing,
+		keyRing:   newConfig.KeyRing,
 		kmsClient: kc,
 		log:       p.log,
 		serverID:  serverID,
 		tdHash:    tdHashString,
+		clk:       p.hooks.clk,
 	}
-	p.log.Debug("Fetching keys from Cloud KMS", "key_ring", config.KeyRing)
+	p.log.Debug("Fetching keys from Cloud KMS", "key_ring", newConfig.KeyRing)
 	keyEntries, err := fetcher.fetchKeyEntries(ctx)
 	if err != nil {
 		return nil, err
@@ -233,14 +274,14 @@ func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) 
 	p.setCache(keyEntries)
 	p.kmsClient = kc
 
-	// Cancel previous tasks in case of re configure.
+	// Cancel previous tasks in case of re-configure.
 	if p.cancelTasks != nil {
 		p.cancelTasks()
 	}
 
 	p.configMtx.Lock()
 	defer p.configMtx.Unlock()
-	p.config = config
+	p.config = newConfig
 
 	// Start long-running tasks.
 	ctx, p.cancelTasks = context.WithCancel(context.Background())
@@ -249,6 +290,15 @@ func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) 
 	go p.disposeCryptoKeysTask(ctx)
 
 	return &configv1.ConfigureResponse{}, nil
+}
+
+func (p *Plugin) Validate(ctx context.Context, req *configv1.ValidateRequest) (*configv1.ValidateResponse, error) {
+	_, notes, err := pluginconf.Build(req, buildConfig)
+
+	return &configv1.ValidateResponse{
+		Valid: err == nil,
+		Notes: notes,
+	}, nil
 }
 
 // GenerateKey creates a key in KMS. If a key already exists in the local storage,
@@ -333,14 +383,14 @@ func (p *Plugin) SignData(ctx context.Context, req *keymanagerv1.SignDataRequest
 	default:
 		return nil, status.Errorf(codes.InvalidArgument, "unsupported signer opts type %T", opts)
 	}
-	switch {
-	case hashAlgo == keymanagerv1.HashAlgorithm_UNSPECIFIED_HASH_ALGORITHM:
+	switch hashAlgo {
+	case keymanagerv1.HashAlgorithm_UNSPECIFIED_HASH_ALGORITHM:
 		return nil, status.Error(codes.InvalidArgument, "hash algorithm is required")
-	case hashAlgo == keymanagerv1.HashAlgorithm_SHA256:
+	case keymanagerv1.HashAlgorithm_SHA256:
 		digest = &kmspb.Digest{
 			Digest: &kmspb.Digest_Sha256{Sha256: req.Data},
 		}
-	case hashAlgo == keymanagerv1.HashAlgorithm_SHA384:
+	case keymanagerv1.HashAlgorithm_SHA384:
 		digest = &kmspb.Digest{
 			Digest: &kmspb.Digest_Sha384{Sha384: req.Data},
 		}
@@ -431,7 +481,7 @@ func (p *Plugin) createKey(ctx context.Context, spireKeyID string, keyType keyma
 	cryptoKeyVersionName := cryptoKey.Name + "/cryptoKeyVersions/1"
 	log.Debug("CryptoKeyVersion version added", cryptoKeyVersionNameTag, cryptoKeyVersionName)
 
-	pubKey, err := getPublicKeyFromCryptoKeyVersion(ctx, p.log, p.kmsClient, cryptoKeyVersionName)
+	pubKey, err := getPublicKeyFromCryptoKeyVersion(ctx, p.log, p.kmsClient, cryptoKeyVersionName, p.hooks.clk)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to get public key: %v", err)
 	}
@@ -485,7 +535,7 @@ func (p *Plugin) addCryptoKeyVersionToCachedEntry(ctx context.Context, entry key
 	}
 	log.Debug("CryptoKeyVersion added", cryptoKeyVersionNameTag, cryptoKeyVersion.Name)
 
-	pubKey, err := getPublicKeyFromCryptoKeyVersion(ctx, p.log, p.kmsClient, cryptoKeyVersion.Name)
+	pubKey, err := getPublicKeyFromCryptoKeyVersion(ctx, p.log, p.kmsClient, cryptoKeyVersion.Name, p.hooks.clk)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get public key: %w", err)
 	}
@@ -573,7 +623,7 @@ func (p *Plugin) disposeCryptoKeys(ctx context.Context) error {
 	return nil
 }
 
-// disposeCryptoKeysTask will be run every 24hs.
+// disposeCryptoKeysTask will be run every 24hr.
 // It will schedule the destruction of CryptoKeyVersions that have a
 // spire-last-update label value older than two weeks.
 // It will only schedule the destruction of CryptoKeyVersions belonging to the
@@ -785,7 +835,7 @@ func (p *Plugin) keepActiveCryptoKeys(ctx context.Context) error {
 	}
 
 	if errs != nil {
-		return fmt.Errorf(strings.Join(errs, "; "))
+		return errors.New(strings.Join(errs, "; "))
 	}
 	return nil
 }
@@ -841,7 +891,7 @@ func (p *Plugin) notifyKeepActiveCryptoKeys(err error) {
 	}
 }
 
-// scheduleDestroyTask is a long running task that schedules the destruction
+// scheduleDestroyTask is a long-running task that schedules the destruction
 // of inactive CryptoKeyVersions and sets the corresponding CryptoKey as inactive.
 func (p *Plugin) scheduleDestroyTask(ctx context.Context) {
 	backoffMin := 1 * time.Second
@@ -980,14 +1030,14 @@ func cryptoKeyVersionAlgorithmFromKeyType(keyType keymanagerv1.KeyType) (kmspb.C
 	// algorithm and a SHA256 digest. Therefore, for RSA signing keys we
 	// choose the corresponding CryptoKeyVersion_CryptoKeyVersionAlgorithm using
 	// RSASSA-PKCS-v1_5 for padding and a SHA256 digest.
-	switch {
-	case keyType == keymanagerv1.KeyType_EC_P256:
+	switch keyType {
+	case keymanagerv1.KeyType_EC_P256:
 		return kmspb.CryptoKeyVersion_EC_SIGN_P256_SHA256, nil
-	case keyType == keymanagerv1.KeyType_EC_P384:
+	case keymanagerv1.KeyType_EC_P384:
 		return kmspb.CryptoKeyVersion_EC_SIGN_P384_SHA384, nil
-	case keyType == keymanagerv1.KeyType_RSA_2048:
+	case keymanagerv1.KeyType_RSA_2048:
 		return kmspb.CryptoKeyVersion_RSA_SIGN_PKCS1_2048_SHA256, nil
-	case keyType == keymanagerv1.KeyType_RSA_4096:
+	case keymanagerv1.KeyType_RSA_4096:
 		return kmspb.CryptoKeyVersion_RSA_SIGN_PKCS1_4096_SHA256, nil
 	default:
 		return kmspb.CryptoKeyVersion_CRYPTO_KEY_VERSION_ALGORITHM_UNSPECIFIED, fmt.Errorf("unsupported key type %q", keyType)
@@ -995,9 +1045,10 @@ func cryptoKeyVersionAlgorithmFromKeyType(keyType keymanagerv1.KeyType) (kmspb.C
 }
 
 // generateCryptoKeyID returns a new identifier to be used as a CryptoKeyID.
-// The returned identifier has the form: spire-key-<UUID>-<SPIRE-KEY-ID>,
-// where UUID is a new randomly generated UUID and SPIRE-KEY-ID is provided
-// through the spireKeyID parameter.
+// The returned identifier has the form: spire-key-<serverID>-<SPIRE-KEY-ID>,
+// where serverID is the configured server ID (a UUID when key_identifier_file
+// is used, or an arbitrary value when key_identifier_value is used) and
+// SPIRE-KEY-ID is provided through the spireKeyID parameter.
 func (p *Plugin) generateCryptoKeyID(spireKeyID string) (cryptoKeyID string, err error) {
 	pd, err := p.getPluginData()
 	if err != nil {
@@ -1046,7 +1097,10 @@ func getOrCreateServerID(idPath string) (string, error) {
 
 // getPublicKeyFromCryptoKeyVersion requests Cloud KMS to get the public key
 // of the specified CryptoKeyVersion.
-func getPublicKeyFromCryptoKeyVersion(ctx context.Context, log hclog.Logger, kmsClient cloudKeyManagementService, cryptoKeyVersionName string) ([]byte, error) {
+func getPublicKeyFromCryptoKeyVersion(ctx context.Context, log hclog.Logger, kmsClient cloudKeyManagementService, cryptoKeyVersionName string, clk clock.Clock) ([]byte, error) {
+	backoffMin := 10 * time.Millisecond
+	backoffMax := time.Second
+	backoff := backoffMin
 	kmsPublicKey, errGetPublicKey := kmsClient.GetPublicKey(ctx, &kmspb.GetPublicKeyRequest{Name: cryptoKeyVersionName})
 	attempts := 1
 
@@ -1082,11 +1136,15 @@ func getPublicKeyFromCryptoKeyVersion(ctx context.Context, log hclog.Logger, kms
 		log.Warn("Could not get the public key because the CryptoKeyVersion is still being generated. Trying again.")
 		attempts++
 		kmsPublicKey, errGetPublicKey = kmsClient.GetPublicKey(ctx, &kmspb.GetPublicKeyRequest{Name: cryptoKeyVersionName})
+		if errGetPublicKey != nil {
+			backoff = min(backoff*2, backoffMax)
+			clk.Sleep(backoff)
+		}
 	}
 
 	// Perform integrity verification.
 	if int64(crc32Checksum([]byte(kmsPublicKey.Pem))) != kmsPublicKey.PemCrc32C.Value {
-		return nil, fmt.Errorf("response corrupted in-transit")
+		return nil, errors.New("response corrupted in-transit")
 	}
 
 	pemBlock, _ := pem.Decode([]byte(kmsPublicKey.Pem))
@@ -1096,48 +1154,6 @@ func getPublicKeyFromCryptoKeyVersion(ctx context.Context, log hclog.Logger, kms
 func makeFingerprint(pkixData []byte) string {
 	s := sha256.Sum256(pkixData)
 	return hex.EncodeToString(s[:])
-}
-
-// min returns the minimum of the provided time durations.
-func min(x, y time.Duration) time.Duration {
-	if x < y {
-		return x
-	}
-	return y
-}
-
-// parseAndValidateConfig returns an error if any configuration provided does
-// not meet acceptable criteria
-func parseAndValidateConfig(c string) (*Config, error) {
-	config := new(Config)
-
-	if err := hcl.Decode(config, c); err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "unable to decode configuration: %v", err)
-	}
-
-	if config.KeyRing == "" {
-		return nil, status.Error(codes.InvalidArgument, "configuration is missing the key ring")
-	}
-
-	if config.KeyMetadataFile == "" && config.KeyIdentifierFile == "" && config.KeyIdentifierValue == "" {
-		return nil, status.Error(codes.InvalidArgument, "configuration requires server id or server id file path")
-	}
-	if (config.KeyMetadataFile != "" || config.KeyIdentifierFile != "") && config.KeyIdentifierValue != "" {
-		return nil, status.Error(codes.InvalidArgument, "configuration must not contain both server id and server id file path")
-	}
-	if config.KeyMetadataFile != "" && config.KeyIdentifierFile != "" {
-		return nil, status.Error(codes.InvalidArgument, "configuration must not contain both 'key_identifier_file' and deprecated 'key_metadata_file'")
-	}
-	if config.KeyIdentifierValue != "" {
-		if !validateCharacters(config.KeyIdentifierValue) {
-			return nil, status.Error(codes.InvalidArgument, "Key identifier must contain only letters, numbers, underscores (_), and dashes (-)")
-		}
-		if len(config.KeyIdentifierValue) > 63 {
-			return nil, status.Error(codes.InvalidArgument, "Key identifier must not be longer than 63 characters")
-		}
-	}
-
-	return config, nil
 }
 
 func validateCharacters(str string) bool {

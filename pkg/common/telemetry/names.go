@@ -66,6 +66,9 @@ const (
 	// (server)
 	GetPublicKeys = "get_public_keys"
 
+	// JWTSVIDCacheSize is the gauge that holds the number of cached JWT-SVIDs
+	JWTSVIDCacheSize = "jwt_svid_cache_size"
+
 	// Keys related to keys used on HCL
 	Keys = "keys"
 
@@ -145,6 +148,12 @@ const (
 	// Agent SPIFFE ID
 	AgentID = "agent_id"
 
+	// AgentVersion is the version of the SPIRE agent
+	AgentVersion = "agent_version"
+
+	// AllowedIdentities tags the allowed identities of a verifier
+	AllowedIdentities = "allowed_identities"
+
 	// Attempt tags some count of attempts
 	Attempt = "attempt"
 
@@ -207,8 +216,23 @@ const (
 	// CertFilePath tags a certificate file path used for TLS connections.
 	CertFilePath = "cert_file_path"
 
+	// CertificateExpiration tags a certificate expiration time
+	CertificateExpiration = "certificate_expiration"
+
+	// ChainExpiration tags a certificate chain expiration time
+	ChainExpiration = "chain_expiration"
+
+	// KeyID tags a key ID
+	KeyID = "key_id"
+
 	// KeyFilePath tags a key file path used for TLS connections.
 	KeyFilePath = "key_file_path"
+
+	// KeyName tags the key name
+	KeyName = "key_name"
+
+	// KeyType tags the key type
+	KeyType = "key_type"
 
 	// CGroupPath tags a linux CGroup path, most likely for use in attestation
 	CGroupPath = "cgroup_path"
@@ -233,6 +257,9 @@ const (
 	// Count tags some basic count; should be used with other tags and clear messaging to add clarity
 	Count = "count"
 
+	// CurrentChainExpiration tags the current certificate chain expiration time
+	CurrentChainExpiration = "current_chain_expiration"
+
 	// CreatedAt tags registration entry creation date
 	CreatedAt = "created_at"
 
@@ -247,6 +274,21 @@ const (
 
 	// DatabaseType labels a database type (MySQL, postgres...)
 	DatabaseType = "db_type"
+
+	// Alert tags log events that should be easy for operators to alert on.
+	Alert = "alert"
+
+	// AlertType tags the category of an alert log event.
+	AlertType = "alert_type"
+
+	// ShortenedLifetimeAlertType tags alerts about potentially shortened credential lifetimes.
+	ShortenedLifetimeAlertType = "shortened_lifetime"
+
+	// DeprecatedConfigAlertType tags alerts for deprecated configuration settings.
+	DeprecatedConfigAlertType = "deprecated_config"
+
+	// DeprecatedServiceAlertType tags alerts for deprecated plugin services.
+	DeprecatedServiceAlertType = "deprecated_service"
 
 	// DeprecatedServiceName tags the deprecated service name
 	DeprecatedServiceName = "deprecated_service_name"
@@ -269,10 +311,10 @@ const (
 	// ElapsedTime tags some duration of time.
 	ElapsedTime = "elapsed_time"
 
-	// EntryAdded is the counter key for when a entry is added to LRU cache
+	// EntryAdded is the counter key for when an entry is added to LRU cache
 	EntryAdded = "lru_cache_entry_add"
 
-	// EntryRemoved is the counter key for when a entry is removed from LRU cache
+	// EntryRemoved is the counter key for when an entry is removed from LRU cache
 	EntryRemoved = "lru_cache_entry_remove"
 
 	// EntryUpdated is the counter key for when an LRU cache entry is updated
@@ -284,6 +326,9 @@ const (
 	// Error tag for some error that occurred. Limited usage, such as logging errors at
 	// non-error level.
 	Error = "error"
+
+	// EventID tags an event ID
+	EventID = "event_id"
 
 	// Expect tags an expected value, as opposed to the one received. Message should clarify
 	// what kind of value was expected, and a different field should show the received value
@@ -332,11 +377,17 @@ const (
 	// Generation represents an objection generation (i.e. version)
 	Generation = "generation"
 
+	// Hash tags a hash
+	Hash = "hash"
+
 	// Hint tags registration entry hint
 	Hint = "hint"
 
 	// IDType tags some type of ID (eg. registration ID, SPIFFE ID...)
 	IDType = "id_type"
+
+	// ImageID tags the image identifier in the format "repository@sha256:digest"
+	ImageID = "image_id"
 
 	// IssuedAt tags an issuance timestamp
 	IssuedAt = "issued_at"
@@ -347,8 +398,11 @@ const (
 	// JWTAuthorityExpiresAt tags a JWT Authority expiration
 	JWTAuthorityExpiresAt = "jwt_authority_expires_at"
 
-	// JWTAuthorityPublicKey tags a JWT authority key ID
+	// JWTAuthorityKeyID tags a JWT authority key ID
 	JWTAuthorityKeyID = "jwt_authority_key_id"
+
+	// JWTAuthorityKeyIDs tags a list of JWT authority key IDs
+	JWTAuthorityKeyIDs = "jwt_authority_key_ids"
 
 	// JWTAuthorityPublicKeySHA256 tags a JWT Authority public key
 	JWTAuthorityPublicKeySHA256 = "jwt_authority_public_key_sha256"
@@ -366,6 +420,9 @@ const (
 	// LocalAuthorityID tags a local authority ID
 	LocalAuthorityID = "local_authority_id"
 
+	// LoggerAPI functionality related to logger endpoints
+	LoggerAPI = "logger_api"
+
 	// Mode tags a bundle deletion mode
 	Mode = "mode"
 
@@ -374,6 +431,9 @@ const (
 
 	// Network tags some network name ("tcp", "udp")
 	Network = "network"
+
+	// NewHash tags a new hash
+	NewHash = "new_hash"
 
 	// NewSerialNumber tags a certificate new serial number
 	NewSerialNumber = "new_serial_num"
@@ -384,11 +444,11 @@ const (
 	// Nonce tags some nonce for communication
 	Nonce = "nonce"
 
+	// OldHash tags a hash
+	OldHash = "old_hash"
+
 	// ParentID tags parent ID for an entry
 	ParentID = "parent_id"
-
-	// PartialSelectors is a partial set of selectors for a workload
-	PartialSelectors = "partial_selectors"
 
 	// Path declares some logic path, likely on the file system
 	Path = "path"
@@ -411,6 +471,9 @@ const (
 	// PluginType tags type of some plugin
 	PluginType = "plugin_type"
 
+	// PreparedChainExpiration tags a prepared certificate chain expiration time
+	PreparedChainExpiration = "prepared_chain_expiration"
+
 	// PodUID tags some pod UID, most likely for use in attestation
 	PodUID = "pod_uid"
 
@@ -420,6 +483,9 @@ const (
 	// Pruned flagging something has been pruned
 	Pruned = "pruned"
 
+	// RateLimitExceeded tags a rate limit exceeded event
+	RateLimitExceeded = "rate_limit_exceeded"
+
 	// ReadOnly tags something read-only
 	ReadOnly = "read_only"
 
@@ -427,7 +493,7 @@ const (
 	Reason = "reason"
 
 	// Reattestable declares if the agent should reattest when its SVID expires
-	Reattestable = "rettestable"
+	Reattestable = "reattestable"
 
 	// Received tags a received value, as opposed to the one that is expected. Message should clarify
 	// what kind of value was received, and a different field should show the expected value.
@@ -445,6 +511,12 @@ const (
 	// RecordMapSize is the gauge key to hold the size of the LRU cache entries map
 	RecordMapSize = "lru_cache_record_map_size"
 
+	// Reconfigurable tags whether something is reconfigurable.
+	Reconfigurable = "reconfigurable"
+
+	// ReferenceType tags a workload reference type URL
+	ReferenceType = "reference_type"
+
 	// RefreshHint tags a bundle refresh hint
 	RefreshHint = "refresh_hint"
 
@@ -458,7 +530,7 @@ const (
 	// RegistrationEntry tags a registration entry
 	RegistrationEntry = "registration_entry"
 
-	// RegistrationEntryEvent is a notice a registration entry has been create, modified, or deleted
+	// RegistrationEntryEvent is a notice a registration entry has been created, modified, or deleted
 	RegistrationEntryEvent = "registration_entry_event"
 
 	// RequestID tags a request identifier
@@ -495,7 +567,7 @@ const (
 	// SelectorsRemoved labels some count of selectors that have been removed from an entity
 	SelectorsRemoved = "selectors_removed"
 
-	// SelfSigned tags whether or not some entity is self-signed
+	// SelfSigned tags whether some entity is self-signed
 	SelfSigned = "self_signed"
 
 	// SendJWTBundleLatency tags latency for sending JWT bundle
@@ -525,6 +597,12 @@ const (
 	// Subject tags some subject (likely a SPIFFE ID, and likely for a token); should be used
 	// with other tags to add clarity
 	Subject = "subject"
+
+	// SubjectKeyID tags a certificate subject key ID
+	SubjectKeyID = "subject_key_id"
+
+	// SubjectKeyIDs tags a list of subject key ID
+	SubjectKeyIDs = "subject_key_ids"
 
 	// SVIDMapSize is the gauge key for the size of the LRU cache SVID map
 	SVIDMapSize = "lru_cache_svid_map_size"
@@ -560,6 +638,26 @@ const (
 	// with other tags to add clarity
 	TTL = "ttl"
 
+	// TTLName identifies the configuration or request field containing a TTL.
+	TTLName = "ttl_name"
+
+	// CATTL is the configured CA/signing key lifetime, in seconds.
+	CATTL = "ca_ttl"
+
+	// RequestedTTL is the requested credential lifetime, in seconds.
+	RequestedTTL = "requested_ttl"
+
+	// EffectiveTTL is the usable credential lifetime, in seconds.
+	EffectiveTTL = "effective_ttl"
+
+	// MaxTTL functionality related to a maximum time-to-live field; should be
+	// used with other tags to add clarity
+	MaxTTL = "max_ttl"
+
+	// MaxExpiration functionality related to a maximum expiration field; should
+	// be used with other tags to add clarity
+	MaxExpiration = "max_expiration"
+
 	// X509 SVID TTL functionality related to a time-to-live field for X509-SVIDs; should be used
 	// with other tags to add clarity
 	X509SVIDTTL = "x509_svid_ttl"
@@ -567,6 +665,10 @@ const (
 	// JWT SVID TTL functionality related to a time-to-live field for JWT-SVIDs; should be used
 	// with other tags to add clarity
 	JWTSVIDTTL = "jwt_svid_ttl"
+
+	// WIT SVID TTL functionality related to a time-to-live field for WIT-SVIDs; should be used
+	// with other tags to add clarity
+	WITSVIDTTL = "wit_svid_ttl"
 
 	// Type tags a type
 	Type = "type"
@@ -584,6 +686,9 @@ const (
 	// with other tags to add clarity
 	Updated = "updated"
 
+	// UpstreamAuthorityID tags a signing authority ID
+	UpstreamAuthorityID = "upstream_authority_id"
+
 	// StoreSvid tags if entry is storable
 	StoreSvid = "store_svid"
 
@@ -592,6 +697,19 @@ const (
 
 	// VersionInfo tags some version information
 	VersionInfo = "version_info"
+
+	// WITAuthorityExpiresAt tags a WIT Authority expiration
+	WITAuthorityExpiresAt = "wit_authority_expires_at"
+
+	// WITAuthorityKeyID tags a WIT authority key ID
+	WITAuthorityKeyID = "wit_authority_key_id"
+
+	// WITAuthorityPublicKeySHA256 tags a WIT Authority public key
+	WITAuthorityPublicKeySHA256 = "wit_authority_public_key_sha256"
+
+	// WITKeys tags some count or list of WIT Keys. Should NEVER provide the actual keys, use
+	// Key IDs instead.
+	WITKeys = "wit_keys"
 
 	// WorkloadAttestation tags call of overall workload attestation
 	WorkloadAttestation = "workload_attestation"
@@ -638,6 +756,21 @@ const (
 
 	// Cache functionality related to a cache
 	Cache = "cache"
+
+	// AgentsByIDCache functionality related to the agent btree cache indexed by ID
+	AgentsByIDCache = "agents_by_id_cache"
+
+	// AgentsByExpiresAtCache functionality related to the agent btree cache indexed by ExpiresAt
+	AgentsByExpiresAtCache = "agents_by_expiresat_cache"
+
+	// NodeAliasesByEntryIDCache functionality related to the node-aliases btree cache indexed by EntryID
+	NodeAliasesByEntryIDCache = "nodealiases_by_entryid_cache"
+
+	// NodeAliasesBySelectorCache functionality related to the node-aliases btree cache indexed by Selector
+	NodeAliasesBySelectorCache = "nodealiases_by_selector_cache"
+
+	// EntriesByEntryIDCache functionality related to the entries btree cache indexed by EntryID
+	EntriesByEntryIDCache = "entries_by_entryid_cache"
 
 	// Cache type tag
 	CacheType = "cache_type"
@@ -705,6 +838,9 @@ const (
 	// NodeEvent functionality related to a node entity or type being created, updated, or deleted
 	NodeEvent = "node_event"
 
+	// NodeManager functionality related to managing expired node records
+	NodeManager = "node_manager"
+
 	// Notifier functionality related to some notifying entity; should be used with other tags
 	// to add clarity
 	Notifier = "notifier"
@@ -735,8 +871,21 @@ const (
 	// RegistrationManager functionality related to a registration manager
 	RegistrationManager = "registration_manager"
 
+	// TaintedJWTSVIDs tags tainted JWT SVID count/list
+	TaintedJWTSVIDs = "tainted_jwt_svids"
+
+	// TaintedX509SVIDs tags tainted X.509 SVID count/list
+	TaintedX509SVIDs = "tainted_x509_svids"
+
 	// Telemetry tags a telemetry module
 	Telemetry = "telemetry"
+
+	// WIT declares WIT-SVID type, clarifying metrics
+	WIT = "wit"
+
+	// WITKey functionality related to a WIT key; should be used with other tags
+	// to add clarity. Should NEVER actually provide the key itself, use Key ID instead.
+	WITKey = "wit_key"
 
 	// X509CA functionality related to an x509 CA; should be used with other tags
 	// to add clarity
@@ -759,6 +908,9 @@ const (
 
 	// AuthorizeCall functionality related to authorizing an incoming call
 	AuthorizeCall = "authorize_call"
+
+	// BrokerAPI functionality related to broker endpoints
+	BrokerAPI = "broker_api"
 
 	// CreateFederatedBundle functionality related to creating a federated bundle
 	CreateFederatedBundle = "create_federated_bundle"
@@ -837,8 +989,11 @@ const (
 	// ListAgents functionality related to listing agents
 	ListAgents = "list_agents"
 
-	// CountEntries functionality related to counting all registration entries
-	CountEntries = "count_entries"
+	// SkippedEntryEventIDs functionality related to counting missed entry event IDs
+	SkippedEntryEventIDs = "skipped_entry_event_ids"
+
+	// SkippedNodeEventIDs functionality related to counting missed node event IDs
+	SkippedNodeEventIDs = "skipped_node_event_ids"
 
 	// ListAllEntriesWithPages functionality related to listing all registration entries with pagination
 	ListAllEntriesWithPages = "list_all_entries_with_pages"
@@ -869,6 +1024,12 @@ const (
 
 	// PushJWTKeyUpstream functionality related to pushing a public JWT Key to an upstream server.
 	PushJWTKeyUpstream = "push_jwtkey_upstream"
+
+	// ProcessTaintedX509SVIDs functionality related to processing tainted X.509 SVIDs.
+	ProcessTaintedX509SVIDs = "process_tainted_x509_svids"
+
+	// ProcessTaintedJWTSVIDs functionality related to processing tainted JWT SVIDs.
+	ProcessTaintedJWTSVIDs = "process_tainted_jwt_svids"
 
 	// SDSAPI functionality related to SDS; should be used with other tags
 	// to add clarity

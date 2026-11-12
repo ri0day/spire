@@ -18,6 +18,7 @@ import (
 	plugintypes "github.com/spiffe/spire-plugin-sdk/proto/spire/plugin/types"
 	configv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/service/common/config/v1"
 	"github.com/spiffe/spire/pkg/common/catalog"
+	"github.com/spiffe/spire/pkg/common/pluginconf"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	admissionv1 "k8s.io/api/admissionregistration/v1"
@@ -63,9 +64,21 @@ type cluster struct {
 	KubeConfigFilePath string `hcl:"kube_config_file_path"`
 }
 
-type pluginConfig struct {
+type Configuration struct {
 	cluster  `hcl:",squash"` // for hcl v2 it should be `hcl:",remain"`
 	Clusters []cluster       `hcl:"clusters"`
+}
+
+func buildConfig(coreConfig catalog.CoreConfig, hclText string, status *pluginconf.Status) *Configuration {
+	newConfig := new(Configuration)
+	if err := hcl.Decode(newConfig, hclText); err != nil {
+		status.ReportError("plugin configuration is malformed")
+		return nil
+	}
+
+	// TODO: move some of the Configure func stuff here.
+
+	return newConfig
 }
 
 type Plugin struct {
@@ -74,13 +87,13 @@ type Plugin struct {
 
 	mu               sync.RWMutex
 	log              hclog.Logger
-	config           *pluginConfig
+	config           *Configuration
 	identityProvider identityproviderv1.IdentityProviderServiceClient
 	clients          []kubeClient
 	stopCh           chan struct{}
 
 	hooks struct {
-		newKubeClients   func(c *pluginConfig) ([]kubeClient, error)
+		newKubeClients   func(c *Configuration) ([]kubeClient, error)
 		informerCallback informerCallback
 	}
 }
@@ -124,39 +137,49 @@ func (p *Plugin) NotifyAndAdvise(ctx context.Context, req *notifierv1.NotifyAndA
 }
 
 func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) (resp *configv1.ConfigureResponse, err error) {
-	config := new(pluginConfig)
-	if err := hcl.Decode(&config, req.HclConfiguration); err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "unable to decode configuration: %v", err)
+	newConfig, _, err := pluginconf.Build(req, buildConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	if hasRootCluster(&newConfig.cluster) || !hasRootCluster(&newConfig.cluster) && !hasMultipleClusters(newConfig.Clusters) {
+		setDefaultValues(&newConfig.cluster)
 	}
 
 	// root set with at least one value or the whole configuration is empty
-	if hasRootCluster(&config.cluster) || !hasRootCluster(&config.cluster) && !hasMultipleClusters(config.Clusters) {
-		setDefaultValues(&config.cluster)
-	}
-	for i := range config.Clusters {
-		if config.Clusters[i].KubeConfigFilePath == "" {
+	for i := range newConfig.Clusters {
+		if newConfig.Clusters[i].KubeConfigFilePath == "" {
 			return nil, status.Error(codes.InvalidArgument, "cluster configuration is missing kube_config_file_path")
 		}
-		setDefaultValues(&config.Clusters[i])
+		setDefaultValues(&newConfig.Clusters[i])
 	}
 
-	clients, err := p.hooks.newKubeClients(config)
+	clients, err := p.hooks.newKubeClients(newConfig)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "unable to create new kubeClients: %v", err)
 	}
 
 	stopCh := make(chan struct{})
-	if err = p.startInformers(ctx, config, clients, stopCh); err != nil {
+	if err = p.startInformers(ctx, newConfig, clients, stopCh); err != nil {
 		close(stopCh)
 		return nil, status.Errorf(codes.Internal, "unable to start informers: %v", err)
 	}
 
-	p.setConfig(config, clients, stopCh)
+	p.setConfig(newConfig, clients, stopCh)
 	return &configv1.ConfigureResponse{}, nil
 }
 
+func (p *Plugin) Validate(_ context.Context, req *configv1.ValidateRequest) (*configv1.ValidateResponse, error) {
+	_, notes, err := pluginconf.Build(req, buildConfig)
+
+	return &configv1.ValidateResponse{
+		Valid: err == nil,
+		Notes: notes,
+	}, nil
+}
+
 // startInformers creates informers to set CA Bundle in objects created after server has started
-func (p *Plugin) startInformers(ctx context.Context, config *pluginConfig, clients []kubeClient, stopCh chan struct{}) error {
+func (p *Plugin) startInformers(ctx context.Context, config *Configuration, clients []kubeClient, stopCh chan struct{}) error {
 	if config.WebhookLabel != "" || config.APIServiceLabel != "" {
 		informerSynced := []cache.InformerSynced{}
 		for _, client := range clients {
@@ -177,7 +200,7 @@ func (p *Plugin) startInformers(ctx context.Context, config *pluginConfig, clien
 	return nil
 }
 
-func (p *Plugin) setConfig(config *pluginConfig, clients []kubeClient, stopCh chan struct{}) {
+func (p *Plugin) setConfig(config *Configuration, clients []kubeClient, stopCh chan struct{}) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -211,33 +234,33 @@ func (p *Plugin) updateBundles(ctx context.Context) (err error) {
 		return err
 	}
 
-	var updateErrs string
+	var updateErrs strings.Builder
 	for _, client := range clients {
 		list, err := client.GetList(ctx)
 		if err != nil {
-			updateErrs += fmt.Sprintf("unable to get list: %v, ", err)
+			fmt.Fprintf(&updateErrs, "unable to get list: %v, ", err)
 			continue
 		}
 		listItems, err := meta.ExtractList(list)
 		if err != nil {
-			updateErrs += fmt.Sprintf("unable to extract list items: %v, ", err)
+			fmt.Fprintf(&updateErrs, "unable to extract list items: %v, ", err)
 			continue
 		}
 		for _, item := range listItems {
 			itemMeta, err := meta.Accessor(item)
 			if err != nil {
-				updateErrs += fmt.Sprintf("unable to extract metadata for item: %v, ", err)
+				fmt.Fprintf(&updateErrs, "unable to extract metadata for item: %v, ", err)
 				continue
 			}
 			err = p.updateBundle(ctx, client, itemMeta.GetNamespace(), itemMeta.GetName())
 			if err != nil && status.Code(err) != codes.AlreadyExists {
-				updateErrs += fmt.Sprintf("%s: %v, ", namespacedName(itemMeta), err)
+				fmt.Fprintf(&updateErrs, "%s: %v, ", namespacedName(itemMeta), err)
 			}
 		}
 	}
 
-	if len(updateErrs) > 0 {
-		return status.Errorf(codes.Internal, "unable to update: %s", strings.TrimSuffix(updateErrs, ", "))
+	if updateErrs.Len() > 0 {
+		return status.Errorf(codes.Internal, "unable to update: %s", strings.TrimSuffix(updateErrs.String(), ", "))
 	}
 	return nil
 }
@@ -293,9 +316,9 @@ func (p *Plugin) informerCallback(client kubeClient, obj runtime.Object) {
 	case err == nil:
 		p.log.Debug("Set bundle for object", "name", objectMeta.GetName())
 	case status.Code(err) == codes.FailedPrecondition:
-		// Ignore FailPrecondition errors for when SPIRE is booting and we receive an event prior to
+		// Ignore FailPrecondition errors for when SPIRE is booting, and we receive an event prior to
 		// IdentityProvider being initialized. In this case the BundleLoaded event will come
-		// to populate the caBundle, so its safe to ignore this error.
+		// to populate the caBundle, so it's safe to ignore this error.
 	case status.Code(err) == codes.AlreadyExists:
 		// Updating the bundle from an ADD event triggers a subsequent MODIFIED event. updateBundle will
 		// return AlreadyExists since nothing needs to be updated.
@@ -304,7 +327,7 @@ func (p *Plugin) informerCallback(client kubeClient, obj runtime.Object) {
 	}
 }
 
-func newKubeClients(c *pluginConfig) ([]kubeClient, error) {
+func newKubeClients(c *Configuration) ([]kubeClient, error) {
 	clients := []kubeClient{}
 
 	if hasRootCluster(&c.cluster) {
@@ -456,9 +479,7 @@ func (c configMapClient) CreatePatch(_ context.Context, obj runtime.Object, resp
 		return nil, status.Errorf(codes.InvalidArgument, "wrong type, expecting ConfigMap")
 	}
 	return &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			ResourceVersion: configMap.ResourceVersion,
-		},
+		ResourceVersion: configMap.ResourceVersion,
 		Data: map[string]string{
 			c.configMapKey: bundleData(resp.Bundle),
 		},
@@ -503,9 +524,7 @@ func (c apiServiceClient) CreatePatch(_ context.Context, obj runtime.Object, res
 	}
 
 	patch := &apiregistrationv1.APIService{
-		ObjectMeta: metav1.ObjectMeta{
-			ResourceVersion: apiService.ResourceVersion,
-		},
+		ResourceVersion: apiService.ResourceVersion,
 		Spec: apiregistrationv1.APIServiceSpec{
 			CABundle:             []byte(bundleData(resp.Bundle)),
 			GroupPriorityMinimum: apiService.Spec.GroupPriorityMinimum,
@@ -575,9 +594,7 @@ func (c mutatingWebhookClient) CreatePatch(_ context.Context, obj runtime.Object
 	}
 
 	patch := &admissionv1.MutatingWebhookConfiguration{
-		ObjectMeta: metav1.ObjectMeta{
-			ResourceVersion: mutatingWebhook.ResourceVersion,
-		},
+		ResourceVersion: mutatingWebhook.ResourceVersion,
 	}
 	patch.Webhooks = make([]admissionv1.MutatingWebhook, len(mutatingWebhook.Webhooks))
 
@@ -649,9 +666,7 @@ func (c validatingWebhookClient) CreatePatch(_ context.Context, obj runtime.Obje
 	}
 
 	patch := &admissionv1.ValidatingWebhookConfiguration{
-		ObjectMeta: metav1.ObjectMeta{
-			ResourceVersion: validatingWebhook.ResourceVersion,
-		},
+		ResourceVersion: validatingWebhook.ResourceVersion,
 	}
 	patch.Webhooks = make([]admissionv1.ValidatingWebhook, len(validatingWebhook.Webhooks))
 

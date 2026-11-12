@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/spiffe/spire/pkg/common/catalog"
+	"github.com/spiffe/spire/pkg/common/coretypes/x509certificate"
 	"github.com/spiffe/spire/proto/spire/common"
 )
 
@@ -20,7 +21,7 @@ type UpstreamAuthority interface {
 	// closed when the caller is no longer interested in updates. If the
 	// upstream authority does not support streaming updates, the stream will
 	// return io.EOF when called.
-	MintX509CA(ctx context.Context, csr []byte, preferredTTL time.Duration) (x509CA, upstreamX509Authorities []*x509.Certificate, stream UpstreamX509AuthorityStream, err error)
+	MintX509CA(ctx context.Context, csr []byte, preferredTTL time.Duration) (x509CA []*x509.Certificate, upstreamX509Authorities []*x509certificate.X509Authority, stream UpstreamX509AuthorityStream, err error)
 
 	// PublishJWTKey publishes the given JWT key with the upstream authority.
 	// Support for this method is optional. Implementations that do not support
@@ -31,6 +32,26 @@ type UpstreamAuthority interface {
 	// the upstream authority does not support streaming updates, the stream
 	// will return io.EOF when called.
 	PublishJWTKey(ctx context.Context, jwtKey *common.PublicKey) (jwtAuthorities []*common.PublicKey, stream UpstreamJWTAuthorityStream, err error)
+
+	// PublishWITKey publishes the given WIT key with the upstream authority.
+	// Support for this method is optional. Implementations that do not support
+	// publishing WIT keys upstream return NotImplemented.
+	// The function returns the latest set of upstream WIT authorities and a
+	// stream for streaming upstream WIT authority updates. The returned stream
+	// MUST be closed when the caller is no longer interested in updates. If
+	// the upstream authority does not support streaming updates, the stream
+	// will return io.EOF when called.
+	PublishWITKey(ctx context.Context, witKey *common.PublicKey) (witAuthorities []*common.PublicKey, stream UpstreamWITAuthorityStream, err error)
+
+	// SubscribeToLocalBundle can be used to sync the local trust bundle with
+	// the upstream trust bundle.
+	// Support for this method is optional but strongly recommended.
+	// The function returns the latest set of upstream authorities and a
+	// stream for streaming upstream authority updates. The returned stream
+	// MUST be closed when the caller is no longer interested in updates. If
+	// the upstream authority does not support streaming updates, the stream
+	// will return io.EOF when called.
+	SubscribeToLocalBundle(ctx context.Context) (x509CAs []*x509certificate.X509Authority, jwtAuthorities []*common.PublicKey, witAuthorities []*common.PublicKey, stream LocalBundleUpdateStream, err error)
 }
 
 type UpstreamX509AuthorityStream interface {
@@ -39,7 +60,7 @@ type UpstreamX509AuthorityStream interface {
 	// method is called, or the context originally passed into MintX509CA is
 	// canceled. If the function returns an error, no more updates will be
 	// available over the stream.
-	RecvUpstreamX509Authorities() ([]*x509.Certificate, error)
+	RecvUpstreamX509Authorities() ([]*x509certificate.X509Authority, error)
 
 	// Close() closes the stream. It MUST be called by callers of MintX509CA
 	// when they are done with the stream.
@@ -47,14 +68,40 @@ type UpstreamX509AuthorityStream interface {
 }
 
 type UpstreamJWTAuthorityStream interface {
-	// RecvUpstreamJWTAuthorities returns the latest set of upstream X.509
+	// RecvUpstreamJWTAuthorities returns the latest set of upstream JWT
 	// authorities. The call blocks until the update is received, the Close()
-	// method is called, or the context originally passed into MintX509CA is
+	// method is called, or the context originally passed into PublishJWTKey is
 	// canceled. If the function returns an error, no more updates will be
 	// available over the stream.
 	RecvUpstreamJWTAuthorities() ([]*common.PublicKey, error)
 
 	// Close() closes the stream. It MUST be called by callers of PublishJWTKey
+	// when they are done with the stream.
+	Close()
+}
+
+type UpstreamWITAuthorityStream interface {
+	// RecvUpstreamWITAuthorities returns the latest set of upstream WIT
+	// authorities. The call blocks until the update is received, the Close()
+	// method is called, or the context originally passed into PublishWITKey is
+	// canceled. If the function returns an error, no more updates will be
+	// available over the stream.
+	RecvUpstreamWITAuthorities() ([]*common.PublicKey, error)
+
+	// Close() closes the stream. It MUST be called by callers of PublishWITKey
+	// when they are done with the stream.
+	Close()
+}
+
+type LocalBundleUpdateStream interface {
+	// RecvLocalBundleUpdate returns the latest local trust domain bundle
+	// The call blocks until the update is received, the Close()
+	// method is called, or the context originally passed into GetTrustBundle is
+	// canceled. If the function returns an error, no more updates will be
+	// available over the stream.
+	RecvLocalBundleUpdate() (x509CAs []*x509certificate.X509Authority, jwtAuthorities []*common.PublicKey, witAuthorities []*common.PublicKey, err error)
+
+	// Close() closes the stream. It MUST be called by callers of GetTrustBundle
 	// when they are done with the stream.
 	Close()
 }

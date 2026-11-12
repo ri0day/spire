@@ -18,6 +18,7 @@ import (
 
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/spire/pkg/common/catalog"
+	"github.com/spiffe/spire/pkg/common/coretypes/x509certificate"
 	"github.com/spiffe/spire/pkg/common/cryptoutil"
 	"github.com/spiffe/spire/pkg/common/pemutil"
 	"github.com/spiffe/spire/pkg/common/x509svid"
@@ -121,7 +122,6 @@ func TestMintX509CA(t *testing.T) {
 			expectedX509Authorities: []string{"spiffe://root"},
 		},
 	} {
-		tt := tt
 		t.Run(tt.test, func(t *testing.T) {
 			p := New()
 			p.clock = testData.Clock
@@ -163,7 +163,7 @@ func TestMintX509CA(t *testing.T) {
 				assert.Equal(t, tt.expectTTL, ttl, "TTL does not match")
 			}
 			assert.Equal(t, tt.expectX509CA, certChainURIs(x509CA))
-			assert.Equal(t, tt.expectedX509Authorities, certChainURIs(x509Authorities))
+			assert.Equal(t, tt.expectedX509Authorities, authChainURIs(x509Authorities))
 
 			// Plugin does not support streaming back changes so assert the
 			// stream returns EOF.
@@ -192,6 +192,11 @@ func TestPublishJWTKey(t *testing.T) {
 	spiretest.RequireGRPCStatus(t, err, codes.Unimplemented, "upstreamauthority(disk): publishing upstream is unsupported")
 	assert.Nil(t, jwtAuthorities)
 	assert.Nil(t, stream)
+
+	witAuthorities, witStream, err := ua.PublishWITKey(context.Background(), &common.PublicKey{Kid: "ID", PkixBytes: pkixBytes})
+	spiretest.RequireGRPCStatus(t, err, codes.Unimplemented, "upstreamauthority(disk): publishing upstream is unsupported")
+	assert.Nil(t, witAuthorities)
+	assert.Nil(t, witStream)
 }
 
 func TestConfigure(t *testing.T) {
@@ -295,7 +300,7 @@ func TestConfigure(t *testing.T) {
 			test:            "malformed config",
 			overrideConfig:  "MALFORMED",
 			expectCode:      codes.InvalidArgument,
-			expectMsgPrefix: "unable to decode configuration: ",
+			expectMsgPrefix: "plugin configuration is malformed",
 		},
 		{
 			test:               "missing trust domain",
@@ -303,10 +308,9 @@ func TestConfigure(t *testing.T) {
 			keyFilePath:        testData.ECRootKey,
 			overrideCoreConfig: &catalog.CoreConfig{},
 			expectCode:         codes.InvalidArgument,
-			expectMsgPrefix:    "trust_domain is required",
+			expectMsgPrefix:    "server core configuration must contain trust_domain",
 		},
 	} {
-		tt := tt
 		t.Run(tt.test, func(t *testing.T) {
 			var err error
 
@@ -342,6 +346,14 @@ func certChainURIs(chain []*x509.Certificate) []string {
 	var uris []string
 	for _, cert := range chain {
 		uris = append(uris, certURI(cert))
+	}
+	return uris
+}
+
+func authChainURIs(chain []*x509certificate.X509Authority) []string {
+	var uris []string
+	for _, authority := range chain {
+		uris = append(uris, certURI(authority.Certificate))
 	}
 	return uris
 }

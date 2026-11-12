@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -12,25 +11,26 @@ import (
 	"github.com/andres-erbsen/clock"
 	"github.com/sirupsen/logrus"
 	"github.com/spiffe/spire/pkg/common/telemetry"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 const (
-	// testDialTimeout is the duration to wait for a test dial
-	testDialTimeout = 30 * time.Second
-
-	readyCheckInterval = time.Minute
+	readyCheckInterval        = time.Minute
+	readyCheckFailureInterval = time.Second
+	failureLogInterval        = time.Minute
 )
 
 // State is the health state of a subsystem.
 type State struct {
-	// Live is whether or not the subsystem is live (i.e. in a good state
+	// Started is whether the subsystem is finished starting.
+	// if undefined, it is treated as started=true.
+	Started *bool
+
+	// Live is whether the subsystem is live (i.e. in a good state
 	// or in a state it can recover from while remaining alive). Global
 	// liveness is only reported true if all subsystems report live.
 	Live bool
 
-	// Ready is whether or not the subsystem is ready (i.e. ready to perform
+	// Ready is whether the subsystem is ready (i.e. ready to perform
 	// its function). Global readiness is only reported true if all subsystems
 	// report ready.
 	Ready bool
@@ -68,6 +68,9 @@ func NewChecker(config Config, log logrus.FieldLogger) ServableChecker {
 		log:    l,
 
 		cache: newCache(l, clock.New()),
+	}
+	if config.CheckInterval > 0 {
+		c.cache.checkInterval = config.CheckInterval
 	}
 
 	// Start HTTP server if ListenerEnabled is true
@@ -115,76 +118,58 @@ func (c *checker) ListenAndServe(ctx context.Context) error {
 
 	var wg sync.WaitGroup
 	if c.config.ListenerEnabled {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			c.log.WithField("address", c.server.Addr).Info("Serving health checks")
 			if err := c.server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 				c.log.WithError(err).Warn("Error serving health checks")
 			}
-		}()
+		})
 	}
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		<-ctx.Done()
 		if c.server != nil {
 			_ = c.server.Close()
 		}
-	}()
+	})
 
 	wg.Wait()
 
 	return nil
 }
 
-// WaitForTestDial tries to create a client connection to the given target
-// with a blocking dial and a timeout specified in testDialTimeout.
-// Nothing is done with the connection, which is just closed in case it
-// is created.
-func WaitForTestDial(ctx context.Context, addr net.Addr) {
-	ctx, cancel := context.WithTimeout(ctx, testDialTimeout)
-	defer cancel()
+// StartedState returns the global startup state.
+func (c *checker) StartedState() bool {
+	startup, _, _, _, _ := c.checkStates()
 
-	conn, err := grpc.DialContext(ctx,
-		addr.String(),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithContextDialer(func(ctx context.Context, name string) (net.Conn, error) {
-			return net.DialUnix("unix", nil, &net.UnixAddr{
-				Net:  "unix",
-				Name: name,
-			})
-		}),
-		grpc.WithBlock())
-	if err != nil {
-		return
-	}
-
-	_ = conn.Close()
+	return startup
 }
 
 // LiveState returns the global live state and details.
 func (c *checker) LiveState() (bool, any) {
-	live, _, details, _ := c.checkStates()
+	_, live, _, details, _ := c.checkStates()
 
 	return live, details
 }
 
 // ReadyState returns the global ready state and details.
 func (c *checker) ReadyState() (bool, any) {
-	_, ready, _, details := c.checkStates()
+	_, _, ready, _, details := c.checkStates()
 
 	return ready, details
 }
 
-func (c *checker) checkStates() (bool, bool, any, any) {
-	isLive, isReady := true, true
+func (c *checker) checkStates() (bool, bool, bool, any, any) {
+	isStarted, isLive, isReady := true, true, true
 
 	liveDetails := make(map[string]any)
 	readyDetails := make(map[string]any)
 	for subsystemName, subsystemState := range c.cache.getStatuses() {
 		state := subsystemState.details
+		if state.Started != nil {
+			isStarted = *state.Started
+		}
+
 		if !state.Live {
 			isLive = false
 		}
@@ -197,7 +182,7 @@ func (c *checker) checkStates() (bool, bool, any, any) {
 		readyDetails[subsystemName] = state.ReadyDetails
 	}
 
-	return isLive, isReady, liveDetails, readyDetails
+	return isStarted, isLive, isReady, liveDetails, readyDetails
 }
 
 func (c *checker) liveHandler(w http.ResponseWriter, _ *http.Request) {

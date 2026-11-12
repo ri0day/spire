@@ -7,8 +7,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/open-policy-agent/opa/storage/inmem"
-	"github.com/open-policy-agent/opa/util"
+	"github.com/open-policy-agent/opa/v1/storage/inmem"
+	"github.com/open-policy-agent/opa/v1/util"
+	"github.com/sirupsen/logrus/hooks/test"
 	"github.com/spiffe/spire/pkg/server/authpolicy"
 	"github.com/stretchr/testify/require"
 )
@@ -130,6 +131,25 @@ func TestPolicy(t *testing.T) {
 			},
 		},
 		{
+			name:     "test policy with input caller path",
+			rego:     condCheckRego("input.caller_file_path == \"/some_caller\""),
+			jsonData: "{}",
+			input: authpolicy.Input{
+				CallerFilePath: "/some_caller",
+				FullMethod:     "some_method",
+				Req: map[string]any{
+					"some_field": "abc",
+				},
+			},
+			expectResult: authpolicy.Result{
+				Allow:             true,
+				AllowIfAdmin:      false,
+				AllowIfLocal:      false,
+				AllowIfDownstream: false,
+				AllowIfAgent:      false,
+			},
+		},
+		{
 			name:     "test policy with input full method",
 			rego:     condCheckRego("input.full_method == \"some_method\""),
 			jsonData: "{}",
@@ -209,7 +229,6 @@ func TestPolicy(t *testing.T) {
 			},
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			var json map[string]any
 			err := util.UnmarshalJSON([]byte(tt.jsonData), &json)
@@ -230,11 +249,11 @@ func TestPolicy(t *testing.T) {
 
 			// Check with NewEngineFromConfigOrDefault
 			regoFile := filepath.Join(tmpDir, "rego_file")
-			err = os.WriteFile(regoFile, []byte(tt.rego), 0600)
+			err = os.WriteFile(regoFile, []byte(tt.rego), 0o600)
 			require.Nil(t, err, "failed to create rego_file")
 
 			permsFile := filepath.Join(tmpDir, "perms_file")
-			err = os.WriteFile(permsFile, []byte(tt.jsonData), 0600)
+			err = os.WriteFile(permsFile, []byte(tt.jsonData), 0o600)
 			require.Nil(t, err, "failed to create perms_file")
 
 			ec := authpolicy.OpaEngineConfig{
@@ -243,7 +262,8 @@ func TestPolicy(t *testing.T) {
 					PolicyDataPath: permsFile,
 				},
 			}
-			pe, err = authpolicy.NewEngineFromConfigOrDefault(ctx, &ec)
+			log, _ := test.NewNullLogger()
+			pe, err = authpolicy.NewEngineFromConfigOrDefault(ctx, log, &ec)
 
 			require.Nil(t, err, "failed to create policy engine")
 
@@ -271,20 +291,20 @@ func TestNewEngineFromConfig(t *testing.T) {
 
 	// Create good policy/perms files
 	validRegoFile := filepath.Join(tmpDir, "valid_rego_file")
-	err = os.WriteFile(validRegoFile, []byte(rego), 0600)
+	err = os.WriteFile(validRegoFile, []byte(rego), 0o600)
 	require.Nil(t, err, "failed to create valid_rego_file")
 
 	validPermsFile := filepath.Join(tmpDir, "valid_perms_file")
-	err = os.WriteFile(validPermsFile, []byte(jsonData), 0600)
+	err = os.WriteFile(validPermsFile, []byte(jsonData), 0o600)
 	require.Nil(t, err, "failed to create valid_perms_file")
 
 	// Create bad policy/perms files
 	invalidRegoFile := filepath.Join(tmpDir, "invalid_rego_file")
-	err = os.WriteFile(invalidRegoFile, []byte("invalid rego"), 0600)
+	err = os.WriteFile(invalidRegoFile, []byte("invalid rego"), 0o600)
 	require.Nil(t, err, "failed to create invalid_rego_file")
 
 	invalidPermsFile := filepath.Join(tmpDir, "invalid_perms_file")
-	err = os.WriteFile(invalidPermsFile, []byte("{"), 0600)
+	err = os.WriteFile(invalidPermsFile, []byte("{"), 0o600)
 	require.Nil(t, err, "failed to create invalid_perms_file")
 
 	// Create permissions tmp file
@@ -386,11 +406,11 @@ func TestNewEngineFromConfig(t *testing.T) {
 			success: false,
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := context.Background()
 
-			_, err := authpolicy.NewEngineFromConfigOrDefault(ctx, tt.ec)
+			log, _ := test.NewNullLogger()
+			_, err := authpolicy.NewEngineFromConfigOrDefault(ctx, log, tt.ec)
 			require.Equal(t, err == nil, tt.success)
 		})
 	}
@@ -418,14 +438,13 @@ func TestNewEngineFromRego(t *testing.T) {
 			// We can't test for Eval failure because NewEngine is designed to
 			// validate the policy so that it will not fail later on during
 			// Eval, so failures of Eval will be purely system exceptions.
-			// Instead we test the cases that would fail Eval by testing the
+			// Instead, we test the cases that would fail Eval by testing the
 			// creation of the new engine.
 			name:    "test validation of SPIRE required fields",
 			rego:    badEvalPolicy,
 			success: false,
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := context.Background()
 			// Just create arbitrary store since there isn't a way to create
@@ -435,6 +454,24 @@ func TestNewEngineFromRego(t *testing.T) {
 			_, err := authpolicy.NewEngineFromRego(ctx, tt.rego, store)
 			require.Equal(t, err == nil, tt.success)
 		})
+	}
+}
+
+func BenchmarkOpaPolicy(b *testing.B) {
+	auth, err := authpolicy.NewEngineFromConfigOrDefault(b.Context(), nil, nil)
+	require.NoError(b, err)
+
+	input := authpolicy.Input{
+		Caller:         "spiffe://example.org/spire/agent/make/it/a/bit/longer",
+		CallerFilePath: "/opt/spire/bin/spire-server",
+		FullMethod:     "/spire.api.server.svid.v1.SVID/BatchNewX509SVID",
+		Req: map[string]string{
+			"foo": "bar",
+		},
+	}
+	for b.Loop() {
+		_, err := auth.Eval(b.Context(), input)
+		require.NoError(b, err)
 	}
 }
 
@@ -450,7 +487,7 @@ func condCheckRego(cond string) string {
     }
     default allow = false
 
-    allow=true {
+    allow=true if {
         %s
     }
     `
@@ -479,7 +516,7 @@ var badEvalPolicy = `
     }
     default allow = false
 
-    allow=true {
+    allow=true if {
         %s
     }
     `

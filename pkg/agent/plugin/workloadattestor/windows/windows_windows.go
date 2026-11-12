@@ -6,12 +6,14 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/hcl"
 	workloadattestorv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/plugin/agent/workloadattestor/v1"
 	configv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/service/common/config/v1"
 	"github.com/spiffe/spire/pkg/common/catalog"
+	"github.com/spiffe/spire/pkg/common/pluginconf"
 	"github.com/spiffe/spire/pkg/common/telemetry"
 	"github.com/spiffe/spire/pkg/common/util"
 	"golang.org/x/sys/windows"
@@ -32,8 +34,19 @@ func New() *Plugin {
 }
 
 type Configuration struct {
-	DiscoverWorkloadPath bool  `hcl:"discover_workload_path"`
-	WorkloadSizeLimit    int64 `hcl:"workload_size_limit"`
+	DiscoverWorkloadPath      bool  `hcl:"discover_workload_path"`
+	WorkloadSizeLimit         int64 `hcl:"workload_size_limit"`
+	DisableGroupNameSelectors bool  `hcl:"disable_group_name_selectors"`
+}
+
+func buildConfig(coreConfig catalog.CoreConfig, hclText string, status *pluginconf.Status) *Configuration {
+	newConfig := new(Configuration)
+	if err := hcl.Decode(newConfig, hclText); err != nil {
+		status.ReportErrorf("failed to decode configuration: %v", err)
+		return nil
+	}
+
+	return newConfig
 }
 
 type Plugin struct {
@@ -66,7 +79,7 @@ func (p *Plugin) Attest(_ context.Context, req *workloadattestorv1.AttestRequest
 		return nil, err
 	}
 
-	process, err := p.newProcessInfo(req.Pid, config.DiscoverWorkloadPath)
+	process, err := p.newProcessInfo(req.Pid, config.DiscoverWorkloadPath, config.DisableGroupNameSelectors)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to get process information: %v", err)
 	}
@@ -101,7 +114,14 @@ func (p *Plugin) Attest(_ context.Context, req *workloadattestorv1.AttestRequest
 	}, nil
 }
 
-func (p *Plugin) newProcessInfo(pid int32, queryPath bool) (*processInfo, error) {
+// AttestReference returns Unimplemented. This plugin does not handle
+// reference-based workload attestation; the host falls back to PID-based
+// Attest when the reference is a WorkloadPIDReference.
+func (p *Plugin) AttestReference(_ context.Context, _ *workloadattestorv1.AttestReferenceRequest) (*workloadattestorv1.AttestReferenceResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "AttestReference not implemented")
+}
+
+func (p *Plugin) newProcessInfo(pid int32, queryPath bool, disableGroupNames bool) (*processInfo, error) {
 	p.log = p.log.With(telemetry.PID, pid)
 
 	h, err := p.q.OpenProcess(pid)
@@ -149,6 +169,7 @@ func (p *Plugin) newProcessInfo(pid int32, queryPath bool) (*processInfo, error)
 	}
 	groups := p.q.AllGroups(tokenGroups)
 
+	start := time.Now()
 	for _, group := range groups {
 		// Each group has a set of attributes that control how
 		// the system uses the SID in an access check.
@@ -156,13 +177,18 @@ func (p *Plugin) newProcessInfo(pid int32, queryPath bool) (*processInfo, error)
 		// https://docs.microsoft.com/en-us/windows/win32/secauthz/sid-attributes-in-an-access-token
 		enabledSelector := getGroupEnabledSelector(group.Attributes)
 		processInfo.groupsSIDs = append(processInfo.groupsSIDs, enabledSelector+":"+group.Sid.String())
-		groupAccount, groupDomain, err := p.q.LookupAccount(group.Sid)
-		if err != nil {
-			p.log.Warn("failed to lookup account from group SID", "sid", group.Sid, "error", err)
-			continue
+		if !disableGroupNames {
+			groupAccount, groupDomain, err := p.q.LookupAccount(group.Sid)
+			if err != nil {
+				p.log.Warn("failed to lookup account from group SID", "sid", group.Sid, "error", err)
+				continue
+			}
+			// If the LookupAccount call succeeded, we know that groupAccount is not empty
+			processInfo.groups = append(processInfo.groups, enabledSelector+":"+parseAccount(groupAccount, groupDomain))
 		}
-		// If the LookupAccount call succeeded, we know that groupAccount is not empty
-		processInfo.groups = append(processInfo.groups, enabledSelector+":"+parseAccount(groupAccount, groupDomain))
+	}
+	if !disableGroupNames {
+		p.log.Debug("Group account name lookups completed", "count", len(groups), "duration_ms", time.Since(start).Milliseconds())
 	}
 
 	if queryPath {
@@ -175,12 +201,29 @@ func (p *Plugin) newProcessInfo(pid int32, queryPath bool) (*processInfo, error)
 }
 
 func (p *Plugin) Configure(_ context.Context, req *configv1.ConfigureRequest) (*configv1.ConfigureResponse, error) {
-	config := new(Configuration)
-	if err := hcl.Decode(config, req.HclConfiguration); err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "failed to decode configuration: %v", err)
+	newConfig, _, err := pluginconf.Build(req, buildConfig)
+	if err != nil {
+		return nil, err
 	}
-	p.setConfig(config)
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.config = newConfig
+
+	if newConfig.DisableGroupNameSelectors {
+		p.log.Info("Group name selectors disabled; only group_sid selectors will be produced for groups")
+	}
+
 	return &configv1.ConfigureResponse{}, nil
+}
+
+func (p *Plugin) Validate(_ context.Context, req *configv1.ValidateRequest) (*configv1.ValidateResponse, error) {
+	_, notes, err := pluginconf.Build(req, buildConfig)
+
+	return &configv1.ValidateResponse{
+		Valid: err == nil,
+		Notes: notes,
+	}, nil
 }
 
 func (p *Plugin) getConfig() (*Configuration, error) {
@@ -191,12 +234,6 @@ func (p *Plugin) getConfig() (*Configuration, error) {
 		return nil, status.Error(codes.FailedPrecondition, "not configured")
 	}
 	return config, nil
-}
-
-func (p *Plugin) setConfig(config *Configuration) {
-	p.mu.Lock()
-	p.config = config
-	p.mu.Unlock()
 }
 
 type processQueryer interface {
@@ -236,7 +273,11 @@ type processQueryer interface {
 type processQuery struct{}
 
 func (q *processQuery) OpenProcess(pid int32) (handle windows.Handle, err error) {
-	return windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
+	pidUint32, err := util.CheckedCast[uint32](pid)
+	if err != nil {
+		return 0, fmt.Errorf("invalid value for PID: %w", err)
+	}
+	return windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pidUint32)
 }
 
 func (q *processQuery) OpenProcessToken(h windows.Handle, token *windows.Token) (err error) {

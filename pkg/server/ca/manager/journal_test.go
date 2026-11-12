@@ -4,15 +4,14 @@ import (
 	"context"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/pem"
 	"errors"
-	"os"
-	"path/filepath"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/andres-erbsen/clock"
 	"github.com/sirupsen/logrus/hooks/test"
+	"github.com/spiffe/spire/pkg/common/x509util"
 	"github.com/spiffe/spire/pkg/server/ca"
 	"github.com/spiffe/spire/pkg/server/credtemplate"
 	"github.com/spiffe/spire/pkg/server/plugin/keymanager"
@@ -34,9 +33,10 @@ var (
 		{Raw: []byte("C")},
 	}
 
-	km        keymanager.KeyManager
-	kmKeys    = map[string]keymanager.Key{}
-	rootCerts = map[string]*x509.Certificate{}
+	km                     keymanager.KeyManager
+	kmKeys                 = map[string]keymanager.Key{}
+	rootCerts              = map[string]*x509.Certificate{}
+	nonExistingAuthorityID = "non-existing-authority-id"
 )
 
 func setupJournalTest(t *testing.T) *journalTest {
@@ -76,14 +76,22 @@ func setupJournalTest(t *testing.T) *journalTest {
 
 		kmKeys["JWT-Signer-C"], err = km.GenerateKey(ctx, "JWT-Signer-C", keymanager.ECP256)
 		require.NoError(t, err)
+
+		kmKeys["WIT-Signer-A"], err = km.GenerateKey(ctx, "WIT-Signer-A", keymanager.ECP256)
+		require.NoError(t, err)
+
+		kmKeys["WIT-Signer-B"], err = km.GenerateKey(ctx, "WIT-Signer-B", keymanager.ECP256)
+		require.NoError(t, err)
+
+		kmKeys["WIT-Signer-C"], err = km.GenerateKey(ctx, "WIT-Signer-C", keymanager.ECP256)
+		require.NoError(t, err)
 	}
 
 	return &journalTest{
 		ds: ds,
 		jc: &journalConfig{
-			cat:      cat,
-			log:      log,
-			filePath: filepath.Join(t.TempDir(), "journal.pem"),
+			cat: cat,
+			log: log,
 		},
 	}
 }
@@ -111,6 +119,7 @@ func TestJournalPersistence(t *testing.T) {
 		Signer:        kmKeys["X509-CA-A"],
 		Certificate:   rootCerts["X509-Root-A"],
 		UpstreamChain: testChain,
+		NotAfter:      rootCerts["X509-Root-A"].NotAfter,
 	})
 	require.NoError(t, err)
 
@@ -121,49 +130,36 @@ func TestJournalPersistence(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	require.NoError(t, j.UpdateX509CAStatus(ctx, now, journal.Status_ACTIVE))
+	err = j.AppendWITKey(ctx, "C", now, &ca.WITKey{
+		Signer:   kmKeys["WIT-Signer-C"],
+		Kid:      "kid1",
+		NotAfter: now.Add(time.Hour),
+	})
+	require.NoError(t, err)
+
+	authorityIDA := x509util.SubjectKeyIDToString(rootCerts["X509-Root-A"].SubjectKeyId)
+	require.NoError(t, j.UpdateX509CAStatus(ctx, authorityIDA, journal.Status_ACTIVE))
 
 	// Check that the CA journal was properly stored in the datastore.
-	journalDS := test.loadJournalFromDS(t)
+	journalDS := test.loadJournal(t)
 	require.NotNil(t, journalDS)
 	spiretest.RequireProtoEqual(t, j.getEntries(), journalDS.getEntries())
 
-	// TODO: the following checks assume that the CA journal is stored both in
-	// datastore and on disk. Revisit this in v1.10.
-	journalDisk := test.loadJournalFromDisk(t)
-	require.NotNil(t, journalDisk)
-	spiretest.RequireProtoEqual(t, j.getEntries(), journalDisk.getEntries())
-
-	// Test for the case when SPIRE starts with a CA journal on disk and does
-	// not yet have a CA journal stored in the datastore. Reset the datastore so
-	// we only have the CA journal on disk.
-	test.ds = fakedatastore.New(t)
-	test.jc.cat.(*fakeservercatalog.Catalog).SetDataStore(test.ds)
-
-	// Load the journal again. It should still get the CA journal stored on
-	// disk.
-	j = test.loadJournal(t)
-	journalDisk = test.loadJournalFromDisk(t)
-	require.NotNil(t, journalDisk)
-	spiretest.RequireProtoEqual(t, j.getEntries(), journalDisk.getEntries())
-
-	// Append a new X.509 CA, which will make the CA journal to be stored
-	// on disk and in the datastore.
+	// Append a new X.509 CA, which will make the CA journal be stored in the
+	// datastore.
 	now = now.Add(time.Minute)
 	err = j.AppendX509CA(ctx, "C", now, &ca.X509CA{
 		Signer:        kmKeys["X509-CA-C"],
 		Certificate:   rootCerts["X509-Root-C"],
 		UpstreamChain: testChain,
+		NotAfter:      rootCerts["X509-Root-C"].NotAfter,
 	})
 	require.NoError(t, err)
-	require.NoError(t, j.UpdateX509CAStatus(ctx, now, journal.Status_ACTIVE))
+	require.NoError(t, j.UpdateX509CAStatus(ctx, authorityIDA, journal.Status_ACTIVE))
 
-	journalDS = test.loadJournalFromDS(t)
+	journalDS = test.loadJournal(t)
 	require.NotNil(t, journalDS)
 	spiretest.RequireProtoEqual(t, j.getEntries(), journalDS.getEntries())
-	journalDisk = test.loadJournalFromDisk(t)
-	require.NotNil(t, journalDisk)
-	spiretest.RequireProtoEqual(t, j.getEntries(), journalDisk.getEntries())
 
 	// Simulate a datastore error
 	dsError := errors.New("ds error")
@@ -172,14 +168,10 @@ func TestJournalPersistence(t *testing.T) {
 		Signer:        kmKeys["X509-CA-C"],
 		Certificate:   rootCerts["X509-Root-C"],
 		UpstreamChain: testChain,
+		NotAfter:      rootCerts["X509-Root-C"].NotAfter,
 	})
 	require.Error(t, err)
 	require.EqualError(t, err, "could not save CA journal in the datastore: ds error")
-
-	// CA journal on disk should have been saved successfully
-	journalDisk = test.loadJournalFromDisk(t)
-	require.NotNil(t, journalDisk)
-	spiretest.RequireProtoEqual(t, j.getEntries(), journalDisk.getEntries())
 }
 
 func TestAppendSetPreparedStatus(t *testing.T) {
@@ -192,6 +184,7 @@ func TestAppendSetPreparedStatus(t *testing.T) {
 		Signer:        kmKeys["X509-CA-A"],
 		Certificate:   rootCerts["X509-Root-A"],
 		UpstreamChain: testChain,
+		NotAfter:      rootCerts["X509-Root-A"].NotAfter,
 	})
 	require.NoError(t, err)
 
@@ -211,6 +204,64 @@ func TestAppendSetPreparedStatus(t *testing.T) {
 	lastJWTKey := testJournal.entries.JwtKeys[0]
 	require.Equal(t, "B", lastJWTKey.SlotId)
 	require.Equal(t, journal.Status_PREPARED, lastJWTKey.Status)
+
+	err = testJournal.AppendWITKey(ctx, "C", now, &ca.WITKey{
+		Signer:   kmKeys["WIT-Signer-C"],
+		Kid:      "KID",
+		NotAfter: now.Add(time.Hour),
+	})
+	require.NoError(t, err)
+
+	require.Len(t, testJournal.entries.WitKeys, 1)
+	lastWITKey := testJournal.entries.WitKeys[0]
+	require.Equal(t, "C", lastWITKey.SlotId)
+	require.Equal(t, journal.Status_PREPARED, lastWITKey.Status)
+}
+
+func TestAppendKeepsEntriesOnSaveFailure(t *testing.T) {
+	test := setupJournalTest(t)
+	now := test.now()
+
+	testJournal := test.loadJournal(t)
+	testJournal.activeX509AuthorityID = getOneX509AuthorityID(ctx, t, test.jc.cat.GetKeyManager())
+
+	test.ds.SetNextError(errors.New("ds error"))
+	err := testJournal.AppendX509CA(ctx, "A", now, &ca.X509CA{
+		Signer:        kmKeys["X509-CA-A"],
+		Certificate:   rootCerts["X509-Root-A"],
+		UpstreamChain: testChain,
+		NotAfter:      rootCerts["X509-Root-A"].NotAfter,
+	})
+	require.EqualError(t, err, "could not save CA journal in the datastore: ds error")
+
+	test.ds.SetNextError(errors.New("ds error"))
+	err = testJournal.AppendJWTKey(ctx, "B", now, &ca.JWTKey{
+		Signer:   kmKeys["JWT-Signer-B"],
+		Kid:      "kid1",
+		NotAfter: now.Add(time.Hour),
+	})
+	require.EqualError(t, err, "could not save CA journal in the datastore: ds error")
+
+	test.ds.SetNextError(errors.New("ds error"))
+	err = testJournal.AppendWITKey(ctx, "C", now, &ca.WITKey{
+		Signer:   kmKeys["WIT-Signer-C"],
+		Kid:      "kid1",
+		NotAfter: now.Add(time.Hour),
+	})
+	require.EqualError(t, err, "could not save CA journal in the datastore: ds error")
+
+	// Journal save failures are non-fatal to callers. Keep the in-memory journal
+	// advanced so a later successful save persists the manager's current state.
+	entries := testJournal.getEntries()
+	require.Len(t, entries.X509CAs, 1)
+	require.Equal(t, "A", entries.X509CAs[0].SlotId)
+	require.Equal(t, journal.Status_PREPARED, entries.X509CAs[0].Status)
+	require.Len(t, entries.JwtKeys, 1)
+	require.Equal(t, "B", entries.JwtKeys[0].SlotId)
+	require.Equal(t, journal.Status_PREPARED, entries.JwtKeys[0].Status)
+	require.Len(t, entries.WitKeys, 1)
+	require.Equal(t, "C", entries.WitKeys[0].SlotId)
+	require.Equal(t, journal.Status_PREPARED, entries.WitKeys[0].Status)
 }
 
 func TestX509CAOverflow(t *testing.T) {
@@ -219,11 +270,12 @@ func TestX509CAOverflow(t *testing.T) {
 
 	journal := test.loadJournal(t)
 
-	for i := 0; i < (journalCap + 1); i++ {
+	for range journalCap + 1 {
 		now = now.Add(time.Minute)
 		err := journal.AppendX509CA(ctx, "A", now, &ca.X509CA{
 			Signer:      kmKeys["X509-CA-A"],
 			Certificate: rootCerts["X509-Root-A"],
+			NotAfter:    rootCerts["X509-Root-A"].NotAfter,
 		})
 		require.NoError(t, err)
 	}
@@ -246,18 +298,21 @@ func TestUpdateX509CAStatus(t *testing.T) {
 	err := testJournal.AppendX509CA(ctx, "A", firstIssuedAt, &ca.X509CA{
 		Signer:      kmKeys["X509-CA-A"],
 		Certificate: rootCerts["X509-Root-A"],
+		NotAfter:    rootCerts["X509-Root-A"].NotAfter,
 	})
 	require.NoError(t, err)
 
 	err = testJournal.AppendX509CA(ctx, "B", secondIssuedAt, &ca.X509CA{
 		Signer:      kmKeys["X509-CA-B"],
 		Certificate: rootCerts["X509-Root-B"],
+		NotAfter:    rootCerts["X509-Root-B"].NotAfter,
 	})
 	require.NoError(t, err)
 
 	err = testJournal.AppendX509CA(ctx, "C", thirdIssuedAt, &ca.X509CA{
 		Signer:      kmKeys["X509-CA-C"],
 		Certificate: rootCerts["X509-Root-C"],
+		NotAfter:    rootCerts["X509-Root-C"].NotAfter,
 	})
 	require.NoError(t, err)
 
@@ -267,7 +322,8 @@ func TestUpdateX509CAStatus(t *testing.T) {
 		require.Equal(t, journal.Status_PREPARED, ca.Status)
 	}
 
-	err = testJournal.UpdateX509CAStatus(ctx, secondIssuedAt, journal.Status_ACTIVE)
+	authorityIDB := x509util.SubjectKeyIDToString(rootCerts["X509-Root-B"].SubjectKeyId)
+	err = testJournal.UpdateX509CAStatus(ctx, authorityIDB, journal.Status_ACTIVE)
 	require.NoError(t, err)
 
 	for _, ca := range testJournal.getEntries().X509CAs {
@@ -279,9 +335,34 @@ func TestUpdateX509CAStatus(t *testing.T) {
 		require.Equal(t, expectedStatus, ca.Status)
 	}
 
-	unusedTime := test.now().Add(time.Hour)
-	err = testJournal.UpdateX509CAStatus(ctx, unusedTime, journal.Status_OLD)
-	require.ErrorContains(t, err, "no journal entry found issued at:")
+	err = testJournal.UpdateX509CAStatus(ctx, nonExistingAuthorityID, journal.Status_OLD)
+	require.ErrorContains(t, err, fmt.Sprintf("no journal entry found with authority ID %q", nonExistingAuthorityID))
+}
+
+func TestUpdateX509CAStatusKeepsStatusOnSaveFailure(t *testing.T) {
+	test := setupJournalTest(t)
+	now := test.now()
+
+	testJournal := test.loadJournal(t)
+
+	err := testJournal.AppendX509CA(ctx, "A", now, &ca.X509CA{
+		Signer:      kmKeys["X509-CA-A"],
+		Certificate: rootCerts["X509-Root-A"],
+		NotAfter:    rootCerts["X509-Root-A"].NotAfter,
+	})
+	require.NoError(t, err)
+
+	test.ds.SetNextError(errors.New("ds error"))
+	authorityIDA := x509util.SubjectKeyIDToString(rootCerts["X509-Root-A"].SubjectKeyId)
+	err = testJournal.UpdateX509CAStatus(ctx, authorityIDA, journal.Status_ACTIVE)
+	require.EqualError(t, err, "could not save CA journal in the datastore: ds error")
+	require.Equal(t, authorityIDA, testJournal.activeX509AuthorityID)
+
+	// Activation proceeds even if journal persistence fails, so the in-memory
+	// journal should still reflect the active authority.
+	entries := testJournal.getEntries()
+	require.Len(t, entries.X509CAs, 1)
+	require.Equal(t, journal.Status_ACTIVE, entries.X509CAs[0].Status)
 }
 
 func TestUpdateJWTKeyStatus(t *testing.T) {
@@ -317,7 +398,7 @@ func TestUpdateJWTKeyStatus(t *testing.T) {
 		require.Equal(t, journal.Status_PREPARED, key.Status)
 	}
 
-	err = testJournal.UpdateJWTKeyStatus(ctx, secondIssuedAt, journal.Status_ACTIVE)
+	err = testJournal.UpdateJWTKeyStatus(ctx, "kid2", journal.Status_ACTIVE)
 	require.NoError(t, err)
 
 	for _, key := range testJournal.getEntries().JwtKeys {
@@ -329,9 +410,33 @@ func TestUpdateJWTKeyStatus(t *testing.T) {
 		require.Equal(t, expectedStatus, key.Status)
 	}
 
-	unusedTime := test.now().Add(time.Hour)
-	err = testJournal.UpdateJWTKeyStatus(ctx, unusedTime, journal.Status_OLD)
-	require.ErrorContains(t, err, "no journal entry found issued at:")
+	err = testJournal.UpdateJWTKeyStatus(ctx, nonExistingAuthorityID, journal.Status_OLD)
+	require.ErrorContains(t, err, fmt.Sprintf("no journal entry found with authority ID %q", nonExistingAuthorityID))
+}
+
+func TestUpdateJWTKeyStatusKeepsStatusOnSaveFailure(t *testing.T) {
+	test := setupJournalTest(t)
+	now := test.now()
+
+	testJournal := test.loadJournal(t)
+	testJournal.activeX509AuthorityID = getOneX509AuthorityID(ctx, t, test.jc.cat.GetKeyManager())
+
+	err := testJournal.AppendJWTKey(ctx, "A", now, &ca.JWTKey{
+		Signer:   kmKeys["JWT-Signer-A"],
+		Kid:      "kid1",
+		NotAfter: now.Add(time.Hour),
+	})
+	require.NoError(t, err)
+
+	test.ds.SetNextError(errors.New("ds error"))
+	err = testJournal.UpdateJWTKeyStatus(ctx, "kid1", journal.Status_ACTIVE)
+	require.EqualError(t, err, "could not save CA journal in the datastore: ds error")
+
+	// Status changes remain in memory after persistence errors because callers
+	// log the error and continue using the updated key.
+	entries := testJournal.getEntries()
+	require.Len(t, entries.JwtKeys, 1)
+	require.Equal(t, journal.Status_ACTIVE, entries.JwtKeys[0].Status)
 }
 
 func TestJWTKeyOverflow(t *testing.T) {
@@ -341,7 +446,7 @@ func TestJWTKeyOverflow(t *testing.T) {
 
 	journal := test.loadJournal(t)
 
-	for i := 0; i < (journalCap + 1); i++ {
+	for range journalCap + 1 {
 		now = now.Add(time.Minute)
 		err := journal.AppendJWTKey(ctx, "B", now, &ca.JWTKey{
 			Signer:   kmKeys["JWT-Signer-B"],
@@ -357,61 +462,130 @@ func TestJWTKeyOverflow(t *testing.T) {
 	require.Equal(t, now, time.Unix(lastEntry.IssuedAt, 0).UTC())
 }
 
-func TestBadPEM(t *testing.T) {
+func TestUpdateWITKeyStatus(t *testing.T) {
 	test := setupJournalTest(t)
 
-	test.writeString(t, test.jc.filePath, "NOT PEM")
-	_, err := LoadJournal(ctx, test.jc)
-	require.EqualError(t, err, "failed to load journal from disk: invalid PEM block")
+	firstIssuedAt := test.now()
+	secondIssuedAt := firstIssuedAt.Add(time.Minute)
+	thirdIssuedAt := secondIssuedAt.Add(time.Minute)
+
+	testJournal := test.loadJournal(t)
+
+	err := testJournal.AppendWITKey(ctx, "A", firstIssuedAt, &ca.WITKey{
+		Signer: kmKeys["WIT-Signer-A"],
+		Kid:    "kid1",
+	})
+	require.NoError(t, err)
+
+	err = testJournal.AppendWITKey(ctx, "B", secondIssuedAt, &ca.WITKey{
+		Signer: kmKeys["WIT-Signer-B"],
+		Kid:    "kid2",
+	})
+	require.NoError(t, err)
+
+	err = testJournal.AppendWITKey(ctx, "C", thirdIssuedAt, &ca.WITKey{
+		Signer: kmKeys["WIT-Signer-C"],
+		Kid:    "kid3",
+	})
+	require.NoError(t, err)
+
+	keys := testJournal.getEntries().WitKeys
+	require.Len(t, keys, 3)
+	for _, key := range keys {
+		require.Equal(t, journal.Status_PREPARED, key.Status)
+	}
+
+	err = testJournal.UpdateWITKeyStatus(ctx, "kid2", journal.Status_ACTIVE)
+	require.NoError(t, err)
+
+	for _, key := range testJournal.getEntries().WitKeys {
+		expectedStatus := journal.Status_PREPARED
+		if key.SlotId == "B" {
+			expectedStatus = journal.Status_ACTIVE
+		}
+
+		require.Equal(t, expectedStatus, key.Status)
+	}
+
+	err = testJournal.UpdateWITKeyStatus(ctx, nonExistingAuthorityID, journal.Status_OLD)
+	require.ErrorContains(t, err, fmt.Sprintf("no journal entry found with authority ID %q", nonExistingAuthorityID))
 }
 
-func TestUnexpectedPEMType(t *testing.T) {
+func TestUpdateWITKeyStatusKeepsStatusOnSaveFailure(t *testing.T) {
+	test := setupJournalTest(t)
+	now := test.now()
+
+	testJournal := test.loadJournal(t)
+	testJournal.activeX509AuthorityID = getOneX509AuthorityID(ctx, t, test.jc.cat.GetKeyManager())
+
+	err := testJournal.AppendWITKey(ctx, "A", now, &ca.WITKey{
+		Signer:   kmKeys["WIT-Signer-A"],
+		Kid:      "kid1",
+		NotAfter: now.Add(time.Hour),
+	})
+	require.NoError(t, err)
+
+	test.ds.SetNextError(errors.New("ds error"))
+	err = testJournal.UpdateWITKeyStatus(ctx, "kid1", journal.Status_ACTIVE)
+	require.EqualError(t, err, "could not save CA journal in the datastore: ds error")
+
+	// Status changes remain in memory after persistence errors because callers
+	// log the error and continue using the updated key.
+	entries := testJournal.getEntries()
+	require.Len(t, entries.WitKeys, 1)
+	require.Equal(t, journal.Status_ACTIVE, entries.WitKeys[0].Status)
+}
+
+func TestWITKeyOverflow(t *testing.T) {
 	test := setupJournalTest(t)
 
-	test.writeBytes(t, test.jc.filePath, pem.EncodeToMemory(&pem.Block{
-		Type:  "WHATEVER",
-		Bytes: []byte("FOO"),
-	}))
-	_, err := LoadJournal(ctx, test.jc)
-	require.EqualError(t, err, `failed to load journal from disk: invalid PEM block type "WHATEVER"`)
+	now := test.now()
+
+	journal := test.loadJournal(t)
+
+	for range journalCap + 1 {
+		now = now.Add(time.Minute)
+		err := journal.AppendWITKey(ctx, "B", now, &ca.WITKey{
+			Signer:   kmKeys["WIT-Signer-B"],
+			Kid:      "KID",
+			NotAfter: now.Add(time.Hour),
+		})
+		require.NoError(t, err)
+	}
+
+	entries := journal.getEntries()
+	require.Len(t, entries.WitKeys, journalCap, "WIT key entries exceeds cap")
+	lastEntry := entries.WitKeys[len(entries.WitKeys)-1]
+	require.Equal(t, now, time.Unix(lastEntry.IssuedAt, 0).UTC())
 }
 
 func TestBadProto(t *testing.T) {
 	test := setupJournalTest(t)
-
-	test.writeBytes(t, test.jc.filePath, pem.EncodeToMemory(&pem.Block{
-		Type:  journalPEMType,
-		Bytes: []byte("FOO"),
-	}))
-	_, err := LoadJournal(ctx, test.jc)
+	j := &Journal{
+		config:                test.jc,
+		activeX509AuthorityID: getOneX509AuthorityID(ctx, t, test.jc.cat.GetKeyManager()),
+	}
+	caJournalID, err := j.saveInDatastore(ctx, []byte("FOO"))
+	require.NoError(t, err)
+	require.NotZero(t, caJournalID)
+	j, err = LoadJournal(ctx, test.jc)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), `unable to unmarshal entries: `)
+	require.Nil(t, j)
+	require.Contains(t, err.Error(), `failed to load journal from datastore: unable to unmarshal entries from CA journal record:`)
+}
+
+func getOneX509AuthorityID(ctx context.Context, t *testing.T, km keymanager.KeyManager) string {
+	kmKeys, err := km.GetKeys(ctx)
+	require.NoError(t, err)
+	subjectKeyID, err := x509util.GetSubjectKeyID(kmKeys[0].Public())
+	require.NoError(t, err)
+	return x509util.SubjectKeyIDToString(subjectKeyID)
 }
 
 func (j *journalTest) loadJournal(t *testing.T) *Journal {
 	journal, err := LoadJournal(ctx, j.jc)
 	require.NoError(t, err)
 	return journal
-}
-
-func (j *journalTest) loadJournalFromDisk(t *testing.T) *Journal {
-	journal, err := loadJournalFromDisk(j.jc)
-	require.NoError(t, err)
-	return journal
-}
-
-func (j *journalTest) loadJournalFromDS(t *testing.T) *Journal {
-	journal, err := loadJournalFromDS(ctx, j.jc)
-	require.NoError(t, err)
-	return journal
-}
-
-func (j *journalTest) writeString(t *testing.T, path, data string) {
-	j.writeBytes(t, path, []byte(data))
-}
-
-func (j *journalTest) writeBytes(t *testing.T, path string, data []byte) {
-	require.NoError(t, os.WriteFile(path, data, 0600))
 }
 
 func (j *journalTest) now() time.Time {

@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"net/http"
@@ -13,14 +14,18 @@ import (
 
 	"github.com/andres-erbsen/clock"
 	"github.com/sirupsen/logrus"
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 	bundlev1 "github.com/spiffe/spire-api-sdk/proto/spire/api/server/bundle/v1"
 	server_util "github.com/spiffe/spire/cmd/spire-server/util"
 	"github.com/spiffe/spire/pkg/common/diskutil"
+	"github.com/spiffe/spire/pkg/common/errorutil"
 	"github.com/spiffe/spire/pkg/common/health"
 	"github.com/spiffe/spire/pkg/common/profiling"
 	"github.com/spiffe/spire/pkg/common/telemetry"
 	"github.com/spiffe/spire/pkg/common/uptime"
 	"github.com/spiffe/spire/pkg/common/util"
+	"github.com/spiffe/spire/pkg/common/version"
 	"github.com/spiffe/spire/pkg/server/authpolicy"
 	bundle_client "github.com/spiffe/spire/pkg/server/bundle/client"
 	ds_pubmanager "github.com/spiffe/spire/pkg/server/bundle/datastore"
@@ -33,8 +38,10 @@ import (
 	"github.com/spiffe/spire/pkg/server/credvalidator"
 	"github.com/spiffe/spire/pkg/server/datastore"
 	"github.com/spiffe/spire/pkg/server/endpoints"
+	"github.com/spiffe/spire/pkg/server/endpoints/bundle"
 	"github.com/spiffe/spire/pkg/server/hostservice/agentstore"
 	"github.com/spiffe/spire/pkg/server/hostservice/identityprovider"
+	"github.com/spiffe/spire/pkg/server/node"
 	"github.com/spiffe/spire/pkg/server/plugin/bundlepublisher"
 	"github.com/spiffe/spire/pkg/server/registration"
 	"github.com/spiffe/spire/pkg/server/svid"
@@ -51,6 +58,8 @@ const (
 	invalidSpiffeIDAttestedNode      = "could not parse SPIFFE ID, from attested node"
 
 	pageSize = 1
+
+	profilingServerShutdownTimeout = 500 * time.Millisecond
 )
 
 type Server struct {
@@ -61,11 +70,23 @@ type Server struct {
 // This method initializes the server, including its plugins,
 // and then blocks until it's shut down or an error is encountered.
 func (s *Server) Run(ctx context.Context) error {
-	if err := s.run(ctx); err != nil {
+	if err := s.run(ctx); err != nil && !errorutil.IsSIGINTOrSIGTERMError(err) {
 		s.config.Log.WithError(err).Error("Fatal run error")
 		return err
 	}
 	return nil
+}
+
+func (s *Server) ValidateConfig(ctx context.Context) (map[string][]string, error) {
+	return catalog.ValidateConfig(ctx, catalog.Config{
+		Log:              s.config.Log.WithField(telemetry.SubsystemName, telemetry.Catalog),
+		Metrics:          telemetry.Blackhole{},
+		TrustDomain:      s.config.TrustDomain,
+		PluginConfigs:    s.config.PluginConfigs,
+		IdentityProvider: identityprovider.New(identityprovider.Config{TrustDomain: s.config.TrustDomain}),
+		AgentStore:       agentstore.New(),
+		HealthChecker:    health.NewChecker(s.config.HealthChecks, s.config.Log),
+	})
 }
 
 func (s *Server) run(ctx context.Context) (err error) {
@@ -74,6 +95,7 @@ func (s *Server) run(ctx context.Context) (err error) {
 		telemetry.AdminIDs:       s.config.AdminIDs,
 		telemetry.DataDir:        s.config.DataDir,
 		telemetry.LaunchLogLevel: s.config.Log.GetLevel(),
+		telemetry.Version:        version.Version(),
 	}).Info("Configured")
 
 	// create the data directory if needed
@@ -86,10 +108,50 @@ func (s *Server) run(ctx context.Context) (err error) {
 		defer stopProfiling()
 	}
 
+	var svidRotator *svid.Rotator
+	var bundleCache *bundle.Cache
 	metrics, err := telemetry.NewMetrics(&telemetry.MetricsConfig{
 		FileConfig:  s.config.Telemetry,
 		Logger:      s.config.Log.WithField(telemetry.SubsystemName, telemetry.Telemetry),
 		ServiceName: telemetry.SpireServer,
+		TrustDomain: s.config.TrustDomain.Name(),
+		TLSPolicy:   s.config.TLSPolicy,
+		GetX509SVID: func() (*x509svid.SVID, error) {
+			if svidRotator == nil {
+				return nil, errors.New("server SVID rotator is not initialized")
+			}
+
+			state := svidRotator.State()
+			if len(state.SVID) == 0 {
+				return nil, errors.New("no certificates found")
+			}
+
+			id, err := x509svid.IDFromCert(state.SVID[0])
+			if err != nil {
+				return nil, err
+			}
+
+			return &x509svid.SVID{
+				ID:           id,
+				Certificates: state.SVID,
+				PrivateKey:   state.Key,
+			}, nil
+		},
+		GetX509BundleAuthorities: func(td spiffeid.TrustDomain) ([]*x509.Certificate, error) {
+			if bundleCache == nil {
+				return nil, errors.New("server bundle cache is not initialized")
+			}
+
+			serverBundle, err := bundleCache.FetchBundleX509(ctx, td)
+			if err != nil {
+				return nil, fmt.Errorf("get bundle from datastore: %w", err)
+			}
+			if serverBundle == nil {
+				return nil, fmt.Errorf("no bundle found for trust domain %q", td)
+			}
+
+			return serverBundle.X509Authorities(), nil
+		},
 	})
 	if err != nil {
 		return err
@@ -118,6 +180,7 @@ func (s *Server) run(ctx context.Context) (err error) {
 		return err
 	}
 	defer cat.Close()
+	bundleCache = bundle.NewCache(cat.DataStore, clock.New())
 
 	bundlePublishingManager, err := s.newBundlePublishingManager(cat.BundlePublishers, cat.DataStore)
 	if err != nil {
@@ -155,12 +218,12 @@ func (s *Server) run(ctx context.Context) (err error) {
 		return err
 	}
 
-	svidRotator, err := s.newSVIDRotator(ctx, serverCA, metrics)
+	svidRotator, err = s.newSVIDRotator(ctx, serverCA, metrics)
 	if err != nil {
 		return err
 	}
 
-	authPolicyEngine, err := authpolicy.NewEngineFromConfigOrDefault(ctx, s.config.AuthOpaPolicyEngineConfig)
+	authPolicyEngine, err := authpolicy.NewEngineFromConfigOrDefault(ctx, s.config.Log, s.config.AuthOpaPolicyEngineConfig)
 	if err != nil {
 		return fmt.Errorf("unable to obtain authpolicy engine: %w", err)
 	}
@@ -208,14 +271,29 @@ func (s *Server) run(ctx context.Context) (err error) {
 		bundleManager.Run,
 		registrationManager.Run,
 		bundlePublishingManager.Run,
-		util.SerialRun(s.waitForTestDial, healthChecker.ListenAndServe),
+		catalog.ReconfigureTask(s.config.Log.WithField(telemetry.SubsystemName, "reconfigurer"), cat),
 	}
 
 	if s.config.LogReopener != nil {
 		tasks = append(tasks, s.config.LogReopener)
 	}
 
-	err = util.RunTasks(ctx, tasks...)
+	if s.config.PruneAttestedNodesExpiredFor != 0 {
+		nodeManager := s.newNodeManager(cat, metrics)
+		tasks = append(tasks, nodeManager.Run)
+	}
+
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	taskRunner := util.NewTaskRunner(ctx, cancel)
+	taskRunner.StartTasks(tasks...)
+
+	// Wait for the server to start listening before proceeding with health
+	// checks.
+	endpointsServer.WaitForListening()
+
+	taskRunner.StartTasks(healthChecker.ListenAndServe)
+	err = taskRunner.Wait()
 	if errors.Is(err, context.Canceled) {
 		err = nil
 	}
@@ -240,21 +318,19 @@ func (s *Server) setupProfiling(ctx context.Context) (stop func()) {
 
 		// kick off a goroutine to serve the pprof endpoints and one to
 		// gracefully shut down the server when profiling is being torn down
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := server.ListenAndServe(); err != nil {
+		wg.Go(func() {
+			if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				s.config.Log.WithError(err).Warn("Unable to serve profiling server")
 			}
-		}()
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		})
+		wg.Go(func() {
 			<-ctx.Done()
-			if err := server.Shutdown(ctx); err != nil {
-				s.config.Log.WithError(err).Warn("Unable to shutdown the server cleanly")
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), profilingServerShutdownTimeout)
+			defer shutdownCancel()
+			if err := server.Shutdown(shutdownCtx); err != nil {
+				s.config.Log.WithError(err).Warn("Unable to cleanly shut down profiling server")
 			}
-		}()
+		})
 	}
 	if s.config.ProfilingFreq > 0 {
 		c := &profiling.Config{
@@ -264,13 +340,11 @@ func (s *Server) setupProfiling(ctx context.Context) (stop func()) {
 			RunGCBeforeHeapProfile: true,
 			Profiles:               s.config.ProfilingNames,
 		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			if err := profiling.Run(ctx, c); err != nil {
 				s.config.Log.WithError(err).Warn("Failed to run profiling")
 			}
-		}()
+		})
 	}
 
 	return func() {
@@ -280,7 +354,8 @@ func (s *Server) setupProfiling(ctx context.Context) (stop func()) {
 }
 
 func (s *Server) loadCatalog(ctx context.Context, metrics telemetry.Metrics, identityProvider *identityprovider.IdentityProvider, agentStore *agentstore.AgentStore,
-	healthChecker health.Checker) (*catalog.Repository, error) {
+	healthChecker health.Checker,
+) (*catalog.Repository, error) {
 	return catalog.Load(ctx, catalog.Config{
 		Log:              s.config.Log.WithField(telemetry.SubsystemName, telemetry.Catalog),
 		Metrics:          metrics,
@@ -294,15 +369,17 @@ func (s *Server) loadCatalog(ctx context.Context, metrics telemetry.Metrics, ide
 
 func (s *Server) newCredBuilder(cat catalog.Catalog) (*credtemplate.Builder, error) {
 	return credtemplate.NewBuilder(credtemplate.Config{
-		TrustDomain:            s.config.TrustDomain,
-		X509CASubject:          s.config.CASubject,
-		X509CATTL:              s.config.CATTL,
-		AgentSVIDTTL:           s.config.AgentTTL,
-		X509SVIDTTL:            s.config.X509SVIDTTL,
-		JWTSVIDTTL:             s.config.JWTSVIDTTL,
-		JWTIssuer:              s.config.JWTIssuer,
-		ExcludeSNFromCASubject: s.config.ExcludeSNFromCASubject,
-		CredentialComposers:    cat.GetCredentialComposers(),
+		TrustDomain:         s.config.TrustDomain,
+		X509CASubject:       s.config.CASubject,
+		X509CATTL:           s.config.CATTL,
+		AgentSVIDTTL:        s.config.AgentTTL,
+		X509SVIDTTL:         s.config.X509SVIDTTL,
+		JWTSVIDTTL:          s.config.JWTSVIDTTL,
+		WITSVIDTTL:          s.config.WITSVIDTTL,
+		JWTIssuer:           s.config.JWTIssuer,
+		WITIssuer:           s.config.WITIssuer,
+		CredentialComposers: cat.GetCredentialComposers(),
+		TLSPolicy:           s.config.TLSPolicy,
 	})
 }
 
@@ -314,27 +391,32 @@ func (s *Server) newCredValidator() (*credvalidator.Validator, error) {
 
 func (s *Server) newCA(metrics telemetry.Metrics, credBuilder *credtemplate.Builder, credValidator *credvalidator.Validator, healthChecker health.Checker) *ca.CA {
 	return ca.NewCA(ca.Config{
-		Log:           s.config.Log.WithField(telemetry.SubsystemName, telemetry.CA),
-		Metrics:       metrics,
-		TrustDomain:   s.config.TrustDomain,
-		CredBuilder:   credBuilder,
-		CredValidator: credValidator,
-		HealthChecker: healthChecker,
+		Log:             s.config.Log.WithField(telemetry.SubsystemName, telemetry.CA),
+		Metrics:         metrics,
+		TrustDomain:     s.config.TrustDomain,
+		CredBuilder:     credBuilder,
+		CredValidator:   credValidator,
+		HealthChecker:   healthChecker,
+		DisableJWTSVIDs: s.config.DisableJWTSVIDs,
+		DisableWITSVIDs: s.config.DisableWITSVIDs,
 	})
 }
 
 func (s *Server) newCAManager(ctx context.Context, cat catalog.Catalog, metrics telemetry.Metrics, serverCA *ca.CA, credBuilder *credtemplate.Builder, credValidator *credvalidator.Validator) (*manager.Manager, error) {
 	caManager, err := manager.NewManager(ctx, manager.Config{
-		CA:            serverCA,
-		Catalog:       cat,
-		TrustDomain:   s.config.TrustDomain,
-		Log:           s.config.Log.WithField(telemetry.SubsystemName, telemetry.CAManager),
-		Metrics:       metrics,
-		CredBuilder:   credBuilder,
-		CredValidator: credValidator,
-		Dir:           s.config.DataDir,
-		X509CAKeyType: s.config.CAKeyType,
-		JWTKeyType:    s.config.JWTKeyType,
+		CA:              serverCA,
+		Catalog:         cat,
+		TrustDomain:     s.config.TrustDomain,
+		Log:             s.config.Log.WithField(telemetry.SubsystemName, telemetry.CAManager),
+		Metrics:         metrics,
+		CredBuilder:     credBuilder,
+		CredValidator:   credValidator,
+		Dir:             s.config.DataDir,
+		X509CAKeyType:   s.config.CAKeyType,
+		DisableJWTSVIDs: s.config.DisableJWTSVIDs,
+		DisableWITSVIDs: s.config.DisableWITSVIDs,
+		JWTKeyType:      s.config.JWTKeyType,
+		WITKeyType:      s.config.WITKeyType,
 	})
 	if err != nil {
 		return nil, err
@@ -365,6 +447,18 @@ func (s *Server) newRegistrationManager(cat catalog.Catalog, metrics telemetry.M
 	return registrationManager
 }
 
+func (s *Server) newNodeManager(cat catalog.Catalog, metrics telemetry.Metrics) *node.Manager {
+	nodeManager := node.NewManager(node.ManagerConfig{
+		DataStore:              cat.GetDataStore(),
+		Log:                    s.config.Log.WithField(telemetry.SubsystemName, telemetry.NodeManager),
+		Metrics:                metrics,
+		BatchSize:              s.config.PruneAttestedNodesBatchSize,
+		ExpiredFor:             s.config.PruneAttestedNodesExpiredFor,
+		IncludeNonReattestable: s.config.PruneNonReattestableNodes,
+	})
+	return nodeManager
+}
+
 func (s *Server) newSVIDRotator(ctx context.Context, serverCA ca.ServerCA, metrics telemetry.Metrics) (*svid.Rotator, error) {
 	svidRotator := svid.NewRotator(&svid.RotatorConfig{
 		ServerCA: serverCA,
@@ -378,33 +472,43 @@ func (s *Server) newSVIDRotator(ctx context.Context, serverCA ca.ServerCA, metri
 	return svidRotator, nil
 }
 
-func (s *Server) newEndpointsServer(ctx context.Context, catalog catalog.Catalog, svidObserver svid.Observer, serverCA ca.ServerCA, metrics telemetry.Metrics, jwtKeyPublisher manager.JwtKeyPublisher, authPolicyEngine *authpolicy.Engine, bundleManager *bundle_client.Manager) (endpoints.Server, error) {
+func (s *Server) newEndpointsServer(ctx context.Context, catalog catalog.Catalog, svidObserver svid.Observer, serverCA ca.ServerCA, metrics telemetry.Metrics, authorityManager manager.AuthorityManager, authPolicyEngine *authpolicy.Engine, bundleManager *bundle_client.Manager) (endpoints.Server, error) {
 	config := endpoints.Config{
-		TCPAddr:              s.config.BindAddress,
-		LocalAddr:            s.config.BindLocalAddress,
-		SVIDObserver:         svidObserver,
-		TrustDomain:          s.config.TrustDomain,
-		Catalog:              catalog,
-		ServerCA:             serverCA,
-		Log:                  s.config.Log.WithField(telemetry.SubsystemName, telemetry.Endpoints),
-		RootLog:              s.config.Log,
-		Metrics:              metrics,
-		JWTKeyPublisher:      jwtKeyPublisher,
-		RateLimit:            s.config.RateLimit,
-		Uptime:               uptime.Uptime,
-		Clock:                clock.New(),
-		CacheReloadInterval:  s.config.CacheReloadInterval,
-		EventsBasedCache:     s.config.EventsBasedCache,
-		PruneEventsOlderThan: s.config.PruneEventsOlderThan,
-		AuditLogEnabled:      s.config.AuditLogEnabled,
-		AuthPolicyEngine:     authPolicyEngine,
-		BundleManager:        bundleManager,
-		AdminIDs:             s.config.AdminIDs,
+		TCPAddr:                      s.config.BindAddress,
+		LocalAddr:                    s.config.BindLocalAddress,
+		SVIDObserver:                 svidObserver,
+		TrustDomain:                  s.config.TrustDomain,
+		Catalog:                      catalog,
+		ServerCA:                     serverCA,
+		CATTL:                        s.config.CATTL,
+		Log:                          s.config.Log.WithField(telemetry.SubsystemName, telemetry.Endpoints),
+		RootLog:                      s.config.Log,
+		Metrics:                      metrics,
+		AuthorityManager:             authorityManager,
+		RateLimit:                    s.config.RateLimit,
+		Uptime:                       uptime.Uptime,
+		Clock:                        clock.New(),
+		CacheReloadInterval:          s.config.CacheReloadInterval,
+		FullCacheReloadInterval:      s.config.FullCacheReloadInterval,
+		EventsBasedCache:             s.config.EventsBasedCache,
+		PruneEventsOlderThan:         s.config.PruneEventsOlderThan,
+		EventTimeout:                 s.config.EventTimeout,
+		AuditLogEnabled:              s.config.AuditLogEnabled,
+		AuditLogExcludeAgentSync:     s.config.AuditLogExcludeAgentSync,
+		ProxyProtocolTrustedCIDRs:    s.config.ProxyProtocolTrustedCIDRs,
+		AuthPolicyEngine:             authPolicyEngine,
+		BundleManager:                bundleManager,
+		AdminIDs:                     s.config.AdminIDs,
+		MaxAttestedNodeInfoStaleness: s.config.MaxAttestedNodeInfoStaleness,
+		AgentSpiffeIdAsSelector:      s.config.Experimental.AgentSpiffeIdAsSelector,
+		AllowNonconformingAgentIDs:   s.config.Experimental.AllowNonconformingAgentIDs,
+		TLSPolicy:                    s.config.TLSPolicy,
 	}
 	if s.config.Federation.BundleEndpoint != nil {
 		config.BundleEndpoint.Address = s.config.Federation.BundleEndpoint.Address
 		config.BundleEndpoint.RefreshHint = s.config.Federation.BundleEndpoint.RefreshHint
 		config.BundleEndpoint.ACME = s.config.Federation.BundleEndpoint.ACME
+		config.BundleEndpoint.DiskCertManager = s.config.Federation.BundleEndpoint.DiskCertManager
 	}
 	return endpoints.New(ctx, config)
 }
@@ -440,8 +544,8 @@ func (s *Server) validateTrustDomain(ctx context.Context, ds datastore.DataStore
 		Pagination: &datastore.Pagination{
 			Token:    "",
 			PageSize: pageSize,
-		}})
-
+		},
+	})
 	if err != nil {
 		return err
 	}
@@ -462,7 +566,8 @@ func (s *Server) validateTrustDomain(ctx context.Context, ds datastore.DataStore
 		Pagination: &datastore.Pagination{
 			Token:    "",
 			PageSize: pageSize,
-		}})
+		},
+	})
 	if err != nil {
 		return err
 	}
@@ -479,14 +584,6 @@ func (s *Server) validateTrustDomain(ctx context.Context, ds datastore.DataStore
 			s.config.Log.Warn(msg)
 		}
 	}
-	return nil
-}
-
-// waitForTestDial calls health.WaitForTestDial to wait for a connection to the
-// SPIRE Server API socket. This function always returns nil, even if
-// health.WaitForTestDial exited due to a timeout.
-func (s *Server) waitForTestDial(ctx context.Context) error {
-	health.WaitForTestDial(ctx, s.config.BindLocalAddress)
 	return nil
 }
 
@@ -511,9 +608,14 @@ func (s *Server) CheckHealth() health.State {
 }
 
 func (s *Server) tryGetBundle() error {
-	client, err := server_util.NewServerClient(s.config.BindLocalAddress)
+	addr, err := util.GetTargetName(s.config.BindLocalAddress)
 	if err != nil {
-		return errors.New("cannot create registration client")
+		return fmt.Errorf("cannot get local gRPC address: %w", err)
+	}
+
+	client, err := server_util.NewServerClient(addr)
+	if err != nil {
+		return fmt.Errorf("cannot create registration client: %w", err)
 	}
 	defer client.Release()
 
@@ -524,7 +626,7 @@ func (s *Server) tryGetBundle() error {
 	// As currently coded however, the API isn't served until after
 	// the server CA has been signed by upstream.
 	if _, err := bundleClient.GetBundle(context.Background(), &bundlev1.GetBundleRequest{}); err != nil {
-		return errors.New("unable to fetch bundle")
+		return fmt.Errorf("unable to fetch bundle: %w", err)
 	}
 	return nil
 }

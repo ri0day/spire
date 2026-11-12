@@ -32,12 +32,15 @@ MWnIPs59/JF8AiBeKSM/rkL2igQchDTvlJJWsyk9YL8UZI/XfZO7907TWA==
 	pkixBytes, _          = x509.MarshalPKIXPublicKey(publicKey)
 	apiJWTAuthoritiesGood = []*apitypes.JWTKey{
 		{KeyId: "ID", PublicKey: pkixBytes, ExpiresAt: expiresAt.Unix()},
+		{KeyId: "IDTainted", PublicKey: pkixBytes, ExpiresAt: expiresAt.Unix(), Tainted: true},
 	}
 	apiJWTAuthoritiesBad = []*apitypes.JWTKey{
+		{PublicKey: pkixBytes, ExpiresAt: expiresAt.Unix()},
 		{PublicKey: pkixBytes, ExpiresAt: expiresAt.Unix()},
 	}
 	apiX509AuthoritiesGood = []*apitypes.X509Certificate{
 		{Asn1: root.Raw},
+		{Asn1: root.Raw, Tainted: true},
 	}
 	apiX509AuthoritiesBad = []*apitypes.X509Certificate{
 		{Asn1: []byte("malformed")},
@@ -63,7 +66,7 @@ MWnIPs59/JF8AiBeKSM/rkL2igQchDTvlJJWsyk9YL8UZI/XfZO7907TWA==
 		RefreshHint:     1,
 		SequenceNumber:  2,
 	}
-	apiInvalidJWTAutorities = &apitypes.Bundle{
+	apiInvalidJWTAuthorities = &apitypes.Bundle{
 		TrustDomain:     "example.org",
 		X509Authorities: apiX509AuthoritiesGood,
 		JwtAuthorities:  apiJWTAuthoritiesBad,
@@ -71,9 +74,12 @@ MWnIPs59/JF8AiBeKSM/rkL2igQchDTvlJJWsyk9YL8UZI/XfZO7907TWA==
 		SequenceNumber:  2,
 	}
 	commonInvalidTD = &common.Bundle{
-		TrustDomainId:  "not a trustdomain id",
-		RootCas:        []*common.Certificate{{DerBytes: root.Raw}},
-		JwtSigningKeys: []*common.PublicKey{{Kid: "ID", PkixBytes: pkixBytes, NotAfter: expiresAt.Unix()}},
+		TrustDomainId: "not a trustdomain id",
+		RootCas:       []*common.Certificate{{DerBytes: root.Raw}},
+		JwtSigningKeys: []*common.PublicKey{
+			{Kid: "ID", PkixBytes: pkixBytes, NotAfter: expiresAt.Unix()},
+			{Kid: "IDTainted", PkixBytes: pkixBytes, NotAfter: expiresAt.Unix(), TaintedKey: true},
+		},
 		RefreshHint:    1,
 		SequenceNumber: 2,
 	}
@@ -93,12 +99,14 @@ MWnIPs59/JF8AiBeKSM/rkL2igQchDTvlJJWsyk9YL8UZI/XfZO7907TWA==
 	}
 	pluginJWTAuthoritiesGood = []*plugintypes.JWTKey{
 		{KeyId: "ID", PublicKey: pkixBytes, ExpiresAt: expiresAt.Unix()},
+		{KeyId: "IDTainted", PublicKey: pkixBytes, ExpiresAt: expiresAt.Unix(), Tainted: true},
 	}
 	pluginJWTAuthoritiesBad = []*plugintypes.JWTKey{
 		{PublicKey: pkixBytes, ExpiresAt: expiresAt.Unix()},
 	}
 	pluginX509AuthoritiesGood = []*plugintypes.X509Certificate{
 		{Asn1: root.Raw},
+		{Asn1: root.Raw, Tainted: true},
 	}
 	pluginX509AuthoritiesBad = []*plugintypes.X509Certificate{
 		{Asn1: []byte("malformed")},
@@ -124,7 +132,7 @@ MWnIPs59/JF8AiBeKSM/rkL2igQchDTvlJJWsyk9YL8UZI/XfZO7907TWA==
 		RefreshHint:     1,
 		SequenceNumber:  2,
 	}
-	pluginInvalidJWTAutorities = &plugintypes.Bundle{
+	pluginInvalidJWTAuthorities = &plugintypes.Bundle{
 		TrustDomain:     "example.org",
 		X509Authorities: pluginX509AuthoritiesGood,
 		JwtAuthorities:  pluginJWTAuthoritiesBad,
@@ -132,9 +140,15 @@ MWnIPs59/JF8AiBeKSM/rkL2igQchDTvlJJWsyk9YL8UZI/XfZO7907TWA==
 		SequenceNumber:  2,
 	}
 	commonGood = &common.Bundle{
-		TrustDomainId:  "spiffe://example.org",
-		RootCas:        []*common.Certificate{{DerBytes: root.Raw}},
-		JwtSigningKeys: []*common.PublicKey{{Kid: "ID", PkixBytes: pkixBytes, NotAfter: expiresAt.Unix()}},
+		TrustDomainId: "spiffe://example.org",
+		RootCas: []*common.Certificate{
+			{DerBytes: root.Raw},
+			{DerBytes: root.Raw, TaintedKey: true},
+		},
+		JwtSigningKeys: []*common.PublicKey{
+			{Kid: "ID", PkixBytes: pkixBytes, NotAfter: expiresAt.Unix()},
+			{Kid: "IDTainted", PkixBytes: pkixBytes, NotAfter: expiresAt.Unix(), TaintedKey: true},
+		},
 		RefreshHint:    1,
 		SequenceNumber: 2,
 	}
@@ -156,7 +170,7 @@ func TestToPluginFromAPIProto(t *testing.T) {
 	assertOK(t, apiGood, pluginGood)
 	assertFail(t, apiInvalidTD, "malformed trust domain:")
 	assertFail(t, apiInvalidX509Authorities, "invalid X.509 authority: failed to parse X.509 certificate data: ")
-	assertFail(t, apiInvalidJWTAutorities, "invalid JWT authority: missing key ID for JWT key")
+	assertFail(t, apiInvalidJWTAuthorities, "invalid JWT authority: missing key ID for JWT key")
 	assertOK(t, nil, nil)
 }
 
@@ -178,7 +192,7 @@ func TestToCommonFromPluginProto(t *testing.T) {
 	assertOK(t, pluginGood, commonGood)
 	assertFail(t, pluginInvalidTD, "malformed trust domain:")
 	assertFail(t, pluginInvalidX509Authorities, "invalid X.509 authority: failed to parse X.509 certificate data: ")
-	assertFail(t, pluginInvalidJWTAutorities, "invalid JWT authority: missing key ID for JWT key")
+	assertFail(t, pluginInvalidJWTAuthorities, "invalid JWT authority: missing key ID for JWT key")
 	assertOK(t, nil, nil)
 }
 

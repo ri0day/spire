@@ -13,7 +13,7 @@ import (
 	keymanagerv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/plugin/agent/keymanager/v1"
 	configv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/service/common/config/v1"
 	keymanagerbase "github.com/spiffe/spire/pkg/agent/plugin/keymanager/base"
-	catalog "github.com/spiffe/spire/pkg/common/catalog"
+	"github.com/spiffe/spire/pkg/common/catalog"
 	"github.com/spiffe/spire/pkg/common/diskutil"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -72,6 +72,10 @@ func (m *KeyManager) Configure(_ context.Context, req *configv1.ConfigureRequest
 		return nil, status.Error(codes.InvalidArgument, "directory must be configured")
 	}
 
+	if err := m.verifyDirectory(config.Directory); err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "directory validation failed: %v", err)
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -91,6 +95,20 @@ func (m *KeyManager) configure(config *configuration) error {
 	}
 
 	m.config = config
+	return nil
+}
+
+func (m *KeyManager) verifyDirectory(dir string) error {
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+
+	probe := filepath.Join(dir, ".probe")
+	if err := os.WriteFile(probe, []byte{}, 0600); err != nil {
+		return err
+	}
+	os.Remove(probe)
+
 	return nil
 }
 

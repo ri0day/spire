@@ -3,6 +3,7 @@ package nodeattestor_test
 import (
 	"context"
 	"errors"
+	"net"
 	"testing"
 
 	nodeattestorv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/plugin/server/nodeattestor/v1"
@@ -14,6 +15,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 )
 
@@ -129,7 +132,6 @@ func TestV1(t *testing.T) {
 			expectResult:  resultWithSelectorsAndCanReattest,
 		},
 	} {
-		tt := tt
 		t.Run(tt.test, func(t *testing.T) {
 			nodeattestor := loadV1Plugin(t, tt.plugin)
 			result, err := nodeattestor.Attest(context.Background(), []byte(tt.payload),
@@ -153,6 +155,121 @@ func TestV1(t *testing.T) {
 			spiretest.AssertProtoListEqual(t, tt.expectResult.Selectors, result.Selectors)
 		})
 	}
+}
+
+type ForwardedHostV1Plugin struct {
+	nodeattestorv1.UnimplementedNodeAttestorServer
+	ExpectedHost string
+}
+
+func (plugin *ForwardedHostV1Plugin) Attest(stream nodeattestorv1.NodeAttestor_AttestServer) error {
+	xForwardedHost := metadata.ValueFromIncomingContext(stream.Context(), nodeattestor.XForwardedHostKey)
+	if len(xForwardedHost) == 0 || xForwardedHost[0] != plugin.ExpectedHost {
+		return errors.New("expected forwarded host in context metadata")
+	}
+	// Consume the payload sent by the client before responding to avoid a
+	// race where the server closes the stream before the client finishes
+	// sending, causing the client's Send to return io.EOF.
+	if _, err := stream.Recv(); err != nil {
+		return err
+	}
+	return stream.Send(&nodeattestorv1.AttestResponse{
+		Response: &nodeattestorv1.AttestResponse_AgentAttributes{
+			AgentAttributes: &nodeattestorv1.AgentAttributes{
+				SpiffeId: "spiffe://example.org/spire/agent/test/foo",
+			},
+		},
+	})
+}
+
+type ForwardedClientIPV1Plugin struct {
+	nodeattestorv1.UnimplementedNodeAttestorServer
+	ExpectedIP string
+}
+
+func (plugin *ForwardedClientIPV1Plugin) Attest(stream nodeattestorv1.NodeAttestor_AttestServer) error {
+	ips := metadata.ValueFromIncomingContext(stream.Context(), nodeattestor.XForwardedClientIPKey)
+	if len(ips) == 0 {
+		return errors.New("client IP metadata key not present")
+	}
+	if ips[0] != plugin.ExpectedIP {
+		return errors.New("forwarded client IP does not match expected value")
+	}
+	if _, err := stream.Recv(); err != nil {
+		return err
+	}
+	return stream.Send(&nodeattestorv1.AttestResponse{
+		Response: &nodeattestorv1.AttestResponse_AgentAttributes{
+			AgentAttributes: &nodeattestorv1.AgentAttributes{
+				SpiffeId: "spiffe://example.org/spire/agent/test/foo",
+			},
+		},
+	})
+}
+
+func TestGetClientIP(t *testing.T) {
+	attestFn := func(ctx context.Context, challenge []byte) ([]byte, error) {
+		return challenge, nil
+	}
+
+	for _, tt := range []struct {
+		name       string
+		ctx        context.Context
+		expectedIP string
+	}{
+		{
+			name:       "IPv4 peer",
+			ctx:        peer.NewContext(context.Background(), &peer.Peer{Addr: &net.TCPAddr{IP: net.ParseIP("192.0.2.1"), Port: 12345}}),
+			expectedIP: "192.0.2.1",
+		},
+		{
+			name:       "IPv6 peer",
+			ctx:        peer.NewContext(context.Background(), &peer.Peer{Addr: &net.TCPAddr{IP: net.ParseIP("2001:db8::1"), Port: 12345}}),
+			expectedIP: "2001:db8::1",
+		},
+		{
+			name:       "no peer in context",
+			ctx:        context.Background(),
+			expectedIP: "",
+		},
+		{
+			name:       "nil peer addr",
+			ctx:        peer.NewContext(context.Background(), &peer.Peer{Addr: nil}),
+			expectedIP: "",
+		},
+		{
+			name:       "unix socket addr",
+			ctx:        peer.NewContext(context.Background(), &peer.Peer{Addr: &net.UnixAddr{Name: "/tmp/spire.sock", Net: "unix"}}),
+			expectedIP: "",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			server := nodeattestorv1.NodeAttestorPluginServer(&ForwardedClientIPV1Plugin{ExpectedIP: tt.expectedIP})
+			na := new(nodeattestor.V1)
+			plugintest.Load(t, catalog.MakeBuiltIn("test", server), na)
+
+			result, err := na.Attest(tt.ctx, []byte("unused"), attestFn)
+			require.NoError(t, err)
+			require.NotNil(t, result)
+		})
+	}
+}
+
+func TestHostForwarding(t *testing.T) {
+	server := nodeattestorv1.NodeAttestorPluginServer(&ForwardedHostV1Plugin{ExpectedHost: "spire-server-xyz.spiffe.io"})
+	nodeattestor := new(nodeattestor.V1)
+	plugintest.Load(t, catalog.MakeBuiltIn("test", server), nodeattestor)
+
+	ctx := metadata.NewIncomingContext(
+		context.Background(),
+		metadata.New(map[string]string{":authority": "spire-server-xyz.spiffe.io:8081"}),
+	)
+	result, err := nodeattestor.Attest(ctx, []byte("unused"), func(ctx context.Context, challenge []byte) ([]byte, error) {
+		return challenge, nil
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
 }
 
 func loadV1Plugin(t *testing.T, plugin *fakeV1Plugin) nodeattestor.NodeAttestor {

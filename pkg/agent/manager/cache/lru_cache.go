@@ -11,7 +11,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/spiffe/go-spiffe/v2/bundle/spiffebundle"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
-	"github.com/spiffe/spire/pkg/agent/common/backoff"
+	"github.com/spiffe/spire/pkg/common/backoff"
 	"github.com/spiffe/spire/pkg/common/telemetry"
 	agentmetrics "github.com/spiffe/spire/pkg/common/telemetry/agent"
 	"github.com/spiffe/spire/proto/spire/common"
@@ -24,25 +24,92 @@ const (
 	SVIDSyncInterval = 500 * time.Millisecond
 )
 
-// Cache caches each registration entry, bundles, and JWT SVIDs for the agent.
-// The signed X509-SVIDs for those entries are stored in LRU-like cache.
+// UpdateEntries holds information for an entries and bundles update to the cache.
+type UpdateEntries struct {
+	// Bundles is a set of ALL trust bundles available to the agent, keyed by trust domain
+	Bundles map[spiffeid.TrustDomain]*spiffebundle.Bundle
+
+	// RegistrationEntries is a set of all registration entries available to the
+	// agent, keyed by registration entry id.
+	RegistrationEntries map[string]*common.RegistrationEntry
+}
+
+// StaleEntry holds stale entries with SVIDs expiration time
+type StaleEntry struct {
+	// Entry stale registration entry
+	Entry *common.RegistrationEntry
+	// SVIDs expiration time
+	SVIDExpiresAt time.Time
+}
+
+// EntriesAndBundlesUpdate is used to convey the registration entries matching
+// a set of selectors, along with the trust bundles they rely on, to entry and
+// bundle subscribers.
+type EntriesAndBundlesUpdate struct {
+	Entries          []*common.RegistrationEntry
+	Bundle           *spiffebundle.Bundle
+	FederatedBundles map[spiffeid.TrustDomain]*spiffebundle.Bundle
+}
+
+func (u *EntriesAndBundlesUpdate) HasEntries() bool {
+	return len(u.Entries) > 0
+}
+
+// CachedSVID is the constraint for any SVID type storable in the generic LRU cache.
+type CachedSVID interface {
+	ExpiresAt() time.Time
+
+	// InvalidatedBy reports whether an SVID issued for the issued entry
+	// must not be served to workloads matching only the updated entry.
+	InvalidatedBy(issued, updated *common.RegistrationEntry) bool
+}
+
+// LRUCacheConfig holds configuration for creating an LRUCache instance.
+type LRUCacheConfig[SVID CachedSVID, Update any] struct {
+	Log              logrus.FieldLogger
+	TrustDomain      spiffeid.TrustDomain
+	Bundle           *Bundle
+	Metrics          telemetry.Metrics
+	SvidCacheMaxSize int
+	Clk              clock.Clock
+
+	// SVIDType identifies the type of SVID stored in the cache.
+	SVIDType string
+
+	// BuildUpdate constructs the typed update from matching records, SVIDs, and bundles.
+	BuildUpdate func(cache *LRUCache[SVID, Update], set selectorSet) *Update
+
+	// ShouldPrefetch determines whether a given entry should be prefetched.
+	// If nil, all entries are eligible for prefetch.
+	ShouldPrefetch func(*common.RegistrationEntry) bool
+}
+
+// LRUCache caches registration entries, bundles, and SVIDs for the agent.
+// It is parameterized by SVID (the SVID type) and Update (the update payload sent to subscribers).
+//
 // It allows subscriptions by (workload) selector sets and notifies subscribers when:
 //
 // 1) a registration entry related to the selectors:
 //   - is modified
-//   - has a new X509-SVID signed for it
-//   - federates with a federated bundle that is updated
+//   - has a new SVID signed for it
+//   - federates with a federated bundle that is updated or removed
 //
 // 2) the trust bundle for the agent trust domain is updated
 //
 // When notified, the subscriber is given a WorkloadUpdate containing
 // related identities and trust bundles.
 //
+// Entry and bundle subscribers (see SubscribeToEntryAndBundleUpdates) are
+// notified under the same conditions, except that SVID updates do not concern
+// them. They are given an EntriesAndBundlesUpdate containing related
+// registration entries and trust bundles, and do not cause SVIDs to be minted
+// for those entries.
+//
 // The cache does this efficiently by building an index for each unique
-// selector it encounters. Each selector index tracks the subscribers (i.e
+// selector it encounters. Each selector index tracks the subscribers (i.e.
 // workloads) and registration entries that have that selector.
 //
-// The LRU-like SVID cache has configurable size limit and expiry period.
+// The LRU-like SVID cache has a size limit and expiry period.
 //  1. Size limit of SVID cache is a soft limit. If SVID has a subscriber present then
 //     that SVID is never removed from cache.
 //  2. Least recently used SVIDs are removed from cache only after the cache expiry period has passed.
@@ -79,10 +146,7 @@ const (
 // that could OOM the agent on smaller VMs. For this reason, the cache is
 // presumed to own ALL data passing in and out of the cache. Producers and
 // consumers MUST NOT mutate the data.
-type LRUCache struct {
-	*BundleCache
-	*JWTSVIDCache
-
+type LRUCache[SVID CachedSVID, Update any] struct {
 	log         logrus.FieldLogger
 	trustDomain spiffeid.TrustDomain
 	clk         clock.Clock
@@ -104,62 +168,52 @@ type LRUCache struct {
 	bundles map[spiffeid.TrustDomain]*spiffebundle.Bundle
 
 	// svids are stored by entry IDs
-	svids map[string]*X509SVID
+	svids map[string]*SVID
 
 	// svidCacheMaxSize is a soft limit of max number of SVIDs that would be stored in cache
-	svidCacheMaxSize   int
+	svidCacheMaxSize int
+
+	// svidType identifies the type of SVID stored in the cache
+	svidType string
+
 	subscribeBackoffFn func() backoff.BackOff
+
+	// buildUpdate constructs the typed update payload for subscribers
+	buildUpdate func(cache *LRUCache[SVID, Update], set selectorSet) *Update
+
+	// shouldPrefetch determines whether an entry should be prefetched (optional)
+	shouldPrefetch func(*common.RegistrationEntry) bool
 }
 
-func NewLRUCache(log logrus.FieldLogger, trustDomain spiffeid.TrustDomain, bundle *Bundle, metrics telemetry.Metrics,
-	svidCacheMaxSize int, clk clock.Clock) *LRUCache {
-	if svidCacheMaxSize <= 0 {
-		svidCacheMaxSize = DefaultSVIDCacheMaxSize
+func NewLRUCache[SVID CachedSVID, Update any](config LRUCacheConfig[SVID, Update]) *LRUCache[SVID, Update] {
+	maxSize := config.SvidCacheMaxSize
+	if maxSize <= 0 {
+		maxSize = DefaultSVIDCacheMaxSize
 	}
 
-	return &LRUCache{
-		BundleCache:  NewBundleCache(trustDomain, bundle),
-		JWTSVIDCache: NewJWTSVIDCache(),
-
-		log:          log,
-		metrics:      metrics,
-		trustDomain:  trustDomain,
+	return &LRUCache[SVID, Update]{
+		log:          config.Log,
+		metrics:      config.Metrics,
+		trustDomain:  config.TrustDomain,
 		records:      make(map[string]*lruCacheRecord),
 		selectors:    make(map[selector]*selectorsMapIndex),
 		staleEntries: make(map[string]bool),
 		bundles: map[spiffeid.TrustDomain]*spiffebundle.Bundle{
-			trustDomain: bundle,
+			config.TrustDomain: config.Bundle,
 		},
-		svids:            make(map[string]*X509SVID),
-		svidCacheMaxSize: svidCacheMaxSize,
-		clk:              clk,
+		svids:            make(map[string]*SVID),
+		svidCacheMaxSize: maxSize,
+		svidType:         config.SVIDType,
+		clk:              config.Clk,
 		subscribeBackoffFn: func() backoff.BackOff {
-			return backoff.NewBackoff(clk, SVIDSyncInterval)
+			return backoff.NewBackoff(config.Clk, SVIDSyncInterval)
 		},
+		buildUpdate:    config.BuildUpdate,
+		shouldPrefetch: config.ShouldPrefetch,
 	}
 }
 
-// Identities is only used by manager tests
-// TODO: We should remove this and find a better way
-func (c *LRUCache) Identities() []Identity {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	out := make([]Identity, 0, len(c.records))
-	for _, record := range c.records {
-		svid, ok := c.svids[record.entry.EntryId]
-		if !ok {
-			// The record does not have an SVID yet and should not be returned
-			// from the cache.
-			continue
-		}
-		out = append(out, makeNewIdentity(record, svid))
-	}
-	sortIdentities(out)
-	return out
-}
-
-func (c *LRUCache) Entries() []*common.RegistrationEntry {
+func (c *LRUCache[SVID, Update]) Entries() []*common.RegistrationEntry {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -171,21 +225,21 @@ func (c *LRUCache) Entries() []*common.RegistrationEntry {
 	return out
 }
 
-func (c *LRUCache) CountSVIDs() int {
+func (c *LRUCache[SVID, Update]) CountSVIDs() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	return len(c.svids)
 }
 
-func (c *LRUCache) CountRecords() int {
+func (c *LRUCache[SVID, Update]) CountRecords() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	return len(c.records)
 }
 
-func (c *LRUCache) MatchingRegistrationEntries(selectors []*common.Selector) []*common.RegistrationEntry {
+func (c *LRUCache[SVID, Update]) MatchingRegistrationEntries(selectors []*common.Selector) []*common.RegistrationEntry {
 	set, setDone := allocSelectorSet(selectors...)
 	defer setDone()
 
@@ -194,27 +248,67 @@ func (c *LRUCache) MatchingRegistrationEntries(selectors []*common.Selector) []*
 	return c.matchingEntries(set)
 }
 
-func (c *LRUCache) FetchWorkloadUpdate(selectors []*common.Selector) *WorkloadUpdate {
+// FetchEntriesAndBundles returns the registration entries matching the given
+// selectors, along with the trust bundles they rely on. Unlike
+// FetchWorkloadUpdate, the federated bundles do not depend on SVIDs having
+// been minted for the matching entries.
+func (c *LRUCache[SVID, Update]) FetchEntriesAndBundles(selectors []*common.Selector) *EntriesAndBundlesUpdate {
 	set, setDone := allocSelectorSet(selectors...)
 	defer setDone()
 
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.buildWorkloadUpdate(set)
+	return c.buildEntriesAndBundlesUpdate(set)
+}
+
+func (c *LRUCache[SVID, Update]) FetchWorkloadUpdate(selectors []*common.Selector) *Update {
+	set, setDone := allocSelectorSet(selectors...)
+	defer setDone()
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.buildUpdate(c, set)
 }
 
 // NewSubscriber creates a subscriber for given selector set.
 // Separately call Notify for the first time after this method is invoked to receive latest updates.
-func (c *LRUCache) NewSubscriber(selectors []*common.Selector) Subscriber {
+func (c *LRUCache[SVID, Update]) NewSubscriber(selectors []*common.Selector) Subscriber[Update] {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	sub := newLRUCacheSubscriber(c, selectors)
+	sub := newLRUCacheSubscriber(c, selectors, func(set selectorSet) *Update {
+		return c.buildUpdate(c, set)
+	}, true)
 	for s := range sub.set {
 		c.addSelectorIndexSub(s, sub)
 	}
-	// update lastAccessTimestamp of records containing provided selectors
-	c.updateLastAccessTimestamp(selectors)
+
+	records, recordsDone := c.getRecordsForSelectors(sub.set)
+	defer recordsDone()
+	now := c.clk.Now().UnixMilli()
+	for record := range records {
+		record.activeSubscriberCount++
+		record.lastAccessTimestamp = now
+	}
+	return sub
+}
+
+// SubscribeToEntryAndBundleUpdates creates a subscriber that receives the
+// registration entries matching the given selectors, along with the trust
+// bundles they rely on. Updates are sent each time selectors, federation
+// relationships or bundles are changed. Unlike workload update subscribers,
+// entry and bundle subscribers do not cause SVIDs to be minted or retained for
+// the matching entries, and are not notified when SVIDs are updated. The
+// subscriber receives its first update before this method returns.
+func (c *LRUCache[SVID, Update]) SubscribeToEntryAndBundleUpdates(selectors []*common.Selector) Subscriber[EntriesAndBundlesUpdate] {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	sub := newLRUCacheSubscriber(c, selectors, c.buildEntriesAndBundlesUpdate, false)
+	for s := range sub.set {
+		c.addSelectorIndexSub(s, sub)
+	}
+	sub.publish()
 	return sub
 }
 
@@ -223,29 +317,29 @@ func (c *LRUCache) NewSubscriber(selectors []*common.Selector) Subscriber {
 // if the SVID for the entry is stale, or otherwise in need of rotation. Entries marked stale
 // through the checkSVID callback are returned from GetStaleEntries() until the SVID is
 // updated through a call to UpdateSVIDs.
-func (c *LRUCache) UpdateEntries(update *UpdateEntries, checkSVID func(*common.RegistrationEntry, *common.RegistrationEntry, *X509SVID) bool) {
+func (c *LRUCache[SVID, Update]) UpdateEntries(update *UpdateEntries, checkSVID func(*common.RegistrationEntry, *common.RegistrationEntry, *SVID) bool) {
 	c.mu.Lock()
-	defer func() { agentmetrics.SetEntriesMapSize(c.metrics, c.CountRecords()) }()
+	defer func() { agentmetrics.SetEntriesMapSize(c.metrics, c.svidType, c.CountRecords()) }()
 	defer c.mu.Unlock()
+
+	// Populate a "changed" set with bundles that are removed or updated, which
+	// we can check when processing registration entries to know if they need
+	// to spawn a notification.
+	bundleChanged := make(map[spiffeid.TrustDomain]bool)
 
 	// Remove bundles that no longer exist. The bundle for the agent trust
 	// domain should NOT be removed even if not present (which should only be
 	// the case if there is a bug on the server) since it is necessary to
 	// authenticate the server.
-	bundleRemoved := false
 	for id := range c.bundles {
 		if _, ok := update.Bundles[id]; !ok && id != c.trustDomain {
-			bundleRemoved = true
-			// bundle no longer exists.
 			c.log.WithField(telemetry.TrustDomainID, id).Debug("Bundle removed")
+			bundleChanged[id] = true
 			delete(c.bundles, id)
 		}
 	}
 
-	// Update bundles with changes, populating a "changed" set that we can
-	// check when processing registration entries to know if they need to spawn
-	// a notification.
-	bundleChanged := make(map[spiffeid.TrustDomain]bool)
+	// Update bundles with changes.
 	for id, bundle := range update.Bundles {
 		existing, ok := c.bundles[id]
 		if !(ok && existing.Equal(bundle)) {
@@ -269,6 +363,8 @@ func (c *LRUCache) UpdateEntries(update *UpdateEntries, checkSVID func(*common.R
 	defer selAddDone()
 	selRem, selRemDone := allocSelectorSet()
 	defer selRemDone()
+	entrySelectors, entrySelectorsDone := allocSelectorSet()
+	defer entrySelectorsDone()
 	fedAdd, fedAddDone := allocStringSet()
 	defer fedAddDone()
 	fedRem, fedRemDone := allocStringSet()
@@ -317,8 +413,21 @@ func (c *LRUCache) UpdateEntries(update *UpdateEntries, checkSVID func(*common.R
 		// notify set.
 		c.diffSelectors(existingEntry, newEntry, selAdd, selRem)
 		selectorsChanged := len(selAdd) > 0 || len(selRem) > 0
+
+		// Removed selectors let workloads that did not match the existing
+		// entry match the new one; they must not get the cached SVID. Compare
+		// against the entry the SVID was issued for, since the entry may have
+		// been updated several times without the SVID being renewed.
+		if len(selRem) > 0 {
+			if svid, ok := c.svids[newEntry.EntryId]; ok && (*svid).InvalidatedBy(record.svidEntry, newEntry) {
+				delete(c.svids, newEntry.EntryId)
+			}
+		}
 		c.addSelectorIndicesRecord(selAdd, record)
 		c.delSelectorIndicesRecord(selRem, record)
+		if selectorsChanged {
+			record.activeSubscriberCount = c.countMatchingSubscribers(record.entry, entrySelectors)
+		}
 
 		// Determine if there were changes to FederatesWith declarations or
 		// if any federated bundles related to the entry were updated.
@@ -405,7 +514,7 @@ func (c *LRUCache) UpdateEntries(update *UpdateEntries, checkSVID func(*common.R
 
 		for _, record := range recordsWithLastAccessTime {
 			if extraSize <= 0 {
-				// no need to delete SVIDs any further as cache size <= svidCacheMaxSize
+				// no need to delete SVIDs any further as cache size <= SVIDCacheMaxSize
 				break
 			}
 			if _, ok := c.svids[record.id]; ok {
@@ -433,10 +542,6 @@ func (c *LRUCache) UpdateEntries(update *UpdateEntries, checkSVID func(*common.R
 		c.log.WithField(telemetry.OutdatedSVIDs, len(outdatedEntries)).
 			Debug("Updating SVIDs with outdated attributes in cache")
 	}
-	if bundleRemoved || len(bundleChanged) > 0 {
-		c.BundleCache.Update(c.bundles)
-	}
-
 	if trustDomainBundleChanged {
 		c.notifyAll()
 	} else {
@@ -444,9 +549,10 @@ func (c *LRUCache) UpdateEntries(update *UpdateEntries, checkSVID func(*common.R
 	}
 }
 
-func (c *LRUCache) UpdateSVIDs(update *UpdateSVIDs) {
+// UpdateSVIDs updates SVIDs in the cache for the given entries.
+func (c *LRUCache[SVID, Update]) UpdateSVIDs(svids map[string]*SVID) {
 	c.mu.Lock()
-	defer func() { agentmetrics.SetSVIDMapSize(c.metrics, c.CountSVIDs()) }()
+	defer func() { agentmetrics.SetSVIDMapSize(c.metrics, c.svidType, c.CountSVIDs()) }()
 	defer c.mu.Unlock()
 
 	// Allocate a set of selectors that
@@ -454,7 +560,7 @@ func (c *LRUCache) UpdateSVIDs(update *UpdateSVIDs) {
 	defer notifySetDone()
 
 	// Add/update records for registration entries in the update
-	for entryID, svid := range update.X509SVIDs {
+	for entryID, svid := range svids {
 		record, existingEntry := c.records[entryID]
 		if !existingEntry {
 			c.log.WithField(telemetry.RegistrationID, entryID).Error("Entry not found")
@@ -462,6 +568,7 @@ func (c *LRUCache) UpdateSVIDs(update *UpdateSVIDs) {
 		}
 
 		c.svids[entryID] = svid
+		record.svidEntry = record.entry
 		notifySet.Merge(record.entry.Selectors...)
 		log := c.log.WithFields(logrus.Fields{
 			telemetry.Entry:    record.entry.EntryId,
@@ -469,15 +576,14 @@ func (c *LRUCache) UpdateSVIDs(update *UpdateSVIDs) {
 		})
 		log.Debug("SVID updated")
 
-		// Registration entry is updated, remove it from stale map
 		delete(c.staleEntries, entryID)
-		c.notifyBySelectorSet(notifySet)
+		c.notifySVIDSubscribersBySelectorSet(notifySet)
 		clearSelectorSet(notifySet)
 	}
 }
 
 // GetStaleEntries obtains a list of stale entries
-func (c *LRUCache) GetStaleEntries() []*StaleEntry {
+func (c *LRUCache[SVID, Update]) GetStaleEntries() []*StaleEntry {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -492,7 +598,7 @@ func (c *LRUCache) GetStaleEntries() []*StaleEntry {
 
 		var expiresAt time.Time
 		if cachedSvid, ok := c.svids[entryID]; ok {
-			expiresAt = cachedSvid.Chain[0].NotAfter
+			expiresAt = (*cachedSvid).ExpiresAt()
 		}
 
 		staleEntries = append(staleEntries, &StaleEntry{
@@ -507,52 +613,38 @@ func (c *LRUCache) GetStaleEntries() []*StaleEntry {
 // SyncSVIDsWithSubscribers will sync svid cache:
 // entries with active subscribers which are not cached will be put in staleEntries map
 // records which are not cached for remainder of max cache size will also be put in staleEntries map
-func (c *LRUCache) SyncSVIDsWithSubscribers() {
+func (c *LRUCache[SVID, Update]) SyncSVIDsWithSubscribers() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	c.syncSVIDsWithSubscribers()
 }
 
-// Notify subscribers of selector set only if all SVIDs for corresponding selector set are cached
-// It returns whether all SVIDs are cached or not.
-// This method should be retried with backoff to avoid lock contention.
-func (c *LRUCache) Notify(selectors []*common.Selector) bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	set, setFree := allocSelectorSet(selectors...)
-	defer setFree()
-	if !c.missingSVIDRecords(set) {
-		c.notifyBySelectorSet(set)
-		return true
-	}
-	return false
-}
-
-func (c *LRUCache) SubscribeToWorkloadUpdates(ctx context.Context, selectors Selectors) (Subscriber, error) {
+func (c *LRUCache[SVID, Update]) SubscribeToWorkloadUpdates(ctx context.Context, selectors Selectors) (Subscriber[Update], error) {
 	return c.subscribeToWorkloadUpdates(ctx, selectors, nil)
 }
 
-func (c *LRUCache) subscribeToWorkloadUpdates(ctx context.Context, selectors Selectors, notifyCallbackFn func()) (Subscriber, error) {
+func (c *LRUCache[SVID, Update]) subscribeToWorkloadUpdates(ctx context.Context, selectors Selectors, notifyCallbackFn func()) (Subscriber[Update], error) {
 	subscriber := c.NewSubscriber(selectors)
 	bo := c.subscribeBackoffFn()
 
+	sub, ok := subscriber.(*lruCacheSubscriber[Update])
+	if !ok {
+		return nil, fmt.Errorf("unexpected subscriber type %T", sub)
+	}
+
 	if len(selectors) == 0 {
-		sub, ok := subscriber.(*lruCacheSubscriber)
-		if !ok {
-			return nil, fmt.Errorf("unexpected subscriber type %T", sub)
-		}
 		if notifyCallbackFn != nil {
 			notifyCallbackFn()
 		}
-		c.notify(sub)
+		sub.publish()
 		return subscriber, nil
 	}
 
 	// block until all svids are cached and subscriber is notified
 	for {
 		// notifyCallbackFn is used for testing
-		if c.Notify(selectors) {
+		if c.notifySubscriberIfSVIDAvailable(selectors, sub) {
 			if notifyCallbackFn != nil {
 				notifyCallbackFn()
 			}
@@ -573,7 +665,19 @@ func (c *LRUCache) subscribeToWorkloadUpdates(ctx context.Context, selectors Sel
 	}
 }
 
-func (c *LRUCache) missingSVIDRecords(set selectorSet) bool {
+func (c *LRUCache[SVID, Update]) notifySubscriberIfSVIDAvailable(selectors []*common.Selector, subscriber *lruCacheSubscriber[Update]) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	set, setFree := allocSelectorSet(selectors...)
+	defer setFree()
+	if !c.missingSVIDRecords(set) {
+		subscriber.publish()
+		return true
+	}
+	return false
+}
+
+func (c *LRUCache[SVID, Update]) missingSVIDRecords(set selectorSet) bool {
 	records, recordsDone := c.getRecordsForSelectors(set)
 	defer recordsDone()
 
@@ -585,23 +689,9 @@ func (c *LRUCache) missingSVIDRecords(set selectorSet) bool {
 	return false
 }
 
-func (c *LRUCache) updateLastAccessTimestamp(selectors []*common.Selector) {
-	set, setFree := allocSelectorSet(selectors...)
-	defer setFree()
-
-	records, recordsDone := c.getRecordsForSelectors(set)
-	defer recordsDone()
-
-	now := c.clk.Now().UnixMilli()
-	for record := range records {
-		// Set lastAccessTimestamp so that svid LRU cache can be cleaned based on this timestamp
-		record.lastAccessTimestamp = now
-	}
-}
-
 // entries with active subscribers which are not cached will be put in staleEntries map
 // records which are not cached for remainder of max cache size will also be put in staleEntries map
-func (c *LRUCache) syncSVIDsWithSubscribers() (map[string]struct{}, []recordAccessEvent) {
+func (c *LRUCache[SVID, Update]) syncSVIDsWithSubscribers() (map[string]struct{}, []recordAccessEvent) {
 	activeSubsByEntryID := make(map[string]struct{})
 	lastAccessTimestamps := make([]recordAccessEvent, 0, len(c.records))
 
@@ -611,25 +701,23 @@ func (c *LRUCache) syncSVIDsWithSubscribers() (map[string]struct{}, []recordAcce
 	//       so that SVID will be cached in next sync
 	// 2. get lastAccessTimestamp of each entry
 	for id, record := range c.records {
-		for _, sel := range record.entry.Selectors {
-			if index, ok := c.selectors[makeSelector(sel)]; ok && index != nil {
-				if len(index.subs) > 0 {
-					if _, ok := c.svids[record.entry.EntryId]; !ok {
-						c.staleEntries[id] = true
-					}
-					activeSubsByEntryID[id] = struct{}{}
-					break
-				}
+		if record.activeSubscriberCount > 0 {
+			if _, ok := c.svids[record.entry.EntryId]; !ok {
+				c.staleEntries[id] = true
 			}
+			activeSubsByEntryID[id] = struct{}{}
 		}
 		lastAccessTimestamps = append(lastAccessTimestamps, newRecordAccessEvent(record.lastAccessTimestamp, id))
 	}
 
-	remainderSize := c.svidCacheMaxSize - len(c.svids)
 	// add records which are not cached for remainder of cache size
-	for id := range c.records {
+	remainderSize := c.svidCacheMaxSize - len(c.svids)
+	for id, record := range c.records {
 		if len(c.staleEntries) >= remainderSize {
 			break
+		}
+		if c.shouldPrefetch != nil && !c.shouldPrefetch(record.entry) {
+			continue
 		}
 		if _, svidCached := c.svids[id]; !svidCached {
 			if _, ok := c.staleEntries[id]; !ok {
@@ -641,7 +729,34 @@ func (c *LRUCache) syncSVIDsWithSubscribers() (map[string]struct{}, []recordAcce
 	return activeSubsByEntryID, lastAccessTimestamps
 }
 
-func (c *LRUCache) updateOrCreateRecord(newEntry *common.RegistrationEntry) (*lruCacheRecord, *common.RegistrationEntry) {
+func (c *LRUCache[SVID, Update]) countMatchingSubscribers(entry *common.RegistrationEntry, set selectorSet) int {
+	clearSelectorSet(set)
+	set.Merge(entry.Selectors...)
+
+	var candidates *selectorsMapIndex
+	for sel := range set {
+		index := c.getSelectorIndexForRead(sel)
+		if index == nil || len(index.subs) == 0 {
+			return 0
+		}
+		if candidates == nil || len(index.subs) < len(candidates.subs) {
+			candidates = index
+		}
+	}
+	if candidates == nil {
+		return 0
+	}
+
+	count := 0
+	for sub := range candidates.subs {
+		if sub.requiresSVIDs() && sub.superSetOf(set) {
+			count++
+		}
+	}
+	return count
+}
+
+func (c *LRUCache[SVID, Update]) updateOrCreateRecord(newEntry *common.RegistrationEntry) (*lruCacheRecord, *common.RegistrationEntry) {
 	var existingEntry *common.RegistrationEntry
 	record, recordExists := c.records[newEntry.EntryId]
 	if !recordExists {
@@ -654,7 +769,7 @@ func (c *LRUCache) updateOrCreateRecord(newEntry *common.RegistrationEntry) (*lr
 	return record, existingEntry
 }
 
-func (c *LRUCache) diffSelectors(existingEntry, newEntry *common.RegistrationEntry, added, removed selectorSet) {
+func (c *LRUCache[SVID, Update]) diffSelectors(existingEntry, newEntry *common.RegistrationEntry, added, removed selectorSet) {
 	// Make a set of all the selectors being added
 	if newEntry != nil {
 		added.Merge(newEntry.Selectors...)
@@ -675,8 +790,7 @@ func (c *LRUCache) diffSelectors(existingEntry, newEntry *common.RegistrationEnt
 	}
 }
 
-func (c *LRUCache) diffFederatesWith(existingEntry, newEntry *common.RegistrationEntry, added, removed stringSet) {
-	// Make a set of all the selectors being added
+func (c *LRUCache[SVID, Update]) diffFederatesWith(existingEntry, newEntry *common.RegistrationEntry, added, removed stringSet) {
 	if newEntry != nil {
 		added.Merge(newEntry.FederatesWith...)
 	}
@@ -695,26 +809,26 @@ func (c *LRUCache) diffFederatesWith(existingEntry, newEntry *common.Registratio
 	}
 }
 
-func (c *LRUCache) addSelectorIndicesRecord(selectors selectorSet, record *lruCacheRecord) {
-	for selector := range selectors {
-		c.addSelectorIndexRecord(selector, record)
+func (c *LRUCache[SVID, Update]) addSelectorIndicesRecord(selectors selectorSet, record *lruCacheRecord) {
+	for sel := range selectors {
+		c.addSelectorIndexRecord(sel, record)
 	}
 }
 
-func (c *LRUCache) addSelectorIndexRecord(s selector, record *lruCacheRecord) {
+func (c *LRUCache[SVID, Update]) addSelectorIndexRecord(s selector, record *lruCacheRecord) {
 	index := c.getSelectorIndexForWrite(s)
 	index.records[record] = struct{}{}
 }
 
-func (c *LRUCache) delSelectorIndicesRecord(selectors selectorSet, record *lruCacheRecord) {
-	for selector := range selectors {
-		c.delSelectorIndexRecord(selector, record)
+func (c *LRUCache[SVID, Update]) delSelectorIndicesRecord(selectors selectorSet, record *lruCacheRecord) {
+	for sel := range selectors {
+		c.delSelectorIndexRecord(sel, record)
 	}
 }
 
 // delSelectorIndexRecord removes the record from the selector index. If
-// the selector index is empty afterwards, it is also removed.
-func (c *LRUCache) delSelectorIndexRecord(s selector, record *lruCacheRecord) {
+// the selector index is empty afterward, it is also removed.
+func (c *LRUCache[SVID, Update]) delSelectorIndexRecord(s selector, record *lruCacheRecord) {
 	index, ok := c.selectors[s]
 	if ok {
 		delete(index.records, record)
@@ -724,14 +838,14 @@ func (c *LRUCache) delSelectorIndexRecord(s selector, record *lruCacheRecord) {
 	}
 }
 
-func (c *LRUCache) addSelectorIndexSub(s selector, sub *lruCacheSubscriber) {
+func (c *LRUCache[SVID, Update]) addSelectorIndexSub(s selector, sub baseSubscriber) {
 	index := c.getSelectorIndexForWrite(s)
 	index.subs[sub] = struct{}{}
 }
 
 // delSelectorIndexSub removes the subscription from the selector index. If
-// the selector index is empty afterwards, it is also removed.
-func (c *LRUCache) delSelectorIndexSub(s selector, sub *lruCacheSubscriber) {
+// the selector index is empty afterward, it is also removed.
+func (c *LRUCache[SVID, Update]) delSelectorIndexSub(s selector, sub baseSubscriber) {
 	index, ok := c.selectors[s]
 	if ok {
 		delete(index.subs, sub)
@@ -741,43 +855,59 @@ func (c *LRUCache) delSelectorIndexSub(s selector, sub *lruCacheSubscriber) {
 	}
 }
 
-func (c *LRUCache) unsubscribe(sub *lruCacheSubscriber) {
+func (c *LRUCache[SVID, Update]) unsubscribe(sub baseSubscriber) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for selector := range sub.set {
+
+	if sub.requiresSVIDs() {
+		records, recordsDone := c.getRecordsForSelectors(sub.getSet())
+		defer recordsDone()
+		for record := range records {
+			record.activeSubscriberCount--
+		}
+	}
+	for selector := range sub.getSet() {
 		c.delSelectorIndexSub(selector, sub)
 	}
 }
 
-func (c *LRUCache) notifyAll() {
+func (c *LRUCache[SVID, Update]) notifyAll() {
 	subs, subsDone := c.allSubscribers()
 	defer subsDone()
 	for sub := range subs {
-		c.notify(sub)
+		sub.publish()
 	}
 }
 
-func (c *LRUCache) notifyBySelectorSet(sets ...selectorSet) {
+func (c *LRUCache[SVID, Update]) notifyBySelectorSet(sets ...selectorSet) {
+	c.notifyMatchingSubscribers(false, sets...)
+}
+
+// notifySVIDSubscribersBySelectorSet is like notifyBySelectorSet, but skips
+// subscribers that do not require SVIDs.
+func (c *LRUCache[SVID, Update]) notifySVIDSubscribersBySelectorSet(sets ...selectorSet) {
+	c.notifyMatchingSubscribers(true, sets...)
+}
+
+func (c *LRUCache[SVID, Update]) notifyMatchingSubscribers(svidSubscribersOnly bool, sets ...selectorSet) {
 	notifiedSubs, notifiedSubsDone := allocLRUCacheSubscriberSet()
 	defer notifiedSubsDone()
 	for _, set := range sets {
 		subs, subsDone := c.getSubscribers(set)
 		defer subsDone()
 		for sub := range subs {
-			if _, notified := notifiedSubs[sub]; !notified && sub.set.SuperSetOf(set) {
-				c.notify(sub)
+			if svidSubscribersOnly && !sub.requiresSVIDs() {
+				continue
+			}
+			if _, notified := notifiedSubs[sub]; !notified && sub.superSetOf(set) {
+				sub.publish()
 				notifiedSubs[sub] = struct{}{}
 			}
 		}
 	}
 }
 
-func (c *LRUCache) notify(sub *lruCacheSubscriber) {
-	update := c.buildWorkloadUpdate(sub.set)
-	sub.notify(update)
-}
-
-func (c *LRUCache) allSubscribers() (lruCacheSubscriberSet, func()) {
+func (c *LRUCache[SVID, Update]) allSubscribers() (lruCacheSubscriberSet, func()) {
 	subs, subsDone := allocLRUCacheSubscriberSet()
 	for _, index := range c.selectors {
 		for sub := range index.subs {
@@ -787,7 +917,7 @@ func (c *LRUCache) allSubscribers() (lruCacheSubscriberSet, func()) {
 	return subs, subsDone
 }
 
-func (c *LRUCache) getSubscribers(set selectorSet) (lruCacheSubscriberSet, func()) {
+func (c *LRUCache[SVID, Update]) getSubscribers(set selectorSet) (lruCacheSubscriberSet, func()) {
 	subs, subsDone := allocLRUCacheSubscriberSet()
 	for s := range set {
 		if index := c.getSelectorIndexForRead(s); index != nil {
@@ -799,7 +929,7 @@ func (c *LRUCache) getSubscribers(set selectorSet) (lruCacheSubscriberSet, func(
 	return subs, subsDone
 }
 
-func (c *LRUCache) matchingIdentities(set selectorSet) []Identity {
+func (c *LRUCache[SVID, Update]) matchingEntries(set selectorSet) []*common.RegistrationEntry {
 	records, recordsDone := c.getRecordsForSelectors(set)
 	defer recordsDone()
 
@@ -807,30 +937,6 @@ func (c *LRUCache) matchingIdentities(set selectorSet) []Identity {
 		return nil
 	}
 
-	// Return identities in ascending "entry id" order to maintain a consistent
-	// ordering.
-	// TODO: figure out how to determine the "default" identity
-	out := make([]Identity, 0, len(records))
-	for record := range records {
-		if svid, ok := c.svids[record.entry.EntryId]; ok {
-			out = append(out, makeNewIdentity(record, svid))
-		}
-	}
-	sortIdentities(out)
-	return out
-}
-
-func (c *LRUCache) matchingEntries(set selectorSet) []*common.RegistrationEntry {
-	records, recordsDone := c.getRecordsForSelectors(set)
-	defer recordsDone()
-
-	if len(records) == 0 {
-		return nil
-	}
-
-	// Return identities in ascending "entry id" order to maintain a consistent
-	// ordering.
-	// TODO: figure out how to determine the "default" identity
 	out := make([]*common.RegistrationEntry, 0, len(records))
 	for record := range records {
 		out = append(out, record.entry)
@@ -839,42 +945,20 @@ func (c *LRUCache) matchingEntries(set selectorSet) []*common.RegistrationEntry 
 	return out
 }
 
-func (c *LRUCache) buildWorkloadUpdate(set selectorSet) *WorkloadUpdate {
-	w := &WorkloadUpdate{
+// buildEntriesAndBundlesUpdate builds the update for entry and bundle
+// subscribers. Callers must hold the read lock.
+func (c *LRUCache[SVID, Update]) buildEntriesAndBundlesUpdate(set selectorSet) *EntriesAndBundlesUpdate {
+	entries := c.matchingEntries(set)
+	return &EntriesAndBundlesUpdate{
+		Entries:          entries,
 		Bundle:           c.bundles[c.trustDomain],
-		FederatedBundles: make(map[spiffeid.TrustDomain]*spiffebundle.Bundle),
-		Identities:       c.matchingIdentities(set),
+		FederatedBundles: c.GatherFederatedBundles(entries),
 	}
-
-	// Add in the bundles the workload is federated with.
-	for _, identity := range w.Identities {
-		for _, federatesWith := range identity.Entry.FederatesWith {
-			td, err := spiffeid.TrustDomainFromString(federatesWith)
-			if err != nil {
-				c.log.WithFields(logrus.Fields{
-					telemetry.TrustDomainID: federatesWith,
-					logrus.ErrorKey:         err,
-				}).Warn("Invalid federated trust domain")
-				continue
-			}
-			if federatedBundle := c.bundles[td]; federatedBundle != nil {
-				w.FederatedBundles[td] = federatedBundle
-			} else {
-				c.log.WithFields(logrus.Fields{
-					telemetry.RegistrationID:  identity.Entry.EntryId,
-					telemetry.SPIFFEID:        identity.Entry.SpiffeId,
-					telemetry.FederatedBundle: federatesWith,
-				}).Warn("Federated bundle contents missing")
-			}
-		}
-	}
-
-	return w
 }
 
-func (c *LRUCache) getRecordsForSelectors(set selectorSet) (lruCacheRecordSet, func()) {
+func (c *LRUCache[SVID, Update]) getRecordsForSelectors(set selectorSet) (lruCacheRecordSet, func()) {
 	// Build and dedup a list of candidate entries. Don't check for selector set inclusion yet, since
-	// that is a more expensive operation and we could easily have duplicate
+	// that is a more expensive operation, and we could easily have duplicate
 	// entries to check.
 	records, recordsDone := allocLRUCacheRecordSet()
 	for selector := range set {
@@ -900,7 +984,7 @@ func (c *LRUCache) getRecordsForSelectors(set selectorSet) (lruCacheRecordSet, f
 // getSelectorIndexForWrite gets the selector index for the selector. If one
 // doesn't exist, it is created. Callers must hold the write lock. If the index
 // is only being read, then getSelectorIndexForRead should be used instead.
-func (c *LRUCache) getSelectorIndexForWrite(s selector) *selectorsMapIndex {
+func (c *LRUCache[SVID, Update]) getSelectorIndexForWrite(s selector) *selectorsMapIndex {
 	index, ok := c.selectors[s]
 	if !ok {
 		index = newSelectorsMapIndex()
@@ -909,34 +993,55 @@ func (c *LRUCache) getSelectorIndexForWrite(s selector) *selectorsMapIndex {
 	return index
 }
 
-// getSelectorIndexForRead gets the selector index for the selector. If one
-// doesn't exist, nil is returned. Callers should hold the read or write lock.
-// If the index is being modified, callers should use getSelectorIndexForWrite
-// instead.
-func (c *LRUCache) getSelectorIndexForRead(s selector) *selectorsMapIndex {
+func (c *LRUCache[SVID, Update]) getSelectorIndexForRead(s selector) *selectorsMapIndex {
 	if index, ok := c.selectors[s]; ok {
 		return index
 	}
 	return nil
 }
 
+// GatherFederatedBundles returns the federated trust bundles referenced by the
+// FederatesWith declarations of the given entries. Callers must hold the read lock.
+func (c *LRUCache[SVID, Update]) GatherFederatedBundles(entries []*common.RegistrationEntry) map[spiffeid.TrustDomain]*spiffebundle.Bundle {
+	federatedBundles := make(map[spiffeid.TrustDomain]*spiffebundle.Bundle)
+	for _, entry := range entries {
+		for _, federatesWith := range entry.FederatesWith {
+			td, err := spiffeid.TrustDomainFromString(federatesWith)
+			if err != nil {
+				c.log.WithFields(logrus.Fields{
+					telemetry.TrustDomainID: federatesWith,
+					logrus.ErrorKey:         err,
+				}).Warn("Invalid federated trust domain")
+				continue
+			}
+			if federatedBundle := c.bundles[td]; federatedBundle != nil {
+				federatedBundles[td] = federatedBundle
+			} else {
+				c.log.WithFields(logrus.Fields{
+					telemetry.RegistrationID:  entry.EntryId,
+					telemetry.SPIFFEID:        entry.SpiffeId,
+					telemetry.FederatedBundle: federatesWith,
+				}).Warn("Federated bundle contents missing")
+			}
+		}
+	}
+	return federatedBundles
+}
+
 type lruCacheRecord struct {
-	entry               *common.RegistrationEntry
-	subs                map[*lruCacheSubscriber]struct{}
-	lastAccessTimestamp int64
+	entry *common.RegistrationEntry
+	// svidEntry is the entry the cached SVID, if any, was issued for.
+	svidEntry             *common.RegistrationEntry
+	activeSubscriberCount int
+	lastAccessTimestamp   int64
 }
 
 func newLRUCacheRecord() *lruCacheRecord {
-	return &lruCacheRecord{
-		subs: make(map[*lruCacheSubscriber]struct{}),
-	}
+	return &lruCacheRecord{}
 }
 
 type selectorsMapIndex struct {
-	// subs holds the subscriptions related to this selector
-	subs map[*lruCacheSubscriber]struct{}
-
-	// records holds the cache records related to this selector
+	subs    map[baseSubscriber]struct{}
 	records map[*lruCacheRecord]struct{}
 }
 
@@ -946,7 +1051,7 @@ func (x *selectorsMapIndex) isEmpty() bool {
 
 func newSelectorsMapIndex() *selectorsMapIndex {
 	return &selectorsMapIndex{
-		subs:    make(map[*lruCacheSubscriber]struct{}),
+		subs:    make(map[baseSubscriber]struct{}),
 		records: make(map[*lruCacheRecord]struct{}),
 	}
 }
@@ -955,14 +1060,6 @@ func sortByTimestamps(records []recordAccessEvent) {
 	sort.Slice(records, func(a, b int) bool {
 		return records[a].timestamp < records[b].timestamp
 	})
-}
-
-func makeNewIdentity(record *lruCacheRecord, svid *X509SVID) Identity {
-	return Identity{
-		Entry:      record.entry,
-		SVID:       svid.Chain,
-		PrivateKey: svid.PrivateKey,
-	}
 }
 
 type recordAccessEvent struct {

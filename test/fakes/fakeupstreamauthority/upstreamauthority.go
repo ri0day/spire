@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"errors"
 	"math/big"
 	"sync"
 	"testing"
@@ -14,10 +15,12 @@ import (
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	upstreamauthorityv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/plugin/server/upstreamauthority/v1"
 	"github.com/spiffe/spire/pkg/common/coretypes/jwtkey"
+	"github.com/spiffe/spire/pkg/common/coretypes/witkey"
 	"github.com/spiffe/spire/pkg/common/coretypes/x509certificate"
 	"github.com/spiffe/spire/pkg/common/x509svid"
 	"github.com/spiffe/spire/pkg/common/x509util"
 	"github.com/spiffe/spire/proto/spire/common"
+	"github.com/spiffe/spire/test/clock"
 	"github.com/spiffe/spire/test/testkey"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
@@ -30,12 +33,18 @@ var (
 )
 
 type Config struct {
-	TrustDomain                 spiffeid.TrustDomain
-	UseIntermediate             bool
-	DisallowPublishJWTKey       bool
-	KeyUsage                    x509.KeyUsage
-	MutateMintX509CAResponse    func(*upstreamauthorityv1.MintX509CAResponse)
-	MutatePublishJWTKeyResponse func(*upstreamauthorityv1.PublishJWTKeyResponse)
+	Clock                                clock.Clock
+	TrustDomain                          spiffeid.TrustDomain
+	UseIntermediate                      bool
+	DisallowPublishJWTKey                bool
+	DisallowPublishWITKey                bool
+	PublishWITKeyErr                     error
+	UseSubscribeToLocalBundle            bool
+	KeyUsage                             x509.KeyUsage
+	MutateMintX509CAResponse             func(*upstreamauthorityv1.MintX509CAResponse)
+	MutatePublishJWTKeyResponse          func(*upstreamauthorityv1.PublishJWTKeyResponse)
+	MutatePublishWITKeyResponse          func(*upstreamauthorityv1.PublishWITKeyResponse)
+	MutateSubscribeToLocalBundleResponse func(*upstreamauthorityv1.SubscribeToLocalBundleResponse)
 }
 
 type UpstreamAuthority struct {
@@ -47,24 +56,32 @@ type UpstreamAuthority struct {
 	x509CAMtx        sync.RWMutex
 	x509CA           *x509svid.UpstreamCA
 	x509CASN         int64
-	x509Root         *x509.Certificate
+	x509Root         *x509certificate.X509Authority
 	x509Intermediate *x509.Certificate
-	x509Roots        []*x509.Certificate
+	x509Roots        []*x509certificate.X509Authority
 
 	jwtKeysMtx sync.RWMutex
 	jwtKeys    []*common.PublicKey
 
+	witKeysMtx sync.RWMutex
+	witKeys    []*common.PublicKey
+
 	streamsMtx           sync.Mutex
 	mintX509CAStreams    map[chan struct{}]struct{}
 	publishJWTKeyStreams map[chan struct{}]struct{}
+	publishWITKeyStreams map[chan struct{}]struct{}
 }
 
 func New(t *testing.T, config Config) *UpstreamAuthority {
+	if config.Clock == nil {
+		config.Clock = clock.NewMock(t)
+	}
 	ua := &UpstreamAuthority{
 		t:                    t,
 		config:               config,
 		mintX509CAStreams:    make(map[chan struct{}]struct{}),
 		publishJWTKeyStreams: make(map[chan struct{}]struct{}),
+		publishWITKeyStreams: make(map[chan struct{}]struct{}),
 	}
 	ua.RotateX509CA()
 	return ua
@@ -82,10 +99,14 @@ func (ua *UpstreamAuthority) MintX509CAAndSubscribe(request *upstreamauthorityv1
 	}
 
 	if err := ua.sendMintX509CAResponse(stream, &upstreamauthorityv1.MintX509CAResponse{
-		X509CaChain:       x509certificate.RequireToPluginProtos(x509CAChain),
+		X509CaChain:       x509certificate.RequireToPluginFromCertificates(x509CAChain),
 		UpstreamX509Roots: x509certificate.RequireToPluginProtos(ua.X509Roots()),
 	}); err != nil {
 		return err
+	}
+
+	if ua.config.UseSubscribeToLocalBundle {
+		return nil
 	}
 
 	for {
@@ -110,10 +131,9 @@ func (ua *UpstreamAuthority) PublishJWTKeyAndSubscribe(req *upstreamauthorityv1.
 	streamCh := ua.newPublishJWTKeyStream()
 	defer ua.removePublishJWTKeyStream(streamCh)
 
-	ctx := stream.Context()
-
 	ua.AppendJWTKey(jwtkey.RequireToCommonFromPluginProto(req.JwtKey))
 
+	ctx := stream.Context()
 	for {
 		select {
 		case <-ctx.Done():
@@ -124,6 +144,85 @@ func (ua *UpstreamAuthority) PublishJWTKeyAndSubscribe(req *upstreamauthorityv1.
 			}); err != nil {
 				return err
 			}
+
+			if ua.config.UseSubscribeToLocalBundle {
+				return nil
+			}
+		}
+	}
+}
+
+func (ua *UpstreamAuthority) PublishWITKeyAndSubscribe(req *upstreamauthorityv1.PublishWITKeyRequest, stream upstreamauthorityv1.UpstreamAuthority_PublishWITKeyAndSubscribeServer) error {
+	if ua.config.DisallowPublishWITKey {
+		return status.Error(codes.Unimplemented, "disallowed")
+	}
+	if ua.config.PublishWITKeyErr != nil {
+		return ua.config.PublishWITKeyErr
+	}
+
+	streamCh := ua.newPublishWITKeyStream()
+	defer ua.removePublishWITKeyStream(streamCh)
+
+	ua.AppendWITKey(witkey.RequireToCommonFromPluginProto(req.WitKey))
+
+	ctx := stream.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-streamCh:
+			if err := ua.sendPublishWITKeyStream(stream, &upstreamauthorityv1.PublishWITKeyResponse{
+				UpstreamWitKeys: witkey.RequireToPluginFromCommonProtos(ua.WITKeys()),
+			}); err != nil {
+				return err
+			}
+
+			if ua.config.UseSubscribeToLocalBundle {
+				return nil
+			}
+		}
+	}
+}
+
+func (ua *UpstreamAuthority) SubscribeToLocalBundle(req *upstreamauthorityv1.SubscribeToLocalBundleRequest, stream upstreamauthorityv1.UpstreamAuthority_SubscribeToLocalBundleServer) error {
+	if !ua.config.UseSubscribeToLocalBundle {
+		return status.Error(codes.Unimplemented, "fetching upstream trust bundle is unsupported")
+	}
+
+	x509StreamCh := ua.newMintX509CAStream()
+	defer ua.removeMintX509CAStream(x509StreamCh)
+
+	jwtStreamCh := ua.newPublishJWTKeyStream()
+	defer ua.removePublishJWTKeyStream(jwtStreamCh)
+
+	witStreamCh := ua.newPublishWITKeyStream()
+	defer ua.removePublishWITKeyStream(witStreamCh)
+
+	// Send a first update on the stream, as required.
+	if err := ua.sendSubscribeToLocalBundleStream(stream, &upstreamauthorityv1.SubscribeToLocalBundleResponse{
+		UpstreamX509Roots: x509certificate.RequireToPluginProtos(ua.X509Roots()),
+		UpstreamJwtKeys:   jwtkey.RequireToPluginFromCommonProtos(ua.JWTKeys()),
+		UpstreamWitKeys:   witkey.RequireToPluginFromCommonProtos(ua.WITKeys()),
+	}); err != nil {
+		return err
+	}
+
+	ctx := stream.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-x509StreamCh:
+		case <-jwtStreamCh:
+		case <-witStreamCh:
+		}
+
+		if err := ua.sendSubscribeToLocalBundleStream(stream, &upstreamauthorityv1.SubscribeToLocalBundleResponse{
+			UpstreamX509Roots: x509certificate.RequireToPluginProtos(ua.X509Roots()),
+			UpstreamJwtKeys:   jwtkey.RequireToPluginFromCommonProtos(ua.JWTKeys()),
+			UpstreamWitKeys:   witkey.RequireToPluginFromCommonProtos(ua.WITKeys()),
+		}); err != nil {
+			return err
 		}
 	}
 }
@@ -140,7 +239,7 @@ func (ua *UpstreamAuthority) RotateX509CA() {
 		caKey = x509IntKey
 	} else {
 		ua.createRootCertificate()
-		caCert = ua.x509Root
+		caCert = ua.x509Root.Certificate
 		caKey = x509RootKey
 	}
 
@@ -152,13 +251,30 @@ func (ua *UpstreamAuthority) RotateX509CA() {
 	ua.TriggerX509RootsChanged()
 }
 
-func (ua *UpstreamAuthority) X509Root() *x509.Certificate {
+func (ua *UpstreamAuthority) TaintAuthority(index int) error {
+	ua.x509CAMtx.Lock()
+	defer ua.x509CAMtx.Unlock()
+
+	rootsLen := len(ua.x509Roots)
+	if rootsLen == 0 {
+		return errors.New("no root to taint")
+	}
+	if index >= rootsLen {
+		return errors.New("out of range")
+	}
+
+	ua.x509Roots[index].Tainted = true
+	ua.TriggerX509RootsChanged()
+	return nil
+}
+
+func (ua *UpstreamAuthority) X509Root() *x509certificate.X509Authority {
 	ua.x509CAMtx.RLock()
 	defer ua.x509CAMtx.RUnlock()
 	return ua.x509Root
 }
 
-func (ua *UpstreamAuthority) X509Roots() []*x509.Certificate {
+func (ua *UpstreamAuthority) X509Roots() []*x509certificate.X509Authority {
 	ua.x509CAMtx.RLock()
 	defer ua.x509CAMtx.RUnlock()
 	return ua.x509Roots
@@ -183,6 +299,19 @@ func (ua *UpstreamAuthority) AppendJWTKey(jwtKey *common.PublicKey) {
 	ua.TriggerJWTKeysChanged()
 }
 
+func (ua *UpstreamAuthority) WITKeys() []*common.PublicKey {
+	ua.witKeysMtx.RLock()
+	defer ua.witKeysMtx.RUnlock()
+	return ua.witKeys
+}
+
+func (ua *UpstreamAuthority) AppendWITKey(witKey *common.PublicKey) {
+	ua.witKeysMtx.Lock()
+	defer ua.witKeysMtx.Unlock()
+	ua.witKeys = append(ua.witKeys, witKey)
+	ua.TriggerWITKeysChanged()
+}
+
 func (ua *UpstreamAuthority) TriggerX509RootsChanged() {
 	ua.streamsMtx.Lock()
 	defer ua.streamsMtx.Unlock()
@@ -198,6 +327,17 @@ func (ua *UpstreamAuthority) TriggerJWTKeysChanged() {
 	ua.streamsMtx.Lock()
 	defer ua.streamsMtx.Unlock()
 	for streamCh := range ua.publishJWTKeyStreams {
+		select {
+		case streamCh <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (ua *UpstreamAuthority) TriggerWITKeysChanged() {
+	ua.streamsMtx.Lock()
+	defer ua.streamsMtx.Unlock()
+	for streamCh := range ua.publishWITKeyStreams {
 		select {
 		case streamCh <- struct{}{}:
 		default:
@@ -262,9 +402,40 @@ func (ua *UpstreamAuthority) sendPublishJWTKeyStream(stream upstreamauthorityv1.
 	return stream.Send(resp)
 }
 
+func (ua *UpstreamAuthority) newPublishWITKeyStream() chan struct{} {
+	streamCh := make(chan struct{}, 1)
+	ua.streamsMtx.Lock()
+	ua.publishWITKeyStreams[streamCh] = struct{}{}
+	ua.streamsMtx.Unlock()
+	return streamCh
+}
+
+func (ua *UpstreamAuthority) removePublishWITKeyStream(streamCh chan struct{}) {
+	ua.streamsMtx.Lock()
+	delete(ua.publishWITKeyStreams, streamCh)
+	ua.streamsMtx.Unlock()
+}
+
+func (ua *UpstreamAuthority) sendPublishWITKeyStream(stream upstreamauthorityv1.UpstreamAuthority_PublishWITKeyAndSubscribeServer, resp *upstreamauthorityv1.PublishWITKeyResponse) error {
+	if ua.config.MutatePublishWITKeyResponse != nil {
+		ua.config.MutatePublishWITKeyResponse(resp)
+	}
+	return stream.Send(resp)
+}
+
+func (ua *UpstreamAuthority) sendSubscribeToLocalBundleStream(stream upstreamauthorityv1.UpstreamAuthority_SubscribeToLocalBundleServer, resp *upstreamauthorityv1.SubscribeToLocalBundleResponse) error {
+	if ua.config.MutateSubscribeToLocalBundleResponse != nil {
+		ua.config.MutateSubscribeToLocalBundleResponse(resp)
+	}
+	return stream.Send(resp)
+}
+
 func (ua *UpstreamAuthority) createRootCertificate() {
-	template := createCATemplate("FAKEUPSTREAMAUTHORITY-ROOT", ua.nextX509CASN(), ua.config.KeyUsage)
-	ua.x509Root = createCertificate(ua.t, template, template, &x509RootKey.PublicKey, x509RootKey)
+	template := createCATemplate(ua.config.Clock.Now(), "FAKEUPSTREAMAUTHORITY-ROOT", ua.nextX509CASN(), ua.config.KeyUsage)
+	root := createCertificate(ua.t, template, template, &x509RootKey.PublicKey, x509RootKey)
+	ua.x509Root = &x509certificate.X509Authority{
+		Certificate: root,
+	}
 	ua.x509Roots = append(ua.x509Roots, ua.x509Root)
 }
 
@@ -272,8 +443,8 @@ func (ua *UpstreamAuthority) createIntermediateCertificate() {
 	if ua.x509Root == nil {
 		ua.createRootCertificate()
 	}
-	template := createCATemplate("FAKEUPSTREAMAUTHORITY-INT", ua.nextX509CASN(), ua.config.KeyUsage)
-	ua.x509Intermediate = createCertificate(ua.t, template, ua.x509Root, &x509IntKey.PublicKey, x509RootKey)
+	template := createCATemplate(ua.config.Clock.Now(), "FAKEUPSTREAMAUTHORITY-INT", ua.nextX509CASN(), ua.config.KeyUsage)
+	ua.x509Intermediate = createCertificate(ua.t, template, ua.x509Root.Certificate, &x509IntKey.PublicKey, x509RootKey)
 }
 
 func (ua *UpstreamAuthority) nextX509CASN() int64 {
@@ -281,8 +452,7 @@ func (ua *UpstreamAuthority) nextX509CASN() int64 {
 	return ua.x509CASN
 }
 
-func createCATemplate(cn string, sn int64, keyUsage x509.KeyUsage) *x509.Certificate {
-	now := time.Now()
+func createCATemplate(now time.Time, cn string, sn int64, keyUsage x509.KeyUsage) *x509.Certificate {
 	return &x509.Certificate{
 		SerialNumber: big.NewInt(sn),
 		Subject: pkix.Name{
@@ -296,8 +466,8 @@ func createCATemplate(cn string, sn int64, keyUsage x509.KeyUsage) *x509.Certifi
 	}
 }
 
-func createCertificate(t *testing.T, template, parent *x509.Certificate, pub crypto.PublicKey, priv crypto.PrivateKey) *x509.Certificate {
-	certDER, err := x509.CreateCertificate(rand.Reader, template, parent, pub, priv)
+func createCertificate(t *testing.T, template, parent *x509.Certificate, publicKey crypto.PublicKey, privateKey crypto.PrivateKey) *x509.Certificate {
+	certDER, err := x509.CreateCertificate(rand.Reader, template, parent, publicKey, privateKey)
 	require.NoError(t, err, "unable to sign certificate")
 
 	cert, err := x509.ParseCertificate(certDER)

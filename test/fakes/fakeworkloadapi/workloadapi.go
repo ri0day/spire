@@ -28,10 +28,13 @@ type WorkloadAPI struct {
 	ExpFetchJWTSVIDReq    *workload.JWTSVIDRequest
 	ExpFetchJWTBundlesReq *workload.JWTBundlesRequest
 
-	fetchX509SVIDRequest   FakeRequest
-	fetchJWTSVIDRequest    FakeRequest
-	fetchJWTBundlesRequest FakeRequest
-	validateJWTRequest     FakeRequest
+	fetchX509SVIDRequest    FakeRequest
+	fetchX509BundlesRequest FakeRequest
+	fetchJWTSVIDRequest     FakeRequest
+	fetchJWTBundlesRequest  FakeRequest
+	fetchWITSVIDRequest     FakeRequest
+	fetchWITBundlesRequest  FakeRequest
+	validateJWTRequest      FakeRequest
 }
 
 func New(t *testing.T, responses ...*FakeRequest) *WorkloadAPI {
@@ -45,10 +48,16 @@ func New(t *testing.T, responses ...*FakeRequest) *WorkloadAPI {
 		switch response.Resp.(type) {
 		case *workload.X509SVIDResponse:
 			w.fetchX509SVIDRequest = *response
+		case *workload.X509BundlesResponse:
+			w.fetchX509BundlesRequest = *response
 		case *workload.JWTSVIDResponse:
 			w.fetchJWTSVIDRequest = *response
 		case *workload.JWTBundlesResponse:
 			w.fetchJWTBundlesRequest = *response
+		case *workload.WITSVIDResponse:
+			w.fetchWITSVIDRequest = *response
+		case *workload.WITBundlesResponse:
+			w.fetchWITBundlesRequest = *response
 		case *workload.ValidateJWTSVIDResponse:
 			w.validateJWTRequest = *response
 		default:
@@ -85,6 +94,31 @@ func (w *WorkloadAPI) FetchX509SVID(req *workload.X509SVIDRequest, stream worklo
 		<-stream.Context().Done()
 	} else {
 		require.FailNow(w.t, fmt.Sprintf("unexpected message type %T", w.fetchX509SVIDRequest.Resp))
+	}
+
+	return nil
+}
+
+func (w *WorkloadAPI) FetchX509Bundles(req *workload.X509BundlesRequest, stream workload.SpiffeWorkloadAPI_FetchX509BundlesServer) error {
+	if err := checkSecurityHeader(stream.Context()); err != nil {
+		return err
+	}
+
+	if w.fetchX509BundlesRequest.Err != nil {
+		return w.fetchX509BundlesRequest.Err
+	}
+
+	if request, ok := w.fetchX509BundlesRequest.Req.(*workload.X509BundlesRequest); ok {
+		spiretest.AssertProtoEqual(w.t, request, req)
+	} else {
+		require.FailNow(w.t, fmt.Sprintf("unexpected message type %T", w.fetchX509BundlesRequest.Req))
+	}
+
+	if response, ok := w.fetchX509BundlesRequest.Resp.(*workload.X509BundlesResponse); ok {
+		_ = stream.Send(response)
+		<-stream.Context().Done()
+	} else {
+		require.FailNow(w.t, fmt.Sprintf("unexpected message type %T", w.fetchX509BundlesRequest.Resp))
 	}
 
 	return nil
@@ -128,6 +162,56 @@ func (w *WorkloadAPI) FetchJWTBundles(req *workload.JWTBundlesRequest, stream wo
 	} else {
 		require.FailNow(w.t, fmt.Sprintf("unexpected message type %T", w.fetchJWTBundlesRequest.Resp))
 	}
+	return nil
+}
+
+func (w *WorkloadAPI) FetchWITSVID(req *workload.WITSVIDRequest, stream workload.SpiffeWorkloadAPI_FetchWITSVIDServer) error {
+	if err := checkSecurityHeader(stream.Context()); err != nil {
+		return err
+	}
+
+	if w.fetchWITSVIDRequest.Err != nil {
+		return w.fetchWITSVIDRequest.Err
+	}
+
+	if request, ok := w.fetchWITSVIDRequest.Req.(*workload.WITSVIDRequest); ok {
+		spiretest.AssertProtoEqual(w.t, request, req)
+	} else {
+		require.FailNow(w.t, fmt.Sprintf("unexpected message type %T", w.fetchWITSVIDRequest.Req))
+	}
+
+	if response, ok := w.fetchWITSVIDRequest.Resp.(*workload.WITSVIDResponse); ok {
+		_ = stream.Send(response)
+		<-stream.Context().Done()
+	} else {
+		require.FailNow(w.t, fmt.Sprintf("unexpected message type %T", w.fetchWITSVIDRequest.Resp))
+	}
+
+	return nil
+}
+
+func (w *WorkloadAPI) FetchWITBundles(req *workload.WITBundlesRequest, stream workload.SpiffeWorkloadAPI_FetchWITBundlesServer) error {
+	if err := checkSecurityHeader(stream.Context()); err != nil {
+		return err
+	}
+
+	if w.fetchWITBundlesRequest.Err != nil {
+		return w.fetchWITBundlesRequest.Err
+	}
+
+	if request, ok := w.fetchWITBundlesRequest.Req.(*workload.WITBundlesRequest); ok {
+		spiretest.AssertProtoEqual(w.t, request, req)
+	} else {
+		require.FailNow(w.t, fmt.Sprintf("unexpected message type %T", w.fetchWITBundlesRequest.Req))
+	}
+
+	if response, ok := w.fetchWITBundlesRequest.Resp.(*workload.WITBundlesResponse); ok {
+		_ = stream.Send(response)
+		<-stream.Context().Done()
+	} else {
+		require.FailNow(w.t, fmt.Sprintf("unexpected message type %T", w.fetchWITBundlesRequest.Resp))
+	}
+
 	return nil
 }
 

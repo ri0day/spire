@@ -10,6 +10,7 @@ import (
 	common "github.com/spiffe/spire/pkg/common/catalog"
 	"github.com/spiffe/spire/pkg/common/health"
 	"github.com/spiffe/spire/pkg/common/telemetry"
+	"github.com/spiffe/spire/pkg/common/tlspolicy"
 	loggerv1 "github.com/spiffe/spire/pkg/server/api/logger/v1"
 	"github.com/spiffe/spire/pkg/server/authpolicy"
 	bundle_client "github.com/spiffe/spire/pkg/server/bundle/client"
@@ -29,6 +30,15 @@ type Config struct {
 
 	// If true enables audit logs
 	AuditLogEnabled bool
+
+	// AuditLogExcludeAgentSync omits successful agent sync reads from audit logs.
+	AuditLogExcludeAgentSync bool
+
+	// ProxyProtocolTrustedCIDRs is a list of trusted CIDRs for PROXY protocol.
+	// When non-empty, the server enables PROXY protocol on the TCP listener and
+	// restricts PROXY header acceptance to connections originating from these
+	// CIDRs. Connections from other sources that send PROXY headers are rejected.
+	ProxyProtocolTrustedCIDRs []string
 
 	// Address of SPIRE server
 	BindAddress *net.TCPAddr
@@ -65,6 +75,9 @@ type Config struct {
 	// JWTSVIDTTL is default time-to-live for SVIDs (overrides SVIDTTL)
 	JWTSVIDTTL time.Duration
 
+	// WITSVIDTTL is default time-to-live for WIT-SVIDs
+	WITSVIDTTL time.Duration
+
 	// CATTL is the time-to-live for the server CA. This only applies to
 	// self-signed CA certificates, otherwise it is up to the upstream CA.
 	CATTL time.Duration
@@ -72,6 +85,10 @@ type Config struct {
 	// JWTIssuer is used as the issuer claim in JWT-SVIDs minted by the server.
 	// If unset, the JWT-SVID will not have an issuer claim.
 	JWTIssuer string
+
+	// WITIssuer is used as the issuer claim in WIT-SVIDs minted by the server.
+	// If unset, the WIT-SVID will not have an issuer claim.
+	WITIssuer string
 
 	// CASubject is the subject used in the CA certificate
 	CASubject pkix.Name
@@ -88,6 +105,9 @@ type Config struct {
 	// JWTKeyType is the key type used for JWT signing keys
 	JWTKeyType keymanager.KeyType
 
+	// WITKeyType is the key type used for WIT signing keys
+	WITKeyType keymanager.KeyType
+
 	// Federation holds the configuration needed to federate with other
 	// trust domains.
 	Federation FederationConfig
@@ -98,11 +118,17 @@ type Config struct {
 	// CacheReloadInterval controls how often the in-memory entry cache reloads
 	CacheReloadInterval time.Duration
 
+	// FullCacheReloadInterval controls how often the in-memory entry goes through a full reload
+	FullCacheReloadInterval time.Duration
+
 	// EventsBasedCache enabled event driven cache reloads
 	EventsBasedCache bool
 
 	// PruneEventsOlderThan controls how long events can live before they are pruned
 	PruneEventsOlderThan time.Duration
+
+	// EventTimeout controls how long to wait for an event before giving up
+	EventTimeout time.Duration
 
 	// AuthPolicyEngineConfig determines the config for authz policy
 	AuthOpaPolicyEngineConfig *authpolicy.OpaEngineConfig
@@ -111,11 +137,42 @@ type Config struct {
 	// X509-SVID, are granted admin rights.
 	AdminIDs []spiffeid.ID
 
-	// Temporary flag to allow disabling the inclusion of serial number in X509 CAs Subject field
-	ExcludeSNFromCASubject bool
+	// TLSPolicy determines the policy settings to apply to all TLS connections.
+	TLSPolicy tlspolicy.Policy
+
+	// PruneAttestedNodesExpiredFor enables periodic removal of attested nodes
+	// with X509-SVID expiration date further than a given time interval in the
+	// past. Non-reattestable nodes are not pruned by default. Banned nodes are
+	// not pruned.
+	PruneAttestedNodesExpiredFor time.Duration
+
+	// PruneNonReattestableNodes, if true, includes non-reattestable nodes in the list
+	// considered for pruning.
+	PruneNonReattestableNodes bool
+
+	// PruneAttestedNodesBatchSize is the maximum number of expired attested
+	// nodes pruned per cycle. When non-positive, a default is used. Only applies
+	// when PruneAttestedNodesExpiredFor is set.
+	PruneAttestedNodesBatchSize int
+
+	// MaxAttestedNodeInfoStaleness determines how long to trust cached attested
+	// node information, before requiring refreshing it from the datastore.
+	MaxAttestedNodeInfoStaleness time.Duration
+
+	// DisableJWTSVIDs, if true, JWT-SVID profile is disabled
+	DisableJWTSVIDs bool
+
+	// DisableWITSVIDs, if true, WIT-SVID profile is disabled
+	DisableWITSVIDs bool
 }
 
 type ExperimentalConfig struct {
+	// AgentSpiffeIdAsSelector, if true, includes the agent spiffe id as a node selector.
+	AgentSpiffeIdAsSelector bool
+
+	// AllowNonconformingAgentIDs, if true, allows node attestors to produce agent
+	// IDs outside of their reserved namespace.
+	AllowNonconformingAgentIDs bool
 }
 
 type FederationConfig struct {

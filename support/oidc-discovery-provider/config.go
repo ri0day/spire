@@ -1,12 +1,18 @@
 package main
 
 import (
+	"errors"
+	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"time"
 
 	"github.com/hashicorp/hcl"
-	"github.com/zeebo/errs"
+	"github.com/hashicorp/hcl/hcl/ast"
+	"github.com/spiffe/spire/pkg/common/config"
+	spirelog "github.com/spiffe/spire/pkg/common/log"
+	"github.com/spiffe/spire/pkg/common/tlspolicy"
 )
 
 const (
@@ -24,6 +30,11 @@ type Config struct {
 	LogFormat string `hcl:"log_format"`
 	LogLevel  string `hcl:"log_level"`
 	LogPath   string `hcl:"log_path"`
+
+	// LogFileRotation, when set, has the provider rotate LogPath itself. The
+	// provider does not handle SIGUSR2, so without it rotation is left to an
+	// external tool using logrotate's lossy copytruncate.
+	LogFileRotation *spirelog.RotationConfig `hcl:"log_file_rotation"`
 
 	// LogRequests is a debug option that logs all incoming requests
 	LogRequests bool `hcl:"log_requests"`
@@ -54,12 +65,25 @@ type Config struct {
 	// on, for when deployed behind another webserver or sidecar.
 	ListenSocketPath string `hcl:"listen_socket_path"`
 
+	// ServingCertSource is the configuration for the source of the certificate
+	// used to serve HTTPS. It is a labeled section whose label selects the
+	// source, e.g. `serving_cert_source "workload_api" {}`. It is required
+	// unless InsecureAddr, ListenSocketPath (ListenNamedPipeName on Windows)
+	// or one of the deprecated ACME or ServingCertFile sections is set.
+	ServingCertSource *ServingCertSourceConfig `hcl:"serving_cert_source"`
+
 	// ACME is the ACME configuration. It is required unless InsecureAddr or
 	// ListenSocketPath is set, or if ServingCertFile is used.
+	//
+	// Deprecated: use ServingCertSource with the "acme" label instead. It is
+	// populated from that section by ParseConfig when it is used.
 	ACME *ACMEConfig `hcl:"acme"`
 
 	// ServingCertFile is the configuration for using a serving certificate to serve HTTPS.
 	// It is required unless InsecureAddr or ListenSocketPath is set, or if ACME configuration is used.
+	//
+	// Deprecated: use ServingCertSource with the "cert_file" label instead. It
+	// is populated from that section by ParseConfig when it is used.
 	ServingCertFile *ServingCertFileConfig `hcl:"serving_cert_file"`
 
 	// ServerAPI is the configuration for using the SPIRE Server API as the
@@ -70,11 +94,55 @@ type Config struct {
 	// as the source for the public keys. Only one source can be configured.
 	WorkloadAPI *WorkloadAPIConfig `hcl:"workload_api"`
 
+	// File is the configuration for using a file as the source for the public keys. Only one source can be
+	// configured.
+	File *FileConfig `hcl:"file"`
+
 	// Health checks enable Liveness and Readiness probes.
 	HealthChecks *HealthChecksConfig `hcl:"health_checks"`
 
 	// Experimental options that are subject to change or removal.
 	Experimental experimentalConfig `hcl:"experimental"`
+
+	// TLSConfig configures TLS settings for HTTPS listeners
+	// (disk certificate and ACME modes).
+	TLSConfig *tlspolicy.TLSConfig `hcl:"tls_config"`
+
+	// JWTIssuer specifies the issuer for the OIDC provider configuration request.
+	JWTIssuer string `hcl:"jwt_issuer"`
+
+	// JWKSURI specifies the absolute uri to the jwks keys document. Use this if you are fronting the
+	// discovery provider with a load balancer or reverse proxy
+	JWKSURI string `hcl:"jwks_uri"`
+
+	// ServerPathPrefix specifies the prefix to strip from the path of requests to route to the server.
+	// Example: if ServerPathPrefix is /foo then a request to http://127.0.0.1/foo/.well-known/openid-configuration and
+	// http://127.0.0.1/foo/keys will function with the server.
+	ServerPathPrefix string `hcl:"server_path_prefix"`
+}
+
+// ServingCertSourceConfig holds the configuration of the serving certificate
+// source. The label of the serving_cert_source section is decoded into the
+// field of the same name. Exactly one source must be configured.
+type ServingCertSourceConfig struct {
+	// ACME obtains the serving certificate via ACME.
+	ACME *ACMEConfig `hcl:"acme"`
+	// CertFile loads the serving certificate and key from disk.
+	CertFile *ServingCertFileConfig `hcl:"cert_file"`
+	// WorkloadAPI serves an X509-SVID obtained from the SPIFFE Workload API.
+	WorkloadAPI *ServingCertWorkloadAPIConfig `hcl:"workload_api"`
+}
+
+type ServingCertWorkloadAPIConfig struct {
+	// SocketPath is the path to the Workload API Unix Domain socket. It defaults
+	// to the socket path of the workload_api section when that is configured.
+	SocketPath string `hcl:"socket_path"`
+	// Addr is the address to listen on. This is optional and defaults to ":443".
+	Addr *net.TCPAddr `hcl:"-"`
+	// RawAddr holds the string version of the Addr. Consumers should use Addr instead.
+	RawAddr string `hcl:"addr"`
+	// Experimental options that are subject to change or removal.
+	Experimental experimentalWorkloadAPIConfig `hcl:"experimental"`
 }
 
 type ServingCertFileConfig struct {
@@ -156,6 +224,20 @@ type WorkloadAPIConfig struct {
 	Experimental experimentalWorkloadAPIConfig `hcl:"experimental"`
 }
 
+type FileConfig struct {
+	// Path is the path to the file the bundle is stored in.
+	Path string `hcl:"path"`
+
+	// PollInterval controls how frequently the service polls the Workload
+	// API for the bundle containing the JWT public keys. This value is calculated
+	// by LoadConfig()/ParseConfig() from RawPollInterval.
+	PollInterval time.Duration `hcl:"-"`
+
+	// RawPollInterval holds the string version of the PollInterval. Consumers
+	// should use PollInterval instead.
+	RawPollInterval string `hcl:"poll_interval"`
+}
+
 type HealthChecksConfig struct {
 	// Listener port binding
 	BindPort int `hcl:"bind_port"`
@@ -181,28 +263,68 @@ type experimentalWorkloadAPIConfig struct {
 	NamedPipeName string `hcl:"named_pipe_name" json:"named_pipe_name"`
 }
 
-func LoadConfig(path string) (*Config, error) {
+func LoadConfig(path string, expandEnv bool) (*Config, error) {
 	hclBytes, err := os.ReadFile(path)
 	if err != nil {
-		return nil, errs.New("unable to load configuration: %v", err)
+		return nil, fmt.Errorf("unable to load configuration: %w", err)
 	}
-	return ParseConfig(string(hclBytes))
+	hclString := string(hclBytes)
+	if expandEnv {
+		hclString = config.ExpandEnv(hclString)
+	}
+	return ParseConfig(hclString)
 }
 
 func ParseConfig(hclConfig string) (_ *Config, err error) {
 	c := new(Config)
 	if err := hcl.Decode(c, hclConfig); err != nil {
-		return nil, errs.New("unable to decode configuration: %v", err)
+		return nil, fmt.Errorf("unable to decode configuration: %w", err)
 	}
 
 	if c.LogLevel == "" {
 		c.LogLevel = defaultLogLevel
 	}
 
+	if c.LogFileRotation != nil {
+		if c.LogPath == "" {
+			return nil, errors.New("log_path must be configured to use the log_file_rotation configuration section")
+		}
+		if err := c.LogFileRotation.Validate(); err != nil {
+			return nil, fmt.Errorf("invalid log_file_rotation configuration section: %w", err)
+		}
+	}
+
 	if len(c.Domains) == 0 {
-		return nil, errs.New("at least one domain must be configured")
+		return nil, errors.New("at least one domain must be configured")
 	}
 	c.Domains = dedupeList(c.Domains)
+
+	if err := validateServingCertSourceSections(hclConfig); err != nil {
+		return nil, err
+	}
+	if c.ServingCertSource != nil {
+		if c.ACME != nil || c.ServingCertFile != nil {
+			return nil, errors.New("the acme and serving_cert_file sections cannot be used together with the serving_cert_source section")
+		}
+		// The deprecated acme and serving_cert_file sections are the legacy
+		// spelling of the "acme" and "cert_file" sources. Alias them so the
+		// rest of the provider has a single place to look.
+		c.ACME = c.ServingCertSource.ACME
+		c.ServingCertFile = c.ServingCertSource.CertFile
+
+		if workloadAPI := c.ServingCertSource.WorkloadAPI; workloadAPI != nil {
+			if workloadAPI.RawAddr == "" {
+				workloadAPI.RawAddr = defaultAddr
+			}
+			workloadAPI.Addr, err = net.ResolveTCPAddr("tcp", workloadAPI.RawAddr)
+			if err != nil {
+				return nil, fmt.Errorf(`invalid addr in the serving_cert_source "workload_api" configuration section: %w`, err)
+			}
+		}
+	}
+
+	// Name the section the user actually wrote in the error messages.
+	acmeSection, certFileSection := c.acmeSectionName(), c.certFileSectionName()
 
 	if c.ACME != nil {
 		c.ACME.CacheDir = defaultCacheDir
@@ -211,20 +333,20 @@ func ParseConfig(hclConfig string) (_ *Config, err error) {
 		}
 		switch {
 		case c.InsecureAddr != "":
-			return nil, errs.New("insecure_addr and the acme section are mutually exclusive")
+			return nil, fmt.Errorf("insecure_addr and the %s section are mutually exclusive", acmeSection)
 		case !c.ACME.ToSAccepted:
-			return nil, errs.New("tos_accepted must be set to true in the acme configuration section")
+			return nil, fmt.Errorf("tos_accepted must be set to true in the %s configuration section", acmeSection)
 		case c.ACME.Email == "":
-			return nil, errs.New("email must be configured in the acme configuration section")
+			return nil, fmt.Errorf("email must be configured in the %s configuration section", acmeSection)
 		}
 	}
 
 	if c.ServingCertFile != nil {
 		if c.ServingCertFile.CertFilePath == "" {
-			return nil, errs.New("cert_file_path must be configured in the serving_cert_file configuration section")
+			return nil, fmt.Errorf("cert_file_path must be configured in the %s configuration section", certFileSection)
 		}
 		if c.ServingCertFile.KeyFilePath == "" {
-			return nil, errs.New("key_file_path must be configured in the serving_cert_file configuration section")
+			return nil, fmt.Errorf("key_file_path must be configured in the %s configuration section", certFileSection)
 		}
 
 		if c.ServingCertFile.RawAddr == "" {
@@ -233,13 +355,13 @@ func ParseConfig(hclConfig string) (_ *Config, err error) {
 
 		addr, err := net.ResolveTCPAddr("tcp", c.ServingCertFile.RawAddr)
 		if err != nil {
-			return nil, errs.New("invalid addr in the serving_cert_file configuration section: %v", err)
+			return nil, fmt.Errorf("invalid addr in the %s configuration section: %w", certFileSection, err)
 		}
 		c.ServingCertFile.Addr = addr
 
 		c.ServingCertFile.FileSyncInterval, err = parseDurationField(c.ServingCertFile.RawFileSyncInterval, defaultFileSyncInterval)
 		if err != nil {
-			return nil, errs.New("invalid file_sync_interval in the serving_cert_file configuration section: %v", err)
+			return nil, fmt.Errorf("invalid file_sync_interval in the %s configuration section: %w", certFileSection, err)
 		}
 	}
 
@@ -248,18 +370,26 @@ func ParseConfig(hclConfig string) (_ *Config, err error) {
 	if c.ServerAPI != nil {
 		c.ServerAPI.PollInterval, err = parseDurationField(c.ServerAPI.RawPollInterval, defaultPollInterval)
 		if err != nil {
-			return nil, errs.New("invalid poll_interval in the server_api configuration section: %v", err)
+			return nil, fmt.Errorf("invalid poll_interval in the server_api configuration section: %w", err)
 		}
 		methodCount++
 	}
 
 	if c.WorkloadAPI != nil {
 		if c.WorkloadAPI.TrustDomain == "" {
-			return nil, errs.New("trust_domain must be configured in the workload_api configuration section")
+			return nil, errors.New("trust_domain must be configured in the workload_api configuration section")
 		}
 		c.WorkloadAPI.PollInterval, err = parseDurationField(c.WorkloadAPI.RawPollInterval, defaultPollInterval)
 		if err != nil {
-			return nil, errs.New("invalid poll_interval in the workload_api configuration section: %v", err)
+			return nil, fmt.Errorf("invalid poll_interval in the workload_api configuration section: %w", err)
+		}
+		methodCount++
+	}
+
+	if c.File != nil {
+		c.File.PollInterval, err = parseDurationField(c.File.RawPollInterval, defaultPollInterval)
+		if err != nil {
+			return nil, fmt.Errorf("invalid poll_interval in the file configuration section: %w", err)
 		}
 		methodCount++
 	}
@@ -282,13 +412,94 @@ func ParseConfig(hclConfig string) (_ *Config, err error) {
 
 	switch methodCount {
 	case 0:
-		return nil, errs.New("either the server_api or workload_api section must be configured")
+		return nil, errors.New("exactly one of the server_api, workload_api, or file sections must be configured")
 	case 1:
 	default:
-		return nil, errs.New("the server_api and workload_api sections are mutually exclusive")
+		return nil, errors.New("the server_api, workload_api, and file sections are mutually exclusive")
+	}
+	if c.JWTIssuer != "" {
+		jwtIssuer, err := url.Parse(c.JWTIssuer)
+		switch {
+		case err != nil:
+			return nil, fmt.Errorf("the jwt_issuer url could not be parsed: %w", err)
+		case jwtIssuer.Scheme == "":
+			return nil, errors.New("the jwt_issuer url must contain a scheme")
+		case jwtIssuer.Host == "":
+			return nil, errors.New("the jwt_issuer url must contain a host")
+		}
+	}
+	if c.JWKSURI != "" {
+		jwksURI, err := url.Parse(c.JWKSURI)
+		if err != nil || jwksURI.Scheme == "" || jwksURI.Host == "" {
+			return nil, fmt.Errorf("the jwks_uri setting could not be parsed: %w", err)
+		}
+	}
+	if c.JWKSURI == "" && c.JWTIssuer != "" {
+		fmt.Printf("Warning: The jwt_issuer configuration will also affect the jwks_uri behavior when jwks_url is not set. This behaviour will be changed in 1.13.0.")
 	}
 
 	return c, nil
+}
+
+// validateServingCertSourceSections checks the serving_cert_source sections
+// on the raw HCL. Decoding merges sections sharing a label and drops unknown
+// labels, so duplicates and typos are only visible before decoding.
+func validateServingCertSourceSections(hclConfig string) error {
+	root, err := hcl.Parse(hclConfig)
+	if err != nil {
+		return fmt.Errorf("unable to parse configuration: %w", err)
+	}
+	objectList, ok := root.Node.(*ast.ObjectList)
+	if !ok {
+		return errors.New("malformed configuration")
+	}
+	items := objectList.Filter("serving_cert_source").Items
+	switch len(items) {
+	case 0:
+		return nil
+	case 1:
+	default:
+		return errors.New("only one serving_cert_source section can be configured")
+	}
+	if len(items[0].Keys) != 1 {
+		return errors.New(`serving_cert_source must have exactly one label, e.g. serving_cert_source "workload_api" {}`)
+	}
+	label, ok := items[0].Keys[0].Token.Value().(string)
+	if !ok {
+		return errors.New("invalid serving_cert_source label")
+	}
+	switch label {
+	case "acme", "cert_file", "workload_api":
+		return nil
+	default:
+		return fmt.Errorf(`unknown serving_cert_source %q: must be one of "acme", "cert_file", or "workload_api"`, label)
+	}
+}
+
+// servingCertWorkloadAPI returns the serving_cert_source "workload_api"
+// configuration, or nil if it is not configured.
+func (c *Config) servingCertWorkloadAPI() *ServingCertWorkloadAPIConfig {
+	if c.ServingCertSource == nil {
+		return nil
+	}
+	return c.ServingCertSource.WorkloadAPI
+}
+
+// acmeSectionName and certFileSectionName name the section the user wrote
+// in error messages: the "acme" and "cert_file" sources are aliased onto the
+// deprecated acme and serving_cert_file sections.
+func (c *Config) acmeSectionName() string {
+	if c.ServingCertSource != nil {
+		return `serving_cert_source "acme"`
+	}
+	return "acme"
+}
+
+func (c *Config) certFileSectionName() string {
+	if c.ServingCertSource != nil {
+		return `serving_cert_source "cert_file"`
+	}
+	return "serving_cert_file"
 }
 
 func dedupeList(items []string) []string {

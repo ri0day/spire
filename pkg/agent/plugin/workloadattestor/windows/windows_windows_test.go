@@ -12,7 +12,9 @@ import (
 
 	"github.com/sirupsen/logrus"
 	"github.com/sirupsen/logrus/hooks/test"
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/spire/pkg/agent/plugin/workloadattestor"
+	"github.com/spiffe/spire/pkg/common/catalog"
 	"github.com/spiffe/spire/pkg/common/telemetry"
 	"github.com/spiffe/spire/test/plugintest"
 	"github.com/spiffe/spire/test/spiretest"
@@ -49,6 +51,7 @@ func TestAttest(t *testing.T) {
 
 	testCases := []struct {
 		name            string
+		trustDomain     string
 		expectSelectors []string
 		config          string
 		pq              *fakeProcessQuery
@@ -57,7 +60,8 @@ func TestAttest(t *testing.T) {
 		expectLogs      []spiretest.LogEntry
 	}{
 		{
-			name: "successful no groups",
+			name:        "successful no groups",
+			trustDomain: "example.org",
 			pq: &fakeProcessQuery{
 				handle:      windows.InvalidHandle,
 				tokenUser:   &windows.Tokenuser{User: windows.SIDAndAttributes{Sid: sidUser}},
@@ -72,7 +76,8 @@ func TestAttest(t *testing.T) {
 			expectCode: codes.OK,
 		},
 		{
-			name: "successful with groups all enabled",
+			name:        "successful with groups all enabled",
+			trustDomain: "example.org",
 			pq: &fakeProcessQuery{
 				handle:           windows.InvalidHandle,
 				tokenUser:        &windows.Tokenuser{User: windows.SIDAndAttributes{Sid: sidUser}},
@@ -92,7 +97,8 @@ func TestAttest(t *testing.T) {
 			expectCode: codes.OK,
 		},
 		{
-			name: "successful with not enabled group",
+			name:        "successful with not enabled group",
+			trustDomain: "example.org",
 			pq: &fakeProcessQuery{
 				handle:           windows.InvalidHandle,
 				tokenUser:        &windows.Tokenuser{User: windows.SIDAndAttributes{Sid: sidUser}},
@@ -110,7 +116,34 @@ func TestAttest(t *testing.T) {
 			expectCode: codes.OK,
 		},
 		{
-			name: "successful getting path and hashing process binary",
+			name:        "successful with groups, group name selectors disabled",
+			trustDomain: "example.org",
+			config:      "disable_group_name_selectors = true",
+			pq: &fakeProcessQuery{
+				handle:           windows.InvalidHandle,
+				tokenUser:        &windows.Tokenuser{User: windows.SIDAndAttributes{Sid: sidUser}},
+				tokenGroups:      &windows.Tokengroups{Groups: [1]windows.SIDAndAttributes{sidAndAttrGroup1}},
+				account:          "user1",
+				domain:           "domain1",
+				sidAndAttributes: []windows.SIDAndAttributes{sidAndAttrGroup1, sidAndAttrGroup3},
+			},
+			expectSelectors: []string{
+				"windows:user_name:domain1\\user1",
+				"windows:user_sid:" + sidUser.String(),
+				"windows:group_sid:se_group_enabled:true:" + sidGroup1.String(),
+				"windows:group_sid:se_group_enabled:true:" + sidGroup3.String(),
+			},
+			expectCode: codes.OK,
+			expectLogs: []spiretest.LogEntry{
+				{
+					Level:   logrus.InfoLevel,
+					Message: "Group name selectors disabled; only group_sid selectors will be produced for groups",
+				},
+			},
+		},
+		{
+			name:        "successful getting path and hashing process binary",
+			trustDomain: "example.org",
 			pq: &fakeProcessQuery{
 				handle:      windows.InvalidHandle,
 				tokenUser:   &windows.Tokenuser{User: windows.SIDAndAttributes{Sid: sidUser}},
@@ -129,7 +162,8 @@ func TestAttest(t *testing.T) {
 			expectCode: codes.OK,
 		},
 		{
-			name: "successful getting path, disabled hashing process binary",
+			name:        "successful getting path, disabled hashing process binary",
+			trustDomain: "example.org",
 			pq: &fakeProcessQuery{
 				handle:      windows.InvalidHandle,
 				tokenUser:   &windows.Tokenuser{User: windows.SIDAndAttributes{Sid: sidUser}},
@@ -147,7 +181,8 @@ func TestAttest(t *testing.T) {
 			expectCode: codes.OK,
 		},
 		{
-			name: "failed to get binary path",
+			name:        "failed to get binary path",
+			trustDomain: "example.org",
 			pq: &fakeProcessQuery{
 				handle:           windows.InvalidHandle,
 				tokenUser:        &windows.Tokenuser{User: windows.SIDAndAttributes{Sid: sidUser}},
@@ -161,7 +196,8 @@ func TestAttest(t *testing.T) {
 			expectMsg:  "workloadattestor(windows): failed to get process information: error getting process exe: get process exe error",
 		},
 		{
-			name: "failed to hash binary",
+			name:        "failed to hash binary",
+			trustDomain: "example.org",
 			pq: &fakeProcessQuery{
 				handle:      windows.InvalidHandle,
 				tokenUser:   &windows.Tokenuser{User: windows.SIDAndAttributes{Sid: sidUser}},
@@ -175,7 +211,8 @@ func TestAttest(t *testing.T) {
 			expectMsg:  "workloadattestor(windows): SHA256 digest: open unreadable: The system cannot find the file specified.",
 		},
 		{
-			name: "binary exceeds limit size",
+			name:        "binary exceeds limit size",
+			trustDomain: "example.org",
 			pq: &fakeProcessQuery{
 				handle:      windows.InvalidHandle,
 				tokenUser:   &windows.Tokenuser{User: windows.SIDAndAttributes{Sid: sidUser}},
@@ -189,7 +226,8 @@ func TestAttest(t *testing.T) {
 			expectMsg:  fmt.Sprintf("workloadattestor(windows): SHA256 digest: workload %s exceeds size limit (4 > 2)", exe),
 		},
 		{
-			name: "OpenProcess error",
+			name:        "OpenProcess error",
+			trustDomain: "example.org",
 			pq: &fakeProcessQuery{
 				openProcessErr: errors.New("open process error"),
 			},
@@ -197,7 +235,8 @@ func TestAttest(t *testing.T) {
 			expectMsg:  "workloadattestor(windows): failed to get process information: failed to open process: open process error",
 		},
 		{
-			name: "OpenProcessToken error",
+			name:        "OpenProcessToken error",
+			trustDomain: "example.org",
 			pq: &fakeProcessQuery{
 				openProcessTokenErr: errors.New("open process token error"),
 				handle:              windows.InvalidHandle,
@@ -206,7 +245,8 @@ func TestAttest(t *testing.T) {
 			expectMsg:  "workloadattestor(windows): failed to get process information: failed to open the access token associated with the process: open process token error",
 		},
 		{
-			name: "GetTokenUser error",
+			name:        "GetTokenUser error",
+			trustDomain: "example.org",
 			pq: &fakeProcessQuery{
 				getTokenUserErr: errors.New("get token user error"),
 				handle:          windows.InvalidHandle,
@@ -215,7 +255,8 @@ func TestAttest(t *testing.T) {
 			expectMsg:  "workloadattestor(windows): failed to get process information: failed to retrieve user account information from access token: get token user error",
 		},
 		{
-			name: "GetTokenGroups error",
+			name:        "GetTokenGroups error",
+			trustDomain: "example.org",
 			pq: &fakeProcessQuery{
 				getTokenGroupsErr: errors.New("get token groups error"),
 				handle:            windows.InvalidHandle,
@@ -225,7 +266,8 @@ func TestAttest(t *testing.T) {
 			expectMsg:  "workloadattestor(windows): failed to get process information: failed to retrieve group accounts information from access token: get token groups error",
 		},
 		{
-			name: "LookupAccount failure",
+			name:        "LookupAccount failure",
+			trustDomain: "example.org",
 			pq: &fakeProcessQuery{
 				lookupAccountErr: errors.New("lookup error"),
 				handle:           windows.InvalidHandle,
@@ -260,7 +302,8 @@ func TestAttest(t *testing.T) {
 			},
 		},
 		{
-			name: "close handle error",
+			name:        "close handle error",
+			trustDomain: "example.org",
 			pq: &fakeProcessQuery{
 				handle:         windows.InvalidHandle,
 				tokenUser:      &windows.Tokenuser{User: windows.SIDAndAttributes{Sid: sidUser}},
@@ -286,7 +329,8 @@ func TestAttest(t *testing.T) {
 			},
 		},
 		{
-			name: "close process token error",
+			name:        "close process token error",
+			trustDomain: "example.org",
 			pq: &fakeProcessQuery{
 				handle:               windows.InvalidHandle,
 				tokenUser:            &windows.Tokenuser{User: windows.SIDAndAttributes{Sid: sidUser}},
@@ -316,7 +360,7 @@ func TestAttest(t *testing.T) {
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
 			test := setupTest()
-			p, err := test.loadPlugin(t, testCase.pq, testCase.config)
+			p, err := test.loadPlugin(t, testCase.pq, testCase.trustDomain, testCase.config)
 			require.NoError(t, err)
 
 			selectors, err := p.Attest(ctx, testPID)
@@ -342,11 +386,11 @@ func TestConfigure(t *testing.T) {
 	test := setupTest()
 
 	// malformed configuration
-	_, err := test.loadPlugin(t, &fakeProcessQuery{}, "malformed")
+	_, err := test.loadPlugin(t, &fakeProcessQuery{}, "example.org", "malformed")
 	spiretest.RequireGRPCStatusContains(t, err, codes.InvalidArgument, "failed to decode configuration")
 
 	// success
-	_, err = test.loadPlugin(t, &fakeProcessQuery{}, "discover_workload_path = true\nworkload_size_limit = 2")
+	_, err = test.loadPlugin(t, &fakeProcessQuery{}, "example.org", "discover_workload_path = true\nworkload_size_limit = 2")
 	require.NoError(t, err)
 }
 
@@ -355,7 +399,7 @@ type windowsTest struct {
 	logHook *test.Hook
 }
 
-func (w *windowsTest) loadPlugin(t *testing.T, q *fakeProcessQuery, config string) (workloadattestor.WorkloadAttestor, error) {
+func (w *windowsTest) loadPlugin(t *testing.T, q *fakeProcessQuery, trustDomain string, config string) (workloadattestor.WorkloadAttestor, error) {
 	var err error
 	p := New()
 	p.q = q
@@ -363,6 +407,9 @@ func (w *windowsTest) loadPlugin(t *testing.T, q *fakeProcessQuery, config strin
 	v1 := new(workloadattestor.V1)
 	plugintest.Load(t, builtin(p), v1,
 		plugintest.Log(w.log),
+		plugintest.CoreConfig(catalog.CoreConfig{
+			TrustDomain: spiffeid.RequireTrustDomainFromString(trustDomain),
+		}),
 		plugintest.Configure(config),
 		plugintest.CaptureConfigureError(&err))
 	return v1, err

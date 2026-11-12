@@ -2,24 +2,43 @@ package x509pop
 
 import (
 	"context"
+	"crypto/rsa"
 	"crypto/x509"
+	"encoding/asn1"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"net/url"
+	"slices"
+	"strings"
 	"sync"
+	"unicode/utf8"
 
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/hcl"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"github.com/spiffe/spire-plugin-sdk/pluginsdk"
+	identityproviderv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/hostservice/server/identityprovider/v1"
 	nodeattestorv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/plugin/server/nodeattestor/v1"
 	configv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/service/common/config/v1"
 	"github.com/spiffe/spire/pkg/common/agentpathtemplate"
 	"github.com/spiffe/spire/pkg/common/catalog"
 	"github.com/spiffe/spire/pkg/common/plugin/x509pop"
+	"github.com/spiffe/spire/pkg/common/pluginconf"
 	"github.com/spiffe/spire/pkg/common/util"
+	"github.com/spiffe/spire/pkg/server/plugin/nodeattestor"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
 const (
 	pluginName = "x509pop"
+
+	// Default security limits to prevent resource exhaustion attacks
+	defaultMaxIntermediates = 4
+	defaultMaxRSAKeySize    = 8192
 )
 
 func BuiltIn() catalog.BuiltIn {
@@ -33,28 +52,179 @@ func builtin(p *Plugin) catalog.BuiltIn {
 	)
 }
 
-type configuration struct {
-	trustDomain  spiffeid.TrustDomain
-	trustBundle  *x509.CertPool
-	pathTemplate *agentpathtemplate.Template
-}
-
 type Config struct {
+	Mode              string   `hcl:"mode"`
+	SVIDPrefix        *string  `hcl:"spiffe_prefix"`
 	CABundlePath      string   `hcl:"ca_bundle_path"`
 	CABundlePaths     []string `hcl:"ca_bundle_paths"`
 	AgentPathTemplate string   `hcl:"agent_path_template"`
+	MaxIntermediates  *int     `hcl:"max_intermediates"`
+	MaxRSAKeySize     *int     `hcl:"max_rsa_key_size"`
+	VerifyClientIP    bool     `hcl:"verify_client_ip"`
+	GroupTemplate     string   `hcl:"group_template"`
+	AllowedGroups     []string `hcl:"allowed_groups"`
+	ExtensionOIDs     []string `hcl:"extension_oids"`
+}
+
+// MySQL stores selector values in varchar(255) columns.
+const maxExtensionSelectorLength = 255
+
+type configuration struct {
+	mode             string
+	svidPrefix       string
+	trustDomain      spiffeid.TrustDomain
+	trustBundle      *x509.CertPool
+	pathTemplate     *agentpathtemplate.Template
+	maxIntermediates int
+	maxRSAKeySize    int
+	verifyClientIP   bool
+	groupTemplate    *agentpathtemplate.Template
+	allowedGroups    map[string]struct{}
+	extensionOIDs    map[string]struct{}
+}
+
+func buildConfig(coreConfig catalog.CoreConfig, hclText string, status *pluginconf.Status) *configuration {
+	hclConfig := new(Config)
+	if err := hcl.Decode(hclConfig, hclText); err != nil {
+		status.ReportErrorf("unable to decode configuration: %v", err)
+		return nil
+	}
+
+	if hclConfig.Mode == "" {
+		hclConfig.Mode = "external_pki"
+	}
+	if hclConfig.Mode != "external_pki" && hclConfig.Mode != "spiffe" {
+		status.ReportError("mode can only be either spiffe or external_pki")
+	}
+	var trustBundles []*x509.Certificate
+	if hclConfig.Mode == "external_pki" {
+		var caPaths []string
+		if hclConfig.CABundlePath != "" && len(hclConfig.CABundlePaths) > 0 {
+			status.ReportError("only one of ca_bundle_path or ca_bundle_paths can be configured, not both")
+		}
+		if hclConfig.CABundlePath != "" {
+			caPaths = []string{hclConfig.CABundlePath}
+		} else {
+			caPaths = hclConfig.CABundlePaths
+		}
+		if len(caPaths) == 0 {
+			status.ReportError("one of ca_bundle_path or ca_bundle_paths must be configured")
+		}
+
+		for _, caPath := range caPaths {
+			certs, err := util.LoadCertificates(caPath)
+			if err != nil {
+				status.ReportErrorf("unable to load trust bundle %q: %v", caPath, err)
+			}
+			trustBundles = append(trustBundles, certs...)
+		}
+	}
+
+	if hclConfig.Mode == "spiffe" && (hclConfig.CABundlePath != "" || len(hclConfig.CABundlePaths) > 0) {
+		status.ReportError("you can not use ca_bundle_path or ca_bundle_paths in spiffe mode")
+	}
+
+	pathTemplate := x509pop.DefaultAgentPathTemplateCN
+	if hclConfig.Mode == "spiffe" {
+		pathTemplate = x509pop.DefaultAgentPathTemplateSVID
+	}
+	if len(hclConfig.AgentPathTemplate) > 0 {
+		tmpl, err := agentpathtemplate.Parse(hclConfig.AgentPathTemplate)
+		if err != nil {
+			status.ReportErrorf("failed to parse agent svid template: %q", hclConfig.AgentPathTemplate)
+		}
+		pathTemplate = tmpl
+	}
+
+	var groupTemplate *agentpathtemplate.Template
+	if len(hclConfig.GroupTemplate) > 0 {
+		tmpl, err := agentpathtemplate.Parse(hclConfig.GroupTemplate)
+		if err != nil {
+			status.ReportErrorf("failed to parse group template %q: %v", hclConfig.GroupTemplate, err)
+		} else {
+			groupTemplate = tmpl
+		}
+		if len(hclConfig.AllowedGroups) == 0 {
+			status.ReportError("allowed_groups must be set when group_template is configured")
+		}
+	} else if len(hclConfig.AllowedGroups) > 0 {
+		status.ReportError("group_template must be set when allowed_groups is configured")
+	}
+
+	allowedGroups := make(map[string]struct{}, len(hclConfig.AllowedGroups))
+	for _, group := range hclConfig.AllowedGroups {
+		allowedGroups[group] = struct{}{}
+	}
+
+	svidPrefix := "/spire-exchange/"
+	if hclConfig.SVIDPrefix != nil {
+		svidPrefix = *hclConfig.SVIDPrefix
+		if !strings.HasSuffix(svidPrefix, "/") {
+			svidPrefix += "/"
+		}
+	}
+
+	maxIntermediates := defaultMaxIntermediates
+	if hclConfig.MaxIntermediates != nil {
+		if *hclConfig.MaxIntermediates <= 0 {
+			status.ReportError("max_intermediates must be greater than 0")
+		}
+		maxIntermediates = *hclConfig.MaxIntermediates
+	}
+
+	maxRSAKeySize := defaultMaxRSAKeySize
+	if hclConfig.MaxRSAKeySize != nil {
+		if *hclConfig.MaxRSAKeySize <= 0 {
+			status.ReportError("max_rsa_key_size must be greater than 0")
+		}
+		maxRSAKeySize = *hclConfig.MaxRSAKeySize
+	}
+
+	extensionOIDs := make(map[string]struct{}, len(hclConfig.ExtensionOIDs))
+	for _, oid := range hclConfig.ExtensionOIDs {
+		if parsed, err := x509.ParseOID(oid); err != nil || parsed.String() != oid {
+			status.ReportErrorf("invalid extension_oids entry %q: must be an OID in canonical dotted decimal form", oid)
+		}
+		extensionOIDs[oid] = struct{}{}
+	}
+
+	newConfig := &configuration{
+		trustDomain:      coreConfig.TrustDomain,
+		trustBundle:      util.NewCertPool(trustBundles...),
+		pathTemplate:     pathTemplate,
+		mode:             hclConfig.Mode,
+		svidPrefix:       svidPrefix,
+		maxIntermediates: maxIntermediates,
+		maxRSAKeySize:    maxRSAKeySize,
+		verifyClientIP:   hclConfig.VerifyClientIP,
+		groupTemplate:    groupTemplate,
+		allowedGroups:    allowedGroups,
+		extensionOIDs:    extensionOIDs,
+	}
+
+	return newConfig
 }
 
 type Plugin struct {
 	nodeattestorv1.UnsafeNodeAttestorServer
 	configv1.UnsafeConfigServer
 
-	m      sync.Mutex
-	config *configuration
+	log hclog.Logger
+
+	m                sync.Mutex
+	config           *configuration
+	identityProvider identityproviderv1.IdentityProviderServiceClient
 }
 
 func New() *Plugin {
 	return &Plugin{}
+}
+
+func (p *Plugin) BrokerHostServices(broker pluginsdk.ServiceBroker) error {
+	if !broker.BrokerClient(&p.identityProvider) {
+		return status.Errorf(codes.FailedPrecondition, "IdentityProvider host service is required")
+	}
+	return nil
 }
 
 func (p *Plugin) Attest(stream nodeattestorv1.NodeAttestor_AttestServer) error {
@@ -82,27 +252,84 @@ func (p *Plugin) Attest(stream nodeattestorv1.NodeAttestor_AttestServer) error {
 	if len(attestationData.Certificates) == 0 {
 		return status.Error(codes.InvalidArgument, "no certificate to attest")
 	}
+
+	// Check intermediate count limit before parsing to prevent resource exhaustion
+	numIntermediates := len(attestationData.Certificates) - 1
+	if numIntermediates > config.maxIntermediates {
+		return status.Error(codes.InvalidArgument, "too many intermediate certificates")
+	}
+
 	leaf, err := x509.ParseCertificate(attestationData.Certificates[0])
 	if err != nil {
 		return status.Errorf(codes.InvalidArgument, "unable to parse leaf certificate: %v", err)
 	}
+
+	// Validate leaf certificate key size
+	if err := validateRSAKeySize(leaf, config.maxRSAKeySize); err != nil {
+		return status.Error(codes.InvalidArgument, "leaf certificate key size too large")
+	}
+
 	intermediates := x509.NewCertPool()
 	for i, intermediateBytes := range attestationData.Certificates[1:] {
 		intermediate, err := x509.ParseCertificate(intermediateBytes)
 		if err != nil {
 			return status.Errorf(codes.InvalidArgument, "unable to parse intermediate certificate %d: %v", i, err)
 		}
+
+		// Validate intermediate certificate key size
+		if err := validateRSAKeySize(intermediate, config.maxRSAKeySize); err != nil {
+			return status.Errorf(codes.InvalidArgument, "intermediate certificate %d key size too large", i)
+		}
+
 		intermediates.AddCert(intermediate)
 	}
+
+	trustBundle := config.trustBundle
+	if config.mode == "spiffe" {
+		trustBundle, err = p.getTrustBundle(stream.Context())
+		if err != nil {
+			return status.Errorf(codes.Internal, "failed to get trust bundle: %v", err)
+		}
+	}
+
+	// Configured critical extensions are handled when they produce a selector.
+	extSelectors := extensionSelectors(leaf, config.extensionOIDs)
+	leaf.UnhandledCriticalExtensions = slices.DeleteFunc(leaf.UnhandledCriticalExtensions, func(oid asn1.ObjectIdentifier) bool {
+		return extSelectors[oid.String()] != ""
+	})
 
 	// verify the chain of trust
 	chains, err := leaf.Verify(x509.VerifyOptions{
 		Intermediates: intermediates,
-		Roots:         config.trustBundle,
+		Roots:         trustBundle,
 		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
 	})
 	if err != nil {
 		return status.Errorf(codes.PermissionDenied, "certificate verification failed: %v", err)
+	}
+
+	if config.verifyClientIP {
+		ips := metadata.ValueFromIncomingContext(stream.Context(), nodeattestor.XForwardedClientIPKey)
+		if len(ips) == 0 || ips[0] == "" {
+			return status.Error(codes.Internal, "client IP not available for verification")
+		}
+		if len(ips) > 1 {
+			p.log.Warn("Multiple client IP values found in metadata, using first value")
+		}
+		clientIP := net.ParseIP(ips[0])
+		if clientIP == nil {
+			return status.Errorf(codes.Internal, "invalid client IP %q", ips[0])
+		}
+		matched := false
+		for _, certIP := range leaf.IPAddresses {
+			if certIP.Equal(clientIP) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return status.Errorf(codes.PermissionDenied, "client IP %s does not match any certificate IP SAN", clientIP)
+		}
 	}
 
 	// now that the leaf certificate is trusted, issue a challenge to the node
@@ -140,16 +367,65 @@ func (p *Plugin) Attest(stream nodeattestorv1.NodeAttestor_AttestServer) error {
 		return status.Errorf(codes.PermissionDenied, "challenge response verification failed: %v", err)
 	}
 
-	spiffeid, err := x509pop.MakeAgentID(config.trustDomain, config.pathTemplate, leaf)
+	svidPath := ""
+	if config.mode == "spiffe" {
+		var spiffeURIs []*url.URL
+		for _, uri := range leaf.URIs {
+			if uri.Scheme == "spiffe" {
+				spiffeURIs = append(spiffeURIs, uri)
+			}
+		}
+		if len(spiffeURIs) == 0 {
+			return status.Errorf(codes.PermissionDenied, "valid SVID x509 cert not found")
+		}
+		svidPath = spiffeURIs[0].EscapedPath()
+		if !strings.HasPrefix(svidPath, config.svidPrefix) {
+			return status.Errorf(codes.PermissionDenied, "x509 cert doesnt match SVID prefix")
+		}
+		svidPath = strings.TrimPrefix(svidPath, config.svidPrefix)
+	}
+
+	sanSelectors := p.parseUriSanSelectors(leaf, config.trustDomain.Name())
+
+	spiffeid, err := x509pop.MakeAgentID(config.trustDomain, config.pathTemplate, leaf, svidPath, sanSelectors)
 	if err != nil {
 		return status.Errorf(codes.Internal, "failed to make spiffe id: %v", err)
+	}
+
+	selectors := buildSelectorValues(leaf, chains, sanSelectors)
+	for oid, selector := range extSelectors {
+		if selector == "" {
+			p.log.Warn("Ignoring certificate extension that cannot be used as a selector", "oid", oid)
+			continue
+		}
+		selectors = append(selectors, selector)
+	}
+
+	if config.groupTemplate != nil {
+		templateData := x509pop.NewTemplateData(config.trustDomain, leaf, svidPath, sanSelectors)
+		rendered, err := config.groupTemplate.Execute(templateData)
+		group := strings.TrimSpace(rendered)
+		switch {
+		case err != nil:
+			// The template may legitimately not apply to every certificate, so
+			// this is not fatal. No group selector is produced.
+			p.log.Debug("Failed to execute group template", "error", err)
+		case group == "":
+			p.log.Debug("Group template produced no group")
+		default:
+			if _, ok := config.allowedGroups[group]; ok {
+				selectors = append(selectors, "group:"+group)
+			} else {
+				p.log.Debug("Group not in allowed_groups", "group", group)
+			}
+		}
 	}
 
 	return stream.Send(&nodeattestorv1.AttestResponse{
 		Response: &nodeattestorv1.AttestResponse_AgentAttributes{
 			AgentAttributes: &nodeattestorv1.AgentAttributes{
 				SpiffeId:       spiffeid.String(),
-				SelectorValues: buildSelectorValues(leaf, chains),
+				SelectorValues: selectors,
 				CanReattest:    true,
 			},
 		},
@@ -157,71 +433,50 @@ func (p *Plugin) Attest(stream nodeattestorv1.NodeAttestor_AttestServer) error {
 }
 
 func (p *Plugin) Configure(_ context.Context, req *configv1.ConfigureRequest) (*configv1.ConfigureResponse, error) {
-	hclConfig := new(Config)
-	if err := hcl.Decode(hclConfig, req.HclConfiguration); err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "unable to decode configuration: %v", err)
-	}
-
-	if req.CoreConfiguration == nil {
-		return nil, status.Error(codes.InvalidArgument, "core configuration is required")
-	}
-
-	if req.CoreConfiguration.TrustDomain == "" {
-		return nil, status.Error(codes.InvalidArgument, "trust_domain is required")
-	}
-
-	trustDomain, err := spiffeid.TrustDomainFromString(req.CoreConfiguration.TrustDomain)
-	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "trust_domain is invalid: %v", err)
-	}
-
-	bundles, err := getBundles(hclConfig)
+	newConfig, _, err := pluginconf.Build(req, buildConfig)
 	if err != nil {
 		return nil, err
 	}
 
-	pathTemplate := x509pop.DefaultAgentPathTemplate
-	if len(hclConfig.AgentPathTemplate) > 0 {
-		tmpl, err := agentpathtemplate.Parse(hclConfig.AgentPathTemplate)
-		if err != nil {
-			return nil, status.Errorf(codes.InvalidArgument, "failed to parse agent svid template: %q", hclConfig.AgentPathTemplate)
-		}
-		pathTemplate = tmpl
-	}
-
-	p.setConfiguration(&configuration{
-		trustDomain:  trustDomain,
-		trustBundle:  util.NewCertPool(bundles...),
-		pathTemplate: pathTemplate,
-	})
+	p.m.Lock()
+	defer p.m.Unlock()
+	p.config = newConfig
 
 	return &configv1.ConfigureResponse{}, nil
 }
 
-func getBundles(config *Config) ([]*x509.Certificate, error) {
-	var caPaths []string
+func (p *Plugin) Validate(_ context.Context, req *configv1.ValidateRequest) (*configv1.ValidateResponse, error) {
+	_, notes, err := pluginconf.Build(req, buildConfig)
 
-	switch {
-	case config.CABundlePath != "" && len(config.CABundlePaths) > 0:
-		return nil, status.Error(codes.InvalidArgument, "only one of ca_bundle_path or ca_bundle_paths can be configured, not both")
-	case config.CABundlePath != "":
-		caPaths = append(caPaths, config.CABundlePath)
-	case len(config.CABundlePaths) > 0:
-		caPaths = append(caPaths, config.CABundlePaths...)
-	default:
-		return nil, status.Error(codes.InvalidArgument, "ca_bundle_path or ca_bundle_paths must be configured")
+	return &configv1.ValidateResponse{
+		Valid: err == nil,
+		Notes: notes,
+	}, nil
+}
+
+// SetLogger sets this plugin's logger
+func (p *Plugin) SetLogger(log hclog.Logger) {
+	p.log = log
+}
+
+func (p *Plugin) getTrustBundle(ctx context.Context) (*x509.CertPool, error) {
+	resp, err := p.identityProvider.FetchX509Identity(ctx, &identityproviderv1.FetchX509IdentityRequest{})
+	if err != nil {
+		return nil, err
 	}
-
-	var cas []*x509.Certificate
-	for _, caPath := range caPaths {
-		certs, err := util.LoadCertificates(caPath)
+	var trustBundles []*x509.Certificate
+	for _, rawcert := range resp.Bundle.X509Authorities {
+		certificates, err := x509.ParseCertificates(rawcert.Asn1)
 		if err != nil {
-			return nil, status.Errorf(codes.InvalidArgument, "unable to load trust bundle %q: %v", caPath, err)
+			return nil, err
 		}
-		cas = append(cas, certs...)
+		trustBundles = append(trustBundles, certificates...)
 	}
-
-	return cas, nil
+	if len(trustBundles) > 0 {
+		return util.NewCertPool(trustBundles...), nil
+	}
+	p.log.Warn("No trust bundle retrieved from SPIRE")
+	return nil, nil
 }
 
 func (p *Plugin) getConfig() (*configuration, error) {
@@ -233,13 +488,7 @@ func (p *Plugin) getConfig() (*configuration, error) {
 	return p.config, nil
 }
 
-func (p *Plugin) setConfiguration(config *configuration) {
-	p.m.Lock()
-	defer p.m.Unlock()
-	p.config = config
-}
-
-func buildSelectorValues(leaf *x509.Certificate, chains [][]*x509.Certificate) []string {
+func buildSelectorValues(leaf *x509.Certificate, chains [][]*x509.Certificate, sanSelectors map[string]string) []string {
 	var selectorValues []string
 
 	if leaf.Subject.CommonName != "" {
@@ -268,5 +517,72 @@ func buildSelectorValues(leaf *x509.Certificate, chains [][]*x509.Certificate) [
 		selectorValues = append(selectorValues, "serialnumber:"+serialNumberHex)
 	}
 
+	for sanUriKey, saniUriValue := range sanSelectors {
+		selectorValues = append(selectorValues, "san:"+sanUriKey+":"+saniUriValue)
+	}
+
 	return selectorValues
+}
+
+func (p *Plugin) parseUriSanSelectors(leaf *x509.Certificate, trustDomain string) map[string]string {
+	uriSelectorMap := make(map[string]string)
+	sanPrefix := "x509pop://" + trustDomain + "/"
+	for _, uri := range leaf.URIs {
+		if strings.HasPrefix(uri.String(), sanPrefix) {
+			segments := strings.SplitN(strings.Trim(uri.Path, "/"), "/", 2)
+			if len(segments) < 2 {
+				p.log.Warn(fmt.Sprintf("cannot extract x509pop san selectors from %s", uri.String()))
+				continue
+			}
+			uriSelectorMap[segments[0]] = segments[1]
+		}
+	}
+	return uriSelectorMap
+}
+
+// Checks if an RSA public key exceeds the maximum allowed size.
+func validateRSAKeySize(cert *x509.Certificate, maxRSAKeySize int) error {
+	if cert.PublicKeyAlgorithm != x509.RSA {
+		return nil
+	}
+	if rsaKey, ok := cert.PublicKey.(*rsa.PublicKey); ok {
+		keySize := rsaKey.N.BitLen()
+		if keySize > maxRSAKeySize {
+			return errors.New("RSA key size exceeds maximum")
+		}
+	}
+	return nil
+}
+
+// extensionSelectors maps each configured OID on the leaf to its ext:oid:<OID>:<value>
+// selector, or to "" if the value is not a non-empty UTF8String, PrintableString or
+// IA5String, or the selector is too long.
+func extensionSelectors(leaf *x509.Certificate, oids map[string]struct{}) map[string]string {
+	selectors := make(map[string]string)
+	for _, ext := range leaf.Extensions {
+		oid := ext.Id.String()
+		if _, ok := oids[oid]; !ok {
+			continue
+		}
+		value, ok := decodeExtensionString(ext.Value)
+		selector := "ext:oid:" + oid + ":" + value
+		if !ok || utf8.RuneCountInString(selector) > maxExtensionSelectorLength {
+			selector = ""
+		}
+		selectors[oid] = selector
+	}
+	return selectors
+}
+
+func decodeExtensionString(der []byte) (string, bool) {
+	var raw asn1.RawValue
+	if rest, err := asn1.Unmarshal(der, &raw); err != nil || len(rest) > 0 || raw.Class != asn1.ClassUniversal ||
+		!slices.Contains([]int{asn1.TagUTF8String, asn1.TagPrintableString, asn1.TagIA5String}, raw.Tag) {
+		return "", false
+	}
+	var value string
+	if _, err := asn1.Unmarshal(der, &value); err != nil || value == "" {
+		return "", false
+	}
+	return value, true
 }

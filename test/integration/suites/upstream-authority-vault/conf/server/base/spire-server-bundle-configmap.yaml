@@ -1,0 +1,7 @@
+# ConfigMap containing the latest trust bundle for the trust domain. It is
+# updated by SPIRE using the k8s_configmap BundlePublisher plugin.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spire-bundle
+  namespace: spire

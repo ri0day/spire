@@ -1,6 +1,7 @@
 package awsiid
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/rsa"
@@ -14,6 +15,7 @@ import (
 	"math"
 	"os"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -26,6 +28,7 @@ import (
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/iam"
 	iamtypes "github.com/aws/aws-sdk-go-v2/service/iam/types"
+	"github.com/aws/aws-sdk-go-v2/service/organizations"
 	"github.com/fullsailor/pkcs7"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/hcl"
@@ -35,13 +38,14 @@ import (
 	"github.com/spiffe/spire/pkg/common/agentpathtemplate"
 	"github.com/spiffe/spire/pkg/common/catalog"
 	caws "github.com/spiffe/spire/pkg/common/plugin/aws"
+	"github.com/spiffe/spire/pkg/common/pluginconf"
 	nodeattestorbase "github.com/spiffe/spire/pkg/server/plugin/nodeattestor/base"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
 var (
-	awsTimeout      = 5 * time.Second
+	awsTimeout      = 20 * time.Second
 	instanceFilters = []ec2types.Filter{
 		{
 			Name: aws.String("instance-state-name"),
@@ -53,12 +57,24 @@ var (
 	}
 
 	defaultPartition = "aws"
-	// No constant was found in the sdk, using the list of paritions defined on
+	// No constant was found in the sdk, using the list of partitions defined on
 	// the page https://docs.aws.amazon.com/IAM/latest/UserGuide/reference-arns.html
 	partitions = []string{
 		defaultPartition,
 		"aws-cn",
 		"aws-us-gov",
+		"aws-eusc",
+	}
+
+	// regionPrefixPartitions maps the region name prefixes of the partitions other than the default one, as in the
+	// SDK's partition metadata (internal/endpoints/awsrulesfn/partitions.json).
+	regionPrefixPartitions = []struct {
+		prefix    string
+		partition string
+	}{
+		{"cn-", "aws-cn"},
+		{"us-gov-", "aws-us-gov"},
+		{"eusc-", "aws-eusc"},
 	}
 )
 
@@ -68,6 +84,7 @@ const (
 	accessKeyIDVarName = "AWS_ACCESS_KEY_ID"
 	// secretAccessKeyVarName env car name for AWS secret access key
 	secretAccessKeyVarName   = "AWS_SECRET_ACCESS_KEY" //nolint: gosec // false positive
+	accountIDSelectorPrefix  = "account_id"
 	azSelectorPrefix         = "az"
 	imageIDSelectorPrefix    = "image:id"
 	instanceIDSelectorPrefix = "instance:id"
@@ -100,6 +117,9 @@ type IIDAttestorPlugin struct {
 	mtx     sync.RWMutex
 	clients *clientsCache
 
+	orgValidation *orgValidator
+	eksValidation *eksValidator
+
 	// test hooks
 	hooks struct {
 		getAWSCACertificate func(string, PublicKeyType) (*x509.Certificate, error)
@@ -112,20 +132,75 @@ type IIDAttestorPlugin struct {
 // IIDAttestorConfig holds hcl configuration for IID attestor plugin
 type IIDAttestorConfig struct {
 	SessionConfig                   `hcl:",squash"`
-	SkipBlockDevice                 bool     `hcl:"skip_block_device"`
-	DisableInstanceProfileSelectors bool     `hcl:"disable_instance_profile_selectors"`
-	LocalValidAcctIDs               []string `hcl:"account_ids_for_local_validation"`
-	AgentPathTemplate               string   `hcl:"agent_path_template"`
-	AssumeRole                      string   `hcl:"assume_role"`
-	Partition                       string   `hcl:"partition"`
-	pathTemplate                    *agentpathtemplate.Template
-	trustDomain                     spiffeid.TrustDomain
-	getAWSCACertificate             func(string, PublicKeyType) (*x509.Certificate, error)
+	SkipBlockDevice                 bool                 `hcl:"skip_block_device"`
+	DisableInstanceProfileSelectors bool                 `hcl:"disable_instance_profile_selectors"`
+	LocalValidAcctIDs               []string             `hcl:"account_ids_for_local_validation"`
+	AgentPathTemplate               string               `hcl:"agent_path_template"`
+	AssumeRole                      string               `hcl:"assume_role"`
+	Partition                       string               `hcl:"partition"`
+	ValidateOrgAccountID            *orgValidationConfig `hcl:"verify_organization"`
+	ValidateEKSClusterMembership    *eksValidationConfig `hcl:"validate_eks_cluster_membership"`
+	// Partitions configures the credentials for the nodes of each AWS partition, keyed by partition name.
+	Partitions          map[string]*SessionConfig `hcl:"partitions"`
+	pathTemplate        *agentpathtemplate.Template
+	trustDomain         spiffeid.TrustDomain
+	getAWSCACertificate func(string, PublicKeyType) (*x509.Certificate, error)
+}
+
+func (p *IIDAttestorPlugin) buildConfig(coreConfig catalog.CoreConfig, hclText string, status *pluginconf.Status) *IIDAttestorConfig {
+	newConfig := new(IIDAttestorConfig)
+	if err := hcl.Decode(newConfig, hclText); err != nil {
+		status.ReportErrorf("unable to decode configuration: %v", err)
+		return nil
+	}
+
+	// Function to get the AWS CA certificate. We do this lazily on configure so deployments
+	// not using this plugin don't pay for parsing it on startup. This
+	// operation should not fail, but we check the return value just in case.
+	newConfig.getAWSCACertificate = p.hooks.getAWSCACertificate
+
+	if len(newConfig.Partitions) > 0 {
+		validatePartitionsConfig(newConfig, status)
+	} else if err := newConfig.Validate(p.hooks.getenv(accessKeyIDVarName), p.hooks.getenv(secretAccessKeyVarName)); err != nil {
+		status.ReportError(err.Error())
+	}
+
+	newConfig.trustDomain = coreConfig.TrustDomain
+
+	newConfig.pathTemplate = defaultAgentPathTemplate
+	if len(newConfig.AgentPathTemplate) > 0 {
+		tmpl, err := agentpathtemplate.Parse(newConfig.AgentPathTemplate)
+		if err != nil {
+			status.ReportErrorf("failed to parse agent svid template: %q", newConfig.AgentPathTemplate)
+		} else {
+			newConfig.pathTemplate = tmpl
+		}
+	}
+
+	if newConfig.Partition == "" {
+		newConfig.Partition = defaultPartition
+	}
+
+	if len(newConfig.Partitions) == 0 && !isValidAWSPartition(newConfig.Partition) {
+		status.ReportErrorf("invalid partition %q, must be one of: %v", newConfig.Partition, partitions)
+	}
+
+	// Check if Feature flag for account belongs to organization is enabled.
+	if newConfig.ValidateOrgAccountID != nil {
+		err := validateOrganizationConfig(newConfig)
+		if err != nil {
+			status.ReportError(err.Error())
+		}
+	}
+
+	return newConfig
 }
 
 // New creates a new IIDAttestorPlugin.
 func New() *IIDAttestorPlugin {
 	p := &IIDAttestorPlugin{}
+	p.orgValidation = newOrganizationValidationBase(&orgValidationConfig{})
+	p.eksValidation = newEKSValidationBase(&eksValidationConfig{})
 	p.clients = newClientsCache(defaultNewClientCallback)
 	p.hooks.getAWSCACertificate = getAWSCACertificate
 	p.hooks.getenv = os.Getenv
@@ -154,11 +229,56 @@ func (p *IIDAttestorPlugin) Attest(stream nodeattestorv1.NodeAttestor_AttestServ
 		return err
 	}
 
-	inTrustAcctList := false
-	for _, id := range c.LocalValidAcctIDs {
-		if attestationData.AccountID == id {
-			inTrustAcctList = true
-			break
+	// Reject nodes of a partition without configuration before calling any AWS API.
+	if _, err := p.clients.sessionConfig(attestationData.Region); err != nil {
+		return err
+	}
+
+	// Feature account belongs to organization
+	// Get the account id of the node from attestation and then check if respective account belongs to organization
+	if c.ValidateOrgAccountID != nil {
+		ctxValidateOrg, cancel := context.WithTimeout(stream.Context(), awsTimeout)
+		defer cancel()
+
+		// In file mode the account list is sourced from disk, so no AWS
+		// Organizations client is required.
+		var orgClient organizations.ListAccountsAPIClient
+		if !c.ValidateOrgAccountID.useAccountListFile() {
+			orgClient, err = p.clients.getClient(ctxValidateOrg, c.ValidateOrgAccountID.AccountRegion, c.ValidateOrgAccountID.AccountID)
+			if err != nil {
+				return status.Errorf(codes.Internal, "failed to get org client: %v", err)
+			}
+		}
+
+		valid, err := p.orgValidation.IsMemberAccount(ctxValidateOrg, orgClient, attestationData.AccountID)
+		if err != nil {
+			return status.Errorf(codes.Internal, "failed aws ec2 attestation, issue while verifying if nodes account id: %v belong to org: %v", attestationData.AccountID, err)
+		}
+
+		if !valid {
+			return status.Errorf(codes.Internal, "failed aws ec2 attestation, nodes account id: %v is not part of configured organization or doesn't have ACTIVE status", attestationData.AccountID)
+		}
+	}
+
+	inTrustAcctList := slices.Contains(c.LocalValidAcctIDs, attestationData.AccountID)
+
+	// Feature node belongs to EKS cluster
+	if c.ValidateEKSClusterMembership != nil {
+		ctxValidateEKS, cancel := context.WithTimeout(stream.Context(), awsTimeout)
+		defer cancel()
+
+		awsClient, err := p.clients.getClient(ctxValidateEKS, attestationData.Region, attestationData.AccountID)
+		if err != nil {
+			return status.Errorf(codes.Internal, "failed to get client: %v", err)
+		}
+
+		valid, err := p.eksValidation.IsNodeInCluster(ctxValidateEKS, awsClient, awsClient, attestationData.InstanceID)
+		if err != nil {
+			return status.Errorf(codes.Internal, "failed aws eks attestation, issue while verifying if nodes id: %v belong to cluster: %v", attestationData.InstanceID, err)
+		}
+
+		if !valid {
+			return status.Errorf(codes.Internal, "failed aws eks attestation, nodes id: %v is not part of configured EKS cluster", attestationData.InstanceID)
 		}
 	}
 
@@ -183,7 +303,7 @@ func (p *IIDAttestorPlugin) Attest(stream nodeattestorv1.NodeAttestor_AttestServ
 	// e.g. do it after the call to `p.AssessTOFU`, however, we may need
 	// the instance to construct tags used in the agent ID.
 	//
-	// This overhead will only effect agents attempting to re-attest which
+	// This overhead will only affect agents attempting to re-attest which
 	// should be a very small portion of the overall server workload. This
 	// is a potential DoS vector.
 	shouldCheckBlockDevice := !inTrustAcctList && !c.SkipBlockDevice
@@ -232,68 +352,63 @@ func (p *IIDAttestorPlugin) Attest(stream nodeattestorv1.NodeAttestor_AttestServ
 
 // Configure configures the IIDAttestorPlugin.
 func (p *IIDAttestorPlugin) Configure(_ context.Context, req *configv1.ConfigureRequest) (*configv1.ConfigureResponse, error) {
-	config := new(IIDAttestorConfig)
-	if err := hcl.Decode(config, req.HclConfiguration); err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "unable to decode configuration: %v", err)
-	}
-
-	// Function to get the AWS CA certificate. We do this lazily on configure so deployments
-	// not using this plugin don't pay for parsing it on startup. This
-	// operation should not fail, but we check the return value just in case.
-	config.getAWSCACertificate = p.hooks.getAWSCACertificate
-
-	if err := config.Validate(p.hooks.getenv(accessKeyIDVarName), p.hooks.getenv(secretAccessKeyVarName)); err != nil {
-		return nil, err
-	}
-
-	if req.CoreConfiguration == nil {
-		return nil, status.Error(codes.InvalidArgument, "core configuration is required")
-	}
-
-	var err error
-	config.trustDomain, err = spiffeid.TrustDomainFromString(req.CoreConfiguration.TrustDomain)
+	newConfig, _, err := pluginconf.Build(req, p.buildConfig)
 	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "core configuration has invalid trust domain: %v", err)
-	}
-
-	config.pathTemplate = defaultAgentPathTemplate
-	if len(config.AgentPathTemplate) > 0 {
-		tmpl, err := agentpathtemplate.Parse(config.AgentPathTemplate)
-		if err != nil {
-			return nil, status.Errorf(codes.InvalidArgument, "failed to parse agent svid template: %q", config.AgentPathTemplate)
-		}
-		config.pathTemplate = tmpl
-	}
-
-	if config.Partition == "" {
-		config.Partition = defaultPartition
-	}
-	if !isValidAWSPartition(config.Partition) {
-		return nil, status.Errorf(codes.InvalidArgument, "invalid partition %q, must be one of: %v", config.Partition, partitions)
+		return nil, err
 	}
 
 	p.mtx.Lock()
 	defer p.mtx.Unlock()
+	p.config = newConfig
 
-	p.config = config
-	p.clients.configure(config.SessionConfig)
+	if newConfig.ValidateOrgAccountID == nil {
+		// unconfigure existing clients
+		p.clients.configure(p.config.SessionConfig, p.config.Partitions, orgValidationConfig{})
+	} else {
+		p.clients.configure(p.config.SessionConfig, p.config.Partitions, *p.config.ValidateOrgAccountID)
+		// Setup required config, for validation and for bootstrapping org client
+		if err := p.orgValidation.configure(p.config.ValidateOrgAccountID); err != nil {
+			return nil, err
+		}
+	}
+
+	if newConfig.ValidateEKSClusterMembership != nil {
+		if err := p.eksValidation.configure(newConfig.ValidateEKSClusterMembership); err != nil {
+			return nil, err
+		}
+	}
 
 	return &configv1.ConfigureResponse{}, nil
+}
+
+func (p *IIDAttestorPlugin) Validate(_ context.Context, req *configv1.ValidateRequest) (*configv1.ValidateResponse, error) {
+	_, notes, err := pluginconf.Build(req, p.buildConfig)
+
+	return &configv1.ValidateResponse{
+		Valid: err == nil,
+		Notes: notes,
+	}, nil
 }
 
 // SetLogger sets this plugin's logger
 func (p *IIDAttestorPlugin) SetLogger(log hclog.Logger) {
 	p.log = log
+	p.orgValidation.setLogger(log)
+	p.eksValidation.setLogger(log)
 }
 
 func (p *IIDAttestorPlugin) checkBlockDevice(instance ec2types.Instance) error {
-	ifaceZeroDeviceIndex := *instance.NetworkInterfaces[0].Attachment.DeviceIndex
-
-	if ifaceZeroDeviceIndex != 0 {
-		return fmt.Errorf("the EC2 instance network interface attachment device index must be zero (has %d)", ifaceZeroDeviceIndex)
+	ifaceZeroIndex := slices.IndexFunc(
+		instance.NetworkInterfaces,
+		func(net ec2types.InstanceNetworkInterface) bool {
+			return *net.Attachment.DeviceIndex == 0
+		},
+	)
+	if ifaceZeroIndex == -1 {
+		return errors.New("the EC2 instance network interface with device index 0 is inaccessible")
 	}
 
-	ifaceZeroAttachTime := instance.NetworkInterfaces[0].Attachment.AttachTime
+	ifaceZeroAttachTime := instance.NetworkInterfaces[ifaceZeroIndex].Attachment.AttachTime
 
 	// skip anti-tampering mechanism when RootDeviceType is instance-store
 	// specifically, if device type is persistent, and the device was attached past
@@ -390,16 +505,24 @@ func unmarshalAndValidateIdentityDocument(data []byte, getAWSCACertificate func(
 	switch publicKeyType {
 	case RSA1024:
 		if err := verifyRSASignature(caCert.PublicKey.(*rsa.PublicKey), attestationData.Document, signature); err != nil {
-			return imds.InstanceIdentityDocument{}, status.Errorf(codes.InvalidArgument, err.Error())
+			return imds.InstanceIdentityDocument{}, status.Error(codes.InvalidArgument, err.Error())
 		}
 	case RSA2048:
 		pkcs7Sig, err := decodeAndParsePKCS7Signature(signature, caCert)
 		if err != nil {
-			return imds.InstanceIdentityDocument{}, status.Errorf(codes.InvalidArgument, err.Error())
+			return imds.InstanceIdentityDocument{}, status.Error(codes.InvalidArgument, err.Error())
 		}
 
 		if err := pkcs7Sig.Verify(); err != nil {
 			return imds.InstanceIdentityDocument{}, status.Errorf(codes.InvalidArgument, "failed verification of instance identity cryptographic signature: %v", err)
+		}
+
+		// Verify the PKCS7 content matches the Document field
+		// to prevent substitution attacks where an attacker
+		// provides a legitimate PKCS7 signature from their
+		// own instance alongside a forged identity document.
+		if !bytes.Equal(pkcs7Sig.Content, []byte(attestationData.Document)) {
+			return imds.InstanceIdentityDocument{}, status.Error(codes.InvalidArgument, "instance identity document does not match the verified PKCS7 content")
 		}
 	}
 
@@ -495,6 +618,7 @@ func (p *IIDAttestorPlugin) resolveSelectors(parent context.Context, instancesDe
 }
 
 func resolveIIDocSelectors(selectorSet map[string]bool, iiDoc imds.InstanceIdentityDocument) {
+	selectorSet[fmt.Sprintf("%s:%s", accountIDSelectorPrefix, iiDoc.AccountID)] = true
 	selectorSet[fmt.Sprintf("%s:%s", imageIDSelectorPrefix, iiDoc.ImageID)] = true
 	selectorSet[fmt.Sprintf("%s:%s", instanceIDSelectorPrefix, iiDoc.InstanceID)] = true
 	selectorSet[fmt.Sprintf("%s:%s", regionSelectorPrefix, iiDoc.Region)] = true
@@ -551,10 +675,108 @@ func instanceProfileNameFromArn(profileArn string) (string, error) {
 }
 
 func isValidAWSPartition(partition string) bool {
-	for _, p := range partitions {
-		if p == partition {
-			return true
+	return slices.Contains(partitions, partition)
+}
+
+// partitionForRegion returns the AWS partition of the region.
+func partitionForRegion(region string) string {
+	for _, p := range regionPrefixPartitions {
+		if strings.HasPrefix(region, p.prefix) {
+			return p.partition
 		}
 	}
-	return false
+	return defaultPartition
+}
+
+// validatePartitionsConfig validates the partitions block. The credentials for each partition are set inside its
+// entry, so they cannot also be set at the top level.
+func validatePartitionsConfig(config *IIDAttestorConfig, st *pluginconf.Status) {
+	topLevel := []struct {
+		name  string
+		value string
+	}{
+		{"access_key_id", config.AccessKeyID},
+		{"secret_access_key", config.SecretAccessKey},
+		{"assume_role", config.SessionConfig.AssumeRole},
+		{"partition", config.SessionConfig.Partition},
+		{"web_identity_role_arn", config.WebIdentityRoleARN},
+		{"web_identity_token_file", config.WebIdentityTokenFile},
+	}
+	for _, field := range topLevel {
+		if field.value != "" {
+			st.ReportErrorf("%q cannot be set together with \"partitions\", set it inside each partition instead", field.name)
+		}
+	}
+
+	for name, partitionConfig := range config.Partitions {
+		if !isValidAWSPartition(name) {
+			st.ReportErrorf("invalid partition %q in \"partitions\", must be one of: %v", name, partitions)
+			continue
+		}
+		if partitionConfig == nil {
+			partitionConfig = new(SessionConfig)
+			config.Partitions[name] = partitionConfig
+		}
+		if partitionConfig.Partition != "" && partitionConfig.Partition != name {
+			st.ReportErrorf("partition %q in \"partitions\" sets a different partition: %q", name, partitionConfig.Partition)
+			continue
+		}
+		partitionConfig.Partition = name
+		if err := partitionConfig.Validate("", ""); err != nil {
+			st.ReportErrorf("partition %q: %v", name, status.Convert(err).Message())
+		}
+	}
+}
+
+func validateOrganizationConfig(config *IIDAttestorConfig) error {
+	cfg := config.ValidateOrgAccountID
+
+	if cfg.useAccountListFile() {
+		// File mode: the account list is sourced from disk, so the AWS
+		// Organizations API fields are not used and must not be set.
+		if cfg.AccountID != "" || cfg.AccountRole != "" {
+			return status.Errorf(codes.InvalidArgument, "%q is mutually exclusive with %q and %q in the block: %q", orgAccountListFile, orgAccountID, orgAccountRole, "verify_organization")
+		}
+
+		// Fail at configure time if the file is missing or malformed.
+		if _, err := parseAccountListFile(cfg.AccountListFile); err != nil {
+			return status.Errorf(codes.InvalidArgument, "invalid %q in the block: %q: %v", orgAccountListFile, "verify_organization", err)
+		}
+	} else {
+		if cfg.AccountID == "" || cfg.AccountRole == "" {
+			return status.Errorf(codes.InvalidArgument, "please ensure that %q & %q are present inside block or remove the block: %q for feature node attestation using account id verification", orgAccountID, orgAccountRole, "verify_organization")
+		}
+
+		if cfg.AccountRegion == "" {
+			cfg.AccountRegion = orgDefaultAccRegion
+		}
+
+		// The Organizations API is called with the credentials of the region's partition.
+		if len(config.Partitions) > 0 {
+			if _, ok := config.Partitions[partitionForRegion(cfg.AccountRegion)]; !ok {
+				return status.Errorf(codes.InvalidArgument, "%q %q is in partition %q, which has no entry in %q", orgAccRegion, cfg.AccountRegion, partitionForRegion(cfg.AccountRegion), "partitions")
+			}
+		}
+	}
+
+	// check TTL if specified
+	ttl := orgAccountDefaultListDuration
+	checkTTL := cfg.AccountListTTL
+	if checkTTL != "" {
+		t, err := time.ParseDuration(checkTTL)
+		if err != nil {
+			return status.Errorf(codes.InvalidArgument, "please ensure that %q if configured, it should be in duration and is suffixed with required 'm' for time duration in minute ex. '5m'. Otherwise, remove the: %q, in the block: %q. Default TTL will be: %q", orgAccountListTTL, orgAccountListTTL, "verify_organization", orgAccountDefaultListTTL)
+		}
+
+		if t.Minutes() < orgAccountMinTTL.Minutes() {
+			return status.Errorf(codes.InvalidArgument, "please ensure that %q if configured, it should be greater than or equal to %q. Otherwise remove the: %q, in the block: %q. Default TTL will be: %q", orgAccountListTTL, orgAccountMinListTTL, orgAccountListTTL, "verify_organization", orgAccountDefaultListTTL)
+		}
+
+		ttl = t
+	}
+
+	// Assign default ttl if ttl doesnt exist.
+	cfg.AccountListTTL = ttl.String()
+
+	return nil
 }

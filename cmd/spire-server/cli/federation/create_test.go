@@ -11,8 +11,8 @@ import (
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	trustdomainv1 "github.com/spiffe/spire-api-sdk/proto/spire/api/server/trustdomain/v1"
 	"github.com/spiffe/spire-api-sdk/proto/spire/api/types"
+	commonapi "github.com/spiffe/spire/pkg/common/api"
 	"github.com/spiffe/spire/pkg/common/pemutil"
-	"github.com/spiffe/spire/pkg/server/api"
 	"github.com/spiffe/spire/test/spiretest"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
@@ -116,6 +116,18 @@ func TestCreate(t *testing.T) {
 	}
 	require.Len(t, jwtAuthorities, 1)
 
+	var witAuthorities []*types.WITKey
+	for id, key := range spiffeBundle.WITAuthorities() {
+		keyBytes, err := x509.MarshalPKIXPublicKey(key)
+		require.NoError(t, err)
+
+		witAuthorities = append(witAuthorities, &types.WITKey{
+			KeyId:     id,
+			PublicKey: keyBytes,
+		})
+	}
+	require.Len(t, witAuthorities, 1)
+
 	frSPIFFEAuthority := &types.FederationRelationship{
 		TrustDomain:       "td-4.org",
 		BundleEndpointUrl: "https://td-4.org/bundle",
@@ -128,6 +140,7 @@ func TestCreate(t *testing.T) {
 			TrustDomain:     "td-4.org",
 			X509Authorities: x509Authorities,
 			JwtAuthorities:  jwtAuthorities,
+			WitAuthorities:  witAuthorities,
 		},
 	}
 
@@ -201,7 +214,7 @@ func TestCreate(t *testing.T) {
 			fakeResp: &trustdomainv1.BatchCreateFederationRelationshipResponse{
 				Results: []*trustdomainv1.BatchCreateFederationRelationshipResponse_Result{
 					{
-						Status:                 api.OK(),
+						Status:                 commonapi.OK(),
 						FederationRelationship: frSPIFFE,
 					},
 				},
@@ -239,7 +252,7 @@ Endpoint SPIFFE ID        : spiffe://other.org/bundle
 			fakeResp: &trustdomainv1.BatchCreateFederationRelationshipResponse{
 				Results: []*trustdomainv1.BatchCreateFederationRelationshipResponse_Result{
 					{
-						Status:                 api.OK(),
+						Status:                 commonapi.OK(),
 						FederationRelationship: frSPIFFEAndBundle,
 					},
 				},
@@ -272,6 +285,7 @@ Endpoint SPIFFE ID        : spiffe://td-3.org/bundle
             }
           ],
           "jwt_authorities": [],
+          "wit_authorities": [],
           "refresh_hint": "0",
           "sequence_number": "0"
         }
@@ -289,7 +303,7 @@ Endpoint SPIFFE ID        : spiffe://td-3.org/bundle
 			fakeResp: &trustdomainv1.BatchCreateFederationRelationshipResponse{
 				Results: []*trustdomainv1.BatchCreateFederationRelationshipResponse_Result{
 					{
-						Status:                 api.OK(),
+						Status:                 commonapi.OK(),
 						FederationRelationship: frWeb,
 					},
 				},
@@ -367,9 +381,9 @@ Error: failed to create one or more federation relationships
 			},
 			fakeResp: &trustdomainv1.BatchCreateFederationRelationshipResponse{
 				Results: []*trustdomainv1.BatchCreateFederationRelationshipResponse_Result{
-					{FederationRelationship: frWeb, Status: api.OK()},
-					{FederationRelationship: frSPIFFE, Status: api.OK()},
-					{FederationRelationship: frPemAuthority, Status: api.OK()},
+					{FederationRelationship: frWeb, Status: commonapi.OK()},
+					{FederationRelationship: frSPIFFE, Status: commonapi.OK()},
+					{FederationRelationship: frPemAuthority, Status: commonapi.OK()},
 				},
 			},
 			expOutPretty: `
@@ -433,6 +447,7 @@ Endpoint SPIFFE ID        : spiffe://td-3.org/bundle
             }
           ],
           "jwt_authorities": [],
+          "wit_authorities": [],
           "refresh_hint": "0",
           "sequence_number": "0"
         }

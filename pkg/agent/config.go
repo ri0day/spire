@@ -2,21 +2,40 @@ package agent
 
 import (
 	"context"
-	"crypto/x509"
 	"net"
 	"time"
 
-	"github.com/sirupsen/logrus"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	loggerv1 "github.com/spiffe/spire/pkg/agent/api/logger/v1"
+	"github.com/spiffe/spire/pkg/agent/broker"
+	"github.com/spiffe/spire/pkg/agent/endpoints"
+	"github.com/spiffe/spire/pkg/agent/manager"
+	"github.com/spiffe/spire/pkg/agent/trustbundlesources"
 	"github.com/spiffe/spire/pkg/agent/workloadkey"
 	"github.com/spiffe/spire/pkg/common/catalog"
 	"github.com/spiffe/spire/pkg/common/health"
 	"github.com/spiffe/spire/pkg/common/telemetry"
+	"github.com/spiffe/spire/pkg/common/tlspolicy"
 )
 
+const (
+	RebootstrapNever  = "never"
+	RebootstrapAuto   = "auto"
+	RebootstrapAlways = "always"
+)
+
+// WorkloadAPIRateLimitConfig is an alias for endpoints.WorkloadAPIRateLimitConfig.
+type WorkloadAPIRateLimitConfig = endpoints.WorkloadAPIRateLimitConfig
+
 type Config struct {
-	// Address to bind the workload api to
+	// Address to bind the public Workload API/SDS endpoint to. Nil disables the endpoint.
 	BindAddress net.Addr
+
+	// DisableWorkloadAPI disables serving the SPIFFE Workload API.
+	DisableWorkloadAPI bool
+
+	// DisableSDSAPI disables serving the Envoy SDS API.
+	DisableSDSAPI bool
 
 	// Directory to store runtime data
 	DataDir string
@@ -36,11 +55,11 @@ type Config struct {
 	// The TLS Certificate resource name to use for the default X509-SVID with Envoy SDS
 	DefaultSVIDName string
 
-	// If true, the agent will bootstrap insecurely with the server
-	InsecureBootstrap bool
+	// How the agent will behave when seeing an unknown x509 cert from the server
+	RebootstrapMode string
 
-	// If true, the agent retries bootstrap with backoff
-	RetryBootstrap bool
+	// The agent will rebootstrap after configured amount of time on unknown x509 cert from the server
+	RebootstrapDelay time.Duration
 
 	// HealthChecks provides the configuration for health monitoring
 	HealthChecks health.Config
@@ -48,7 +67,10 @@ type Config struct {
 	// Configurations for agent plugins
 	PluginConfigs catalog.PluginConfigs
 
-	Log logrus.FieldLogger
+	Log loggerv1.Logger
+
+	// Workload selector prefixes allowed to be included in diagnostic logs.
+	LogSelectors []string
 
 	// LogReopener facilitates handling a signal to rotate log file.
 	LogReopener func(context.Context) error
@@ -56,25 +78,39 @@ type Config struct {
 	// Address of SPIRE server
 	ServerAddress string
 
+	// ServerLoadBalancingConfig is an opaque payload used as the
+	// loadBalancingConfig field of the gRPC service config used to connect to
+	// the SPIRE server. If empty, round robin load balancing is used.
+	ServerLoadBalancingConfig string
+
 	// SVID key type
 	WorkloadKeyType workloadkey.KeyType
 
 	// SyncInterval controls how often the agent sync synchronizer waits
 	SyncInterval time.Duration
 
-	// UseSyncAuthorizedEntries controls if the new SyncAuthorizedEntries RPC
-	// is used to sync entries from the server.
-	UseSyncAuthorizedEntries bool
+	// SyncRetryBackoff overrides the exponential backoff applied between
+	// failed synchronizations with the server. Unset fields are derived from
+	// SyncInterval.
+	SyncRetryBackoff *manager.SyncRetryBackoffConfig
 
-	// X509SVIDCacheMaxSize is a soft limit of max number of SVIDs that would be stored in cache
+	// X509SVIDCacheMaxSize is a soft limit of max number of X509-SVIDs that would be stored in cache
 	X509SVIDCacheMaxSize int
 
-	// DisableLRUCache disables the SPIRE Agent LRU cache used for storing SVIDs and fallback to original cache
-	DisableLRUCache bool
+	// JWTSVIDCacheMaxSize is a soft limit of max number of JWT-SVIDs that would be stored in cache
+	JWTSVIDCacheMaxSize int
+
+	// WITSVIDCacheMaxSize is a soft limit of max number of WIT-SVIDs that would be stored in cache
+	WITSVIDCacheMaxSize int
+
+	// EnableWITSVIDs controls whether WIT-SVIDs are minted and served
+	EnableWITSVIDs bool
 
 	// Trust domain and associated CA bundle
 	TrustDomain spiffeid.TrustDomain
-	TrustBundle []*x509.Certificate
+
+	// Sources for getting Trust Bundles
+	TrustBundleSources trustbundlesources.Bundle
 
 	// Join token to use for attestation, if needed
 	JoinToken string
@@ -101,11 +137,41 @@ type Config struct {
 
 	AuthorizedDelegates []string
 
+	// Broker holds the SPIFFE Broker API endpoint configuration. Distinct
+	// from AuthorizedDelegates, which gates the Delegated Identity API.
+	// Modeled as a struct (rather than a bare slice) so future top-level
+	// broker configuration can be added without breaking this field's API.
+	Broker BrokerConfig
+
 	// AvailabilityTarget controls how frequently rotate SVIDs
 	AvailabilityTarget time.Duration
 
-	// Deprecated config option to disable reattest to renew functionality
-	DisableReattestToRenew bool
+	// TLSPolicy determines the post-quantum-safe TLS policy to apply to all TLS connections.
+	TLSPolicy tlspolicy.Policy
+
+	// WorkloadAPIRateLimit configures per-selector-set rate limiting for Workload API and SDS methods.
+	WorkloadAPIRateLimit WorkloadAPIRateLimitConfig
+}
+
+// BrokerConfig mirrors the agent's `experimental.broker {}` HCL block.
+type BrokerConfig struct {
+	// BindAddresses are the addresses the broker endpoint listens on. Each
+	// element is a `*net.UnixAddr` (UDS, POSIX only) or a `*net.TCPAddr`.
+	// Multiple entries are served simultaneously by a single gRPC server.
+	// Empty disables the broker endpoint.
+	BindAddresses []net.Addr
+
+	// Brokers enumerates the brokers authorized to talk to this agent's
+	// broker endpoint.
+	Brokers []broker.Broker
+
+	// ReattestInterval is how often active X.509-SVID subscriptions re-attest
+	// their workload reference. Zero uses the default.
+	ReattestInterval time.Duration
+
+	// ReattestJitter is the fraction of ReattestInterval used to jitter each
+	// re-attestation interval. Nil uses the default.
+	ReattestJitter *float64
 }
 
 func New(c *Config) *Agent {

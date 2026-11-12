@@ -14,30 +14,35 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	"dario.cat/mergo"
 	"github.com/google/go-cmp/cmp"
 	"github.com/hashicorp/hcl"
 	"github.com/hashicorp/hcl/hcl/ast"
 	"github.com/hashicorp/hcl/hcl/printer"
 	"github.com/hashicorp/hcl/hcl/token"
-	"github.com/imdario/mergo"
 	"github.com/mitchellh/cli"
 	"github.com/sirupsen/logrus"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/spire/pkg/common/bundleutil"
 	"github.com/spiffe/spire/pkg/common/catalog"
 	common_cli "github.com/spiffe/spire/pkg/common/cli"
+	"github.com/spiffe/spire/pkg/common/config"
+	"github.com/spiffe/spire/pkg/common/diskcertmanager"
+	"github.com/spiffe/spire/pkg/common/errorutil"
 	"github.com/spiffe/spire/pkg/common/fflag"
 	"github.com/spiffe/spire/pkg/common/health"
 	"github.com/spiffe/spire/pkg/common/log"
 	"github.com/spiffe/spire/pkg/common/telemetry"
+	"github.com/spiffe/spire/pkg/common/tlspolicy"
 	"github.com/spiffe/spire/pkg/server"
 	"github.com/spiffe/spire/pkg/server/authpolicy"
 	bundleClient "github.com/spiffe/spire/pkg/server/bundle/client"
-	"github.com/spiffe/spire/pkg/server/ca/manager"
+	"github.com/spiffe/spire/pkg/server/ca"
 	"github.com/spiffe/spire/pkg/server/credtemplate"
 	"github.com/spiffe/spire/pkg/server/endpoints/bundle"
 	"github.com/spiffe/spire/pkg/server/plugin/keymanager"
@@ -62,33 +67,39 @@ type Config struct {
 }
 
 type serverConfig struct {
-	AdminIDs           []string           `hcl:"admin_ids"`
-	AgentTTL           string             `hcl:"agent_ttl"`
-	AuditLogEnabled    bool               `hcl:"audit_log_enabled"`
-	BindAddress        string             `hcl:"bind_address"`
-	BindPort           int                `hcl:"bind_port"`
-	CAKeyType          string             `hcl:"ca_key_type"`
-	CASubject          *caSubjectConfig   `hcl:"ca_subject"`
-	CATTL              string             `hcl:"ca_ttl"`
-	DataDir            string             `hcl:"data_dir"`
-	DefaultX509SVIDTTL string             `hcl:"default_x509_svid_ttl"`
-	DefaultJWTSVIDTTL  string             `hcl:"default_jwt_svid_ttl"`
-	Experimental       experimentalConfig `hcl:"experimental"`
-	Federation         *federationConfig  `hcl:"federation"`
-	JWTIssuer          string             `hcl:"jwt_issuer"`
-	JWTKeyType         string             `hcl:"jwt_key_type"`
-	LogFile            string             `hcl:"log_file"`
-	LogLevel           string             `hcl:"log_level"`
-	LogFormat          string             `hcl:"log_format"`
-	LogSourceLocation  bool               `hcl:"log_source_location"`
-	RateLimit          rateLimitConfig    `hcl:"ratelimit"`
-	SocketPath         string             `hcl:"socket_path"`
-	TrustDomain        string             `hcl:"trust_domain"`
-	// Temporary flag to allow disabling the inclusion of serial number in X509 CAs Subject field
-	ExcludeSNFromCASubject bool `hcl:"exclude_sn_from_ca_subject"`
-
-	ConfigPath string
-	ExpandEnv  bool
+	AdminIDs                     []string             `hcl:"admin_ids"`
+	AgentTTL                     string               `hcl:"agent_ttl"`
+	AuditLogEnabled              bool                 `hcl:"audit_log_enabled"`
+	AuditLogExcludeAgentSync     bool                 `hcl:"audit_log_exclude_agent_sync"`
+	BindAddress                  string               `hcl:"bind_address"`
+	BindPort                     int                  `hcl:"bind_port"`
+	CAKeyType                    string               `hcl:"ca_key_type"`
+	CASubject                    *caSubjectConfig     `hcl:"ca_subject"`
+	CATTL                        string               `hcl:"ca_ttl"`
+	DataDir                      string               `hcl:"data_dir"`
+	DefaultX509SVIDTTL           string               `hcl:"default_x509_svid_ttl"`
+	DefaultJWTSVIDTTL            string               `hcl:"default_jwt_svid_ttl"`
+	Experimental                 experimentalConfig   `hcl:"experimental"`
+	Federation                   *federationConfig    `hcl:"federation"`
+	DisableJWTSVIDs              bool                 `hcl:"disable_jwt_svids"`
+	JWTIssuer                    string               `hcl:"jwt_issuer"`
+	JWTKeyType                   string               `hcl:"jwt_key_type"`
+	LogFile                      string               `hcl:"log_file"`
+	LogFileRotation              *log.RotationConfig  `hcl:"log_file_rotation"`
+	LogLevel                     string               `hcl:"log_level"`
+	LogFormat                    string               `hcl:"log_format"`
+	LogSourceLocation            bool                 `hcl:"log_source_location"`
+	PruneAttestedNodesExpiredFor string               `hcl:"prune_attested_nodes_expired_for"`
+	PruneAttestedNodesBatchSize  int                  `hcl:"prune_attested_nodes_batch_size"`
+	PruneNonReattestableNodes    bool                 `hcl:"prune_tofu_nodes"`
+	ProxyProtocolTrustedCIDRs    []string             `hcl:"proxy_protocol_trusted_cidrs"`
+	RateLimit                    rateLimitConfig      `hcl:"ratelimit"`
+	SocketPath                   string               `hcl:"socket_path"`
+	TrustDomain                  string               `hcl:"trust_domain"`
+	MaxAttestedNodeInfoStaleness *string              `hcl:"max_attested_node_info_staleness"`
+	TLSConfig                    *tlspolicy.TLSConfig `hcl:"tls_config"`
+	ConfigPath                   string
+	ExpandEnv                    bool
 
 	// Undocumented configurables
 	ProfilingEnabled bool     `hcl:"profiling_enabled"`
@@ -100,10 +111,20 @@ type serverConfig struct {
 }
 
 type experimentalConfig struct {
-	AuthOpaPolicyEngine  *authpolicy.OpaEngineConfig `hcl:"auth_opa_policy_engine"`
-	CacheReloadInterval  string                      `hcl:"cache_reload_interval"`
-	EventsBasedCache     bool                        `hcl:"events_based_cache"`
-	PruneEventsOlderThan string                      `hcl:"prune_events_older_than"`
+	AgentSpiffeIdAsSelector    bool                        `hcl:"agent_spiffe_id_as_selector"`
+	AllowNonconformingAgentIDs bool                        `hcl:"allow_nonconforming_agent_ids"`
+	AuthOpaPolicyEngine        *authpolicy.OpaEngineConfig `hcl:"auth_opa_policy_engine"`
+	CacheReloadInterval        string                      `hcl:"cache_reload_interval"`
+	FullCacheReloadInterval    string                      `hcl:"full_cache_reload_interval"`
+	EventsBasedCache           bool                        `hcl:"events_based_cache"`
+	PruneEventsOlderThan       string                      `hcl:"prune_events_older_than"`
+	EventTimeout               string                      `hcl:"event_timeout"`
+	SQLTransactionTimeout      string                      `hcl:"sql_transaction_timeout"`
+	RequirePQKEM               bool                        `hcl:"require_pq_kem"`
+	EnableWITSVIDs             bool                        `hcl:"enable_wit_svids"`
+	WITKeyType                 string                      `hcl:"wit_key_type"`
+	WITIssuer                  string                      `hcl:"wit_issuer"`
+	DefaultWITSVIDTTL          string                      `hcl:"default_wit_svid_ttl"`
 
 	Flags fflag.RawConfig `hcl:"feature_flags"`
 
@@ -143,10 +164,18 @@ type bundleEndpointConfigProfile struct {
 }
 
 type bundleEndpointProfileHTTPSWebConfig struct {
-	ACME *bundleEndpointACMEConfig `hcl:"acme"`
+	ACME            *bundleEndpointACMEConfig      `hcl:"acme"`
+	ServingCertFile *bundleEndpointServingCertFile `hcl:"serving_cert_file"`
 }
 
 type bundleEndpointProfileHTTPSSPIFFEConfig struct{}
+
+type bundleEndpointServingCertFile struct {
+	CertFilePath        string        `hcl:"cert_file_path"`
+	KeyFilePath         string        `hcl:"key_file_path"`
+	FileSyncInterval    time.Duration `hcl:"-"`
+	RawFileSyncInterval string        `hcl:"file_sync_interval"`
+}
 
 type bundleEndpointACMEConfig struct {
 	DirectoryURL       string                 `hcl:"directory_url"`
@@ -159,6 +188,8 @@ type bundleEndpointACMEConfig struct {
 type federatesWithConfig struct {
 	BundleEndpointURL     string                 `hcl:"bundle_endpoint_url"`
 	BundleEndpointProfile ast.Node               `hcl:"bundle_endpoint_profile"`
+	BootstrapBundlePath   string                 `hcl:"bootstrap_bundle_path"`
+	BootstrapBundleFormat string                 `hcl:"bootstrap_bundle_format"`
 	UnusedKeyPositions    map[string][]token.Pos `hcl:",unusedKeyPositions"`
 }
 
@@ -216,6 +247,16 @@ func Help(name string, writer io.Writer) string {
 }
 
 func LoadConfig(name string, args []string, logOptions []log.Option, output io.Writer, allowUnknownConfig bool) (*server.Config, error) {
+	return loadConfig(name, args, logOptions, output, allowUnknownConfig, false)
+}
+
+// LoadConfigForValidation loads the configuration without opening log_file, so
+// that validating the config of a running server does not touch its log.
+func LoadConfigForValidation(name string, args []string, logOptions []log.Option, output io.Writer) (*server.Config, error) {
+	return loadConfig(name, args, logOptions, output, false, true)
+}
+
+func loadConfig(name string, args []string, logOptions []log.Option, output io.Writer, allowUnknownConfig, skipLogFile bool) (*server.Config, error) {
 	// First parse the CLI flags so we can get the config
 	// file path, if set
 	cliInput, err := parseFlags(name, args, output)
@@ -240,7 +281,7 @@ func LoadConfig(name string, args []string, logOptions []log.Option, output io.W
 		return nil, fmt.Errorf("error loading feature flags: %w", err)
 	}
 
-	return NewServerConfig(input, logOptions, allowUnknownConfig)
+	return newServerConfig(input, logOptions, allowUnknownConfig, skipLogFile)
 }
 
 // Run the SPIFFE Server
@@ -264,7 +305,7 @@ func (cmd *Command) Run(args []string) int {
 	defer stop()
 
 	err = s.Run(ctx)
-	if err != nil {
+	if err != nil && !errorutil.IsCanceled(err) {
 		c.Log.WithError(err).Error("Server crashed")
 		return 1
 	}
@@ -304,7 +345,7 @@ func ParseFile(path string, expandEnv bool) (*Config, error) {
 
 	// If envTemplate flag is passed, substitute $VARIABLES in configuration file
 	if expandEnv {
-		data = os.ExpandEnv(data)
+		data = config.ExpandEnv(data)
 	}
 
 	if err := hcl.Decode(&c, data); err != nil {
@@ -362,6 +403,10 @@ func mergeInput(fileInput *Config, cliInput *serverConfig) (*Config, error) {
 }
 
 func NewServerConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool) (*server.Config, error) {
+	return newServerConfig(c, logOptions, allowUnknownConfig, false)
+}
+
+func newServerConfig(c *Config, logOptions []log.Option, allowUnknownConfig, skipLogFile bool) (*server.Config, error) {
 	sc := &server.Config{}
 
 	if err := validateConfig(c); err != nil {
@@ -375,9 +420,10 @@ func NewServerConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool
 	if c.Server.LogSourceLocation {
 		logOptions = append(logOptions, log.WithSourceLocation())
 	}
-	var reopenableFile *log.ReopenableFile
-	if c.Server.LogFile != "" {
-		reopenableFile, err := log.NewReopenableFile(c.Server.LogFile)
+	var reopenableFile log.ReopenableWriteCloser
+	if c.Server.LogFile != "" && !skipLogFile {
+		var err error
+		reopenableFile, err = log.NewOutputFile(c.Server.LogFile, c.Server.LogFileRotation)
 		if err != nil {
 			return nil, err
 		}
@@ -394,7 +440,7 @@ func NewServerConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool
 		sc.LogReopener = log.ReopenOnSignal(logger, reopenableFile)
 	}
 
-	bindAddress, err := net.ResolveTCPAddr("tcp", fmt.Sprintf("%s:%d", c.Server.BindAddress, c.Server.BindPort))
+	bindAddress, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(strings.Trim(c.Server.BindAddress, "[]"), strconv.Itoa(c.Server.BindPort)))
 	if err != nil {
 		return nil, fmt.Errorf(`could not resolve bind address "%s:%d": %w`, c.Server.BindAddress, c.Server.BindPort, err)
 	}
@@ -409,6 +455,8 @@ func NewServerConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool
 
 	sc.DataDir = c.Server.DataDir
 	sc.AuditLogEnabled = c.Server.AuditLogEnabled
+	sc.AuditLogExcludeAgentSync = c.Server.AuditLogExcludeAgentSync
+	sc.ProxyProtocolTrustedCIDRs = c.Server.ProxyProtocolTrustedCIDRs
 
 	td, err := spiffeid.TrustDomainFromString(c.Server.TrustDomain)
 	if err != nil {
@@ -460,11 +508,10 @@ func NewServerConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool
 			}
 
 			if c.Server.Federation.BundleEndpoint != nil {
-				acmeConfig, err := parseBundleEndpointConfigProfile(c.Server.Federation.BundleEndpoint, sc.DataDir, sc.Log)
+				err := setBundleEndpointConfigProfile(c.Server.Federation.BundleEndpoint, sc.DataDir, sc.Log, &sc.Federation)
 				if err != nil {
 					return nil, err
 				}
-				sc.Federation.BundleEndpoint.ACME = acmeConfig
 			}
 		}
 
@@ -483,6 +530,9 @@ func NewServerConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool
 				if err != nil {
 					return nil, fmt.Errorf("error parsing federation relationship for trust domain %q: %w", trustDomain, err)
 				}
+				if err := validateFederatesWithBootstrap(td, trustDomainConfig); err != nil {
+					return nil, fmt.Errorf("error parsing federation relationship for trust domain %q: %w", trustDomain, err)
+				}
 			default:
 				return nil, fmt.Errorf("federation configuration for trust domain %q: missing bundle endpoint configuration", trustDomain)
 			}
@@ -495,6 +545,24 @@ func NewServerConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool
 	sc.ProfilingPort = c.Server.ProfilingPort
 	sc.ProfilingFreq = c.Server.ProfilingFreq
 	sc.ProfilingNames = c.Server.ProfilingNames
+
+	tlsPolicyLogger := log.NewHCLogAdapter(logger, "tlspolicy")
+
+	sc.TLSPolicy, err = tlspolicy.NewPolicy(c.Server.Experimental.RequirePQKEM, c.Server.TLSConfig, tlsPolicyLogger)
+	if err != nil {
+		return nil, fmt.Errorf("unable to parse configured TLS configuration: %w", err)
+	}
+
+	tlspolicy.LogPolicy(sc.TLSPolicy, tlsPolicyLogger)
+
+	if c.Server.MaxAttestedNodeInfoStaleness != nil {
+		maxAttestedNodeInfoStaleness, err := time.ParseDuration(*c.Server.MaxAttestedNodeInfoStaleness)
+		if err != nil {
+			return nil, fmt.Errorf("could not parse max attested node staleness %q: %w", *c.Server.MaxAttestedNodeInfoStaleness, err)
+		}
+
+		sc.MaxAttestedNodeInfoStaleness = maxAttestedNodeInfoStaleness
+	}
 
 	for _, adminID := range c.Server.AdminIDs {
 		id, err := spiffeid.FromString(adminID)
@@ -537,6 +605,16 @@ func NewServerConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool
 		sc.JWTSVIDTTL = credtemplate.DefaultJWTSVIDTTL
 	}
 
+	if c.Server.Experimental.DefaultWITSVIDTTL != "" {
+		ttl, err := time.ParseDuration(c.Server.Experimental.DefaultWITSVIDTTL)
+		if err != nil {
+			return nil, fmt.Errorf("could not parse default WIT SVID ttl %q: %w", c.Server.Experimental.DefaultWITSVIDTTL, err)
+		}
+		sc.WITSVIDTTL = ttl
+	} else {
+		sc.WITSVIDTTL = credtemplate.DefaultWITSVIDTTL
+	}
+
 	if c.Server.CATTL != "" {
 		ttl, err := time.ParseDuration(c.Server.CATTL)
 		if err != nil {
@@ -545,12 +623,16 @@ func NewServerConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool
 		sc.CATTL = ttl
 	}
 
+	sc.Experimental.AgentSpiffeIdAsSelector = c.Server.Experimental.AgentSpiffeIdAsSelector
+	sc.Experimental.AllowNonconformingAgentIDs = c.Server.Experimental.AllowNonconformingAgentIDs
+
 	// If the configured TTLs can lead to surprises, then do our best to log an
 	// accurate message and guide the user to resolution
-	ttlChecks := []struct {
+	type ttlCheck struct {
 		name string
 		ttl  time.Duration
-	}{
+	}
+	ttlChecks := []ttlCheck{
 		{
 			name: "default_x509_svid_ttl",
 			ttl:  sc.X509SVIDTTL,
@@ -559,6 +641,16 @@ func NewServerConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool
 			name: "default_jwt_svid_ttl",
 			ttl:  sc.JWTSVIDTTL,
 		},
+		{
+			name: "default_wit_svid_ttl",
+			ttl:  sc.WITSVIDTTL,
+		},
+	}
+	if sc.AgentTTL != 0 {
+		ttlChecks = append(ttlChecks, ttlCheck{
+			name: "agent_ttl",
+			ttl:  sc.AgentTTL,
+		})
 	}
 
 	for _, ttlCheck := range ttlChecks {
@@ -566,7 +658,7 @@ func NewServerConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool
 			var message string
 
 			switch {
-			case ttlCheck.ttl < manager.MaxSVIDTTL():
+			case ttlCheck.ttl < ca.MaxSVIDTTL():
 				// TTL is smaller than our cap, but the CA TTL
 				// is not large enough to accommodate it
 				message = fmt.Sprintf("%s is too high for the configured "+
@@ -576,7 +668,7 @@ func NewServerConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool
 					"when CA rotations are scheduled.",
 					ttlCheck.name, ttlCheck.name, printMaxSVIDTTL(sc.CATTL), printMinCATTL(ttlCheck.ttl), ttlCheck.name,
 				)
-			case sc.CATTL < manager.MinCATTLForSVIDTTL(manager.MaxSVIDTTL()):
+			case sc.CATTL < ca.MinCATTLForSVIDTTL(ca.MaxSVIDTTL()):
 				// TTL is larger than our cap, it needs to be
 				// decreased no matter what. Additionally, the CA TTL is
 				// too small to accommodate the maximum SVID TTL.
@@ -585,7 +677,7 @@ func NewServerConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool
 					"may be issued. Please set %s to %v or less, and the "+
 					"ca_ttl to %v or more, to guarantee the full %s "+
 					"lifetime when CA rotations are scheduled.",
-					ttlCheck.name, ttlCheck.name, printDuration(manager.MaxSVIDTTL()), printMinCATTL(manager.MaxSVIDTTL()), ttlCheck.name,
+					ttlCheck.name, ttlCheck.name, printDuration(ca.MaxSVIDTTL()), printMinCATTL(ca.MaxSVIDTTL()), ttlCheck.name,
 				)
 			default:
 				// TTL is larger than our cap and needs to be
@@ -597,30 +689,47 @@ func NewServerConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool
 					ttlCheck.name, ttlCheck.name, printMaxSVIDTTL(sc.CATTL), ttlCheck.name,
 				)
 			}
-			sc.Log.Warn(message)
+			sc.Log.WithFields(logrus.Fields{
+				telemetry.Alert:        true,
+				telemetry.AlertType:    telemetry.ShortenedLifetimeAlertType,
+				telemetry.TTLName:      ttlCheck.name,
+				telemetry.RequestedTTL: ttlCheck.ttl.Seconds(),
+				telemetry.MaxTTL:       ca.MaxSVIDTTLForCATTL(sc.CATTL).Seconds(),
+				telemetry.CATTL:        sc.CATTL.Seconds(),
+			}).Warn(message)
 		}
 	}
 
 	if c.Server.CAKeyType != "" {
-		keyType, err := keyTypeFromString(c.Server.CAKeyType)
+		keyType, err := keymanager.KeyTypeFromString(c.Server.CAKeyType)
 		if err != nil {
 			return nil, fmt.Errorf("error parsing ca_key_type: %w", err)
 		}
 		sc.CAKeyType = keyType
 		sc.JWTKeyType = keyType
+		sc.WITKeyType = keyType
 	} else {
 		sc.CAKeyType = keymanager.ECP256
 		sc.JWTKeyType = keymanager.ECP256
+		sc.WITKeyType = keymanager.ECP256
 	}
 
 	if c.Server.JWTKeyType != "" {
-		sc.JWTKeyType, err = keyTypeFromString(c.Server.JWTKeyType)
+		sc.JWTKeyType, err = keymanager.KeyTypeFromString(c.Server.JWTKeyType)
 		if err != nil {
 			return nil, fmt.Errorf("error parsing jwt_key_type: %w", err)
 		}
 	}
 
+	if c.Server.Experimental.WITKeyType != "" {
+		sc.WITKeyType, err = keymanager.KeyTypeFromString(c.Server.Experimental.WITKeyType)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing wit_key_type: %w", err)
+		}
+	}
+
 	sc.JWTIssuer = c.Server.JWTIssuer
+	sc.WITIssuer = c.Server.Experimental.WITIssuer
 
 	if subject := c.Server.CASubject; subject != nil {
 		sc.CASubject = pkix.Name{
@@ -637,18 +746,35 @@ func NewServerConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool
 		sc.CASubject = credtemplate.DefaultX509CASubject()
 	}
 
-	sc.ExcludeSNFromCASubject = c.Server.ExcludeSNFromCASubject
-	// TODO: remove exclude_sn_from_ca_subject in SPIRE v1.10.0
-	if sc.ExcludeSNFromCASubject {
-		sc.Log.Warn("The deprecated exclude_sn_from_ca_subject configurable will be removed in a future release")
-	}
-
 	sc.PluginConfigs, err = catalog.PluginConfigsFromHCLNode(c.Plugins)
 	if err != nil {
 		return nil, err
 	}
 	sc.Telemetry = c.Telemetry
+	if err := c.HealthChecks.ParseCheckInterval(); err != nil {
+		return nil, err
+	}
 	sc.HealthChecks = c.HealthChecks
+
+	if c.Server.PruneAttestedNodesExpiredFor != "" {
+		expiredFor, err := time.ParseDuration(c.Server.PruneAttestedNodesExpiredFor)
+		if err != nil {
+			return nil, fmt.Errorf("could not parse prune_attested_nodes_expired_for: %w", err)
+		}
+		sc.PruneAttestedNodesExpiredFor = expiredFor
+		if c.Server.PruneNonReattestableNodes {
+			sc.PruneNonReattestableNodes = c.Server.PruneNonReattestableNodes
+		}
+
+		sc.PruneAttestedNodesBatchSize = c.Server.PruneAttestedNodesBatchSize
+	}
+
+	if c.Server.DisableJWTSVIDs {
+		sc.Log.Info("JWT-SVID profile is disabled")
+	}
+	sc.DisableJWTSVIDs = c.Server.DisableJWTSVIDs
+
+	sc.DisableWITSVIDs = !c.Server.Experimental.EnableWITSVIDs
 
 	if !allowUnknownConfig {
 		if err := checkForUnknownConfig(c, sc.Log); err != nil {
@@ -668,12 +794,40 @@ func NewServerConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool
 		sc.CacheReloadInterval = interval
 	}
 
+	if c.Server.Experimental.FullCacheReloadInterval != "" {
+		interval, err := time.ParseDuration(c.Server.Experimental.FullCacheReloadInterval)
+		if err != nil {
+			return nil, fmt.Errorf("could not parse full cache reload interval: %w", err)
+		}
+		sc.FullCacheReloadInterval = interval
+	}
+
 	if c.Server.Experimental.PruneEventsOlderThan != "" {
 		interval, err := time.ParseDuration(c.Server.Experimental.PruneEventsOlderThan)
 		if err != nil {
 			return nil, fmt.Errorf("could not parse prune events interval: %w", err)
 		}
 		sc.PruneEventsOlderThan = interval
+	}
+
+	if c.Server.Experimental.SQLTransactionTimeout != "" {
+		sc.Log.WithFields(logrus.Fields{
+			telemetry.Alert:     true,
+			telemetry.AlertType: telemetry.DeprecatedConfigAlertType,
+		}).Warn("experimental.sql_transaction_timeout is deprecated, use experimental.event_timeout instead")
+		interval, err := time.ParseDuration(c.Server.Experimental.SQLTransactionTimeout)
+		if err != nil {
+			return nil, fmt.Errorf("could not parse SQL transaction timeout interval: %w", err)
+		}
+		sc.EventTimeout = interval
+	}
+
+	if c.Server.Experimental.EventTimeout != "" {
+		interval, err := time.ParseDuration(c.Server.Experimental.EventTimeout)
+		if err != nil {
+			return nil, fmt.Errorf("could not parse event timeout interval: %w", err)
+		}
+		sc.EventTimeout = interval
 	}
 
 	if c.Server.Experimental.EventsBasedCache {
@@ -690,46 +844,57 @@ func NewServerConfig(c *Config, logOptions []log.Option, allowUnknownConfig bool
 	return sc, nil
 }
 
-func parseBundleEndpointConfigProfile(config *bundleEndpointConfig, dataDir string, log logrus.FieldLogger) (*bundle.ACMEConfig, error) {
+func setBundleEndpointConfigProfile(config *bundleEndpointConfig, dataDir string, log logrus.FieldLogger, federationConfig *server.FederationConfig) error {
 	switch {
 	case config.ACME != nil && config.Profile != nil:
-		return nil, errors.New("either bundle endpoint 'acme' or 'profile' can be set, but not both")
+		return errors.New("either bundle endpoint 'acme' or 'profile' can be set, but not both")
 
 	case config.ACME != nil:
-		log.Warn("ACME configuration within the bundle_endpoint is deprecated. Please use ACME configuration as part of the https_web profile instead.")
-		return configToACMEConfig(config.ACME, dataDir), nil
+		log.WithFields(logrus.Fields{
+			telemetry.Alert:     true,
+			telemetry.AlertType: telemetry.DeprecatedConfigAlertType,
+		}).Warn("ACME configuration within the bundle_endpoint is deprecated. Please use ACME configuration as part of the https_web profile instead.")
+		federationConfig.BundleEndpoint.ACME = configToACMEConfig(config.ACME, dataDir)
+		return nil
 
 	case config.Profile == nil:
-		log.Warn("Bundle endpoint is configured but has no profile set, using https_spiffe as default; please configure a profile explicitly. This will be fatal in a future release.")
-		return nil, nil
+		log.WithFields(logrus.Fields{
+			telemetry.Alert:     true,
+			telemetry.AlertType: telemetry.DeprecatedConfigAlertType,
+		}).Warn("Bundle endpoint is configured but has no profile set, using https_spiffe as default; please configure a profile explicitly. This will be fatal in a future release.")
+		return nil
 	}
 
 	// Profile is set, parse it
 	configString, err := parseBundleEndpointProfileASTNode(config.Profile)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	profileConfig := new(bundleEndpointConfigProfile)
 	if err := hcl.Decode(profileConfig, configString); err != nil {
-		return nil, fmt.Errorf("failed to decode configuration: %w", err)
+		return fmt.Errorf("failed to decode configuration: %w", err)
 	}
 
 	switch {
 	case profileConfig.HTTPSWeb != nil:
-		acme := profileConfig.HTTPSWeb.ACME
-		if acme == nil {
-			return nil, fmt.Errorf("malformed https_web profile configuration: ACME is required")
+		switch {
+		case profileConfig.HTTPSWeb.ACME != nil:
+			federationConfig.BundleEndpoint.ACME = configToACMEConfig(profileConfig.HTTPSWeb.ACME, dataDir)
+			return nil
+		case profileConfig.HTTPSWeb.ServingCertFile != nil:
+			federationConfig.BundleEndpoint.DiskCertManager, err = configToDiskCertManager(profileConfig.HTTPSWeb.ServingCertFile, log)
+			return err
+		default:
+			return errors.New("malformed https_web profile configuration: 'acme' or 'serving_cert_file' is required")
 		}
-		acmeConfig := configToACMEConfig(acme, dataDir)
-		return acmeConfig, nil
 
 	// For now ignore SPIFFE configuration
 	case profileConfig.HTTPSSPIFFE != nil:
-		return nil, nil
+		return nil
 
 	default:
-		return nil, errors.New(`unknown bundle endpoint profile configured; current supported profiles are "https_spiffe" and 'https_web"`)
+		return errors.New(`unknown bundle endpoint profile configured; current supported profiles are "https_spiffe" and 'https_web"`)
 	}
 }
 
@@ -741,6 +906,28 @@ func configToACMEConfig(acme *bundleEndpointACMEConfig, dataDir string) *bundle.
 		Email:        acme.Email,
 		ToSAccepted:  acme.ToSAccepted,
 	}
+}
+
+func configToDiskCertManager(serviceCertFile *bundleEndpointServingCertFile, log logrus.FieldLogger) (*diskcertmanager.DiskCertManager, error) {
+	fileSyncInterval, err := time.ParseDuration(serviceCertFile.RawFileSyncInterval)
+	if err != nil {
+		return nil, err
+	}
+
+	serviceCertFile.FileSyncInterval = fileSyncInterval
+	if serviceCertFile.FileSyncInterval == time.Duration(0) {
+		serviceCertFile.FileSyncInterval = time.Hour
+	}
+
+	return diskcertmanager.New(
+		&diskcertmanager.Config{
+			CertFilePath:     serviceCertFile.CertFilePath,
+			KeyFilePath:      serviceCertFile.KeyFilePath,
+			FileSyncInterval: serviceCertFile.FileSyncInterval,
+		},
+		nil,
+		log,
+	)
 }
 
 func parseBundleEndpointProfile(config federatesWithConfig) (trustDomainConfig *bundleClient.TrustDomainConfig, err error) {
@@ -768,10 +955,41 @@ func parseBundleEndpointProfile(config federatesWithConfig) (trustDomainConfig *
 		return nil, errors.New(`no bundle endpoint profile defined; current supported profiles are "https_spiffe" and 'https_web"`)
 	}
 
+	format := strings.ToLower(strings.TrimSpace(config.BootstrapBundleFormat))
+	if config.BootstrapBundlePath != "" && format == "" {
+		format = bundleClient.BootstrapBundleFormatPEM
+	}
+
 	return &bundleClient.TrustDomainConfig{
-		EndpointURL:     config.BundleEndpointURL,
-		EndpointProfile: endpointProfile,
+		EndpointURL:           config.BundleEndpointURL,
+		EndpointProfile:       endpointProfile,
+		BootstrapBundlePath:   config.BootstrapBundlePath,
+		BootstrapBundleFormat: format,
 	}, nil
+}
+
+func validateFederatesWithBootstrap(td spiffeid.TrustDomain, cfg *bundleClient.TrustDomainConfig) error {
+	if cfg.BootstrapBundleFormat != "" && cfg.BootstrapBundlePath == "" {
+		return errors.New("bootstrap_bundle_format is set but bootstrap_bundle_path is empty")
+	}
+	if cfg.BootstrapBundlePath == "" {
+		return nil
+	}
+
+	switch cfg.BootstrapBundleFormat {
+	case bundleClient.BootstrapBundleFormatPEM, bundleClient.BootstrapBundleFormatSPIFFE:
+	default:
+		return fmt.Errorf("bootstrap_bundle_format must be %q or %q", bundleClient.BootstrapBundleFormatPEM, bundleClient.BootstrapBundleFormatSPIFFE)
+	}
+
+	spiffeProfile, ok := cfg.EndpointProfile.(bundleClient.HTTPSSPIFFEProfile)
+	if !ok {
+		return errors.New("bootstrap_bundle_path is only supported with the https_spiffe bundle endpoint profile")
+	}
+	if spiffeProfile.EndpointSPIFFEID.TrustDomain() != td {
+		return errors.New("bootstrap_bundle_path is only supported when the endpoint SPIFFE ID is in the federated trust domain")
+	}
+	return nil
 }
 
 func parseBundleEndpointProfileASTNode(node ast.Node) (string, error) {
@@ -812,6 +1030,15 @@ func validateConfig(c *Config) error {
 		return errors.New("plugins section must be configured")
 	}
 
+	if c.Server.LogFileRotation != nil {
+		if c.Server.LogFile == "" {
+			return errors.New("log_file must be configured to use log_file_rotation")
+		}
+		if err := c.Server.LogFileRotation.Validate(); err != nil {
+			return fmt.Errorf("invalid log_file_rotation configuration: %w", err)
+		}
+	}
+
 	if c.Server.Federation != nil {
 		if c.Server.Federation.BundleEndpoint != nil &&
 			c.Server.Federation.BundleEndpoint.ACME != nil {
@@ -833,6 +1060,16 @@ func validateConfig(c *Config) error {
 			case !strings.HasPrefix(strings.ToLower(tdConfig.BundleEndpointURL), "https://"):
 				return fmt.Errorf("federation.federates_with[\"%s\"].bundle_endpoint_url must use the HTTPS protocol; URL found: %q", td, tdConfig.BundleEndpointURL)
 			}
+		}
+	}
+
+	if c.Server.Experimental.EventTimeout != "" && c.Server.Experimental.SQLTransactionTimeout != "" {
+		return errors.New("both experimental sql_transaction_timeout and event_timeout set, only set event_timeout")
+	}
+
+	for _, cidr := range c.Server.ProxyProtocolTrustedCIDRs {
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			return fmt.Errorf("invalid proxy_protocol_trusted_cidrs value %q: %w", cidr, err)
 		}
 	}
 
@@ -865,6 +1102,10 @@ func checkForUnknownConfig(c *Config, l logrus.FieldLogger) (err error) {
 
 		if cs := c.Server.CASubject; cs != nil && len(cs.UnusedKeyPositions) != 0 {
 			detectedUnknown("ca_subject", cs.UnusedKeyPositions)
+		}
+
+		if lr := c.Server.LogFileRotation; lr != nil && len(lr.UnusedKeyPositions) != 0 {
+			detectedUnknown("log_file_rotation", lr.UnusedKeyPositions)
 		}
 
 		if rl := c.Server.RateLimit; len(rl.UnusedKeyPositions) != 0 {
@@ -960,37 +1201,22 @@ func defaultConfig() *Config {
 	}
 }
 
-func keyTypeFromString(s string) (keymanager.KeyType, error) {
-	switch strings.ToLower(s) {
-	case "rsa-2048":
-		return keymanager.RSA2048, nil
-	case "rsa-4096":
-		return keymanager.RSA4096, nil
-	case "ec-p256":
-		return keymanager.ECP256, nil
-	case "ec-p384":
-		return keymanager.ECP384, nil
-	default:
-		return keymanager.KeyTypeUnset, fmt.Errorf("key type %q is unknown; must be one of [rsa-2048, rsa-4096, ec-p256, ec-p384]", s)
-	}
-}
-
 // hasCompatibleTTL checks if we can guarantee the configured SVID TTL given the
 // configured CA TTL. If we detect that a new SVID TTL may be cut short due to
 // a scheduled CA rotation, this function will return false. This method should
 // be called for each SVID TTL we may use
 func hasCompatibleTTL(caTTL time.Duration, svidTTL time.Duration) bool {
-	return svidTTL <= manager.MaxSVIDTTLForCATTL(caTTL)
+	return svidTTL <= ca.MaxSVIDTTLForCATTL(caTTL)
 }
 
 // printMaxSVIDTTL calculates the display string for a sufficiently short SVID TTL
 func printMaxSVIDTTL(caTTL time.Duration) string {
-	return printDuration(manager.MaxSVIDTTLForCATTL(caTTL))
+	return printDuration(ca.MaxSVIDTTLForCATTL(caTTL))
 }
 
 // printMinCATTL calculates the display string for a sufficiently large CA TTL
 func printMinCATTL(svidTTL time.Duration) string {
-	return printDuration(manager.MinCATTLForSVIDTTL(svidTTL))
+	return printDuration(ca.MinCATTLForSVIDTTL(svidTTL))
 }
 
 func printDuration(d time.Duration) string {

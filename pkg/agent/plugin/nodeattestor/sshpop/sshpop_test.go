@@ -6,8 +6,10 @@ import (
 	"os"
 	"testing"
 
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/spire/pkg/agent/plugin/nodeattestor"
 	nodeattestortest "github.com/spiffe/spire/pkg/agent/plugin/nodeattestor/test"
+	"github.com/spiffe/spire/pkg/common/catalog"
 	"github.com/spiffe/spire/pkg/common/plugin/sshpop"
 	"github.com/spiffe/spire/test/fixture"
 	"github.com/spiffe/spire/test/plugintest"
@@ -42,9 +44,13 @@ func (s *Suite) SetupTest() {
 		host_key_path = %q
 		host_cert_path = %q`, privateKeyPath, certificatePath)
 
-	s.na = s.loadPlugin(plugintest.Configure(clientConfig))
+	s.na = s.loadPlugin(plugintest.CoreConfig(catalog.CoreConfig{
+		TrustDomain: spiffeid.RequireTrustDomainFromString("example.org"),
+	}),
+		plugintest.Configure(clientConfig),
+	)
 
-	sshclient, err := sshpop.NewClient(clientConfig)
+	sshclient, err := sshpop.NewClient("example.org", clientConfig)
 	require.NoError(err)
 	s.sshclient = sshclient
 
@@ -69,7 +75,7 @@ func (s *Suite) TestFetchAttestationDataSuccess() {
 	err := s.na.Attest(context.Background(),
 		streamBuilder.Handle(func(payloadOrChallengeResponse []byte) (challenge []byte, err error) {
 			// send challenge
-			if err := server.VerifyAttestationData(payloadOrChallengeResponse); err != nil {
+			if err := server.VerifyAttestationData(payloadOrChallengeResponse, ""); err != nil {
 				return nil, err
 			}
 			return server.IssueChallenge()

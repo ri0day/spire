@@ -34,6 +34,7 @@ A Makefile is provided for common actions.
 * `make all` - builds all binaries, lints code, and runs all unit tests
 * `make bin/spire-server` - builds SPIRE server
 * `make bin/spire-agent` - builds SPIRE agent
+* `make bin/oidc-discovery-provider` - builds SPIRE oidc-discovery-provider
 * `make images` - builds SPIRE docker images
 * `make test` - runs unit tests
 
@@ -45,7 +46,7 @@ toolchain and other build related files are cached under the `.build` folder
 
 ### Development in Docker
 
-You can either build SPIRE on your host or in a Ubuntu docker container. In
+You can either build SPIRE on your host or in an Ubuntu docker container. In
 both cases you will use the same Makefile commands.
 
 To build SPIRE within a container, first build the development image:
@@ -70,6 +71,15 @@ In addition to the conventions covered in the SPIFFE project's
 [CONTRIBUTING](https://github.com/spiffe/spiffe/blob/main/CONTRIBUTING.md), the following
 conventions apply to the SPIRE repository:
 
+### Pull request review process
+
+When you open a pull request, the description is pre-filled from our
+[pull request template](.github/PULL_REQUEST_TEMPLATE.md?plain=1), which
+explains how our review process works: the rotating "ball in court" assignee,
+how the assignee moves as you push commits and discuss, preferring new commits
+over force-pushing, and handling Copilot comments. Please follow the guidance
+shown there when you open and iterate on your PR.
+
 ### SQL Plugin Changes
 
 Datastore changes must be present in at least one full minor release cycle prior to introducing code changes that depend on them.
@@ -92,12 +102,23 @@ Common functionality for agent, server, and plugins
 
 The implementation of each plugin and their support packages
 
-`/proto/spire/{agent,server,api,common}/<name>/`
+`/proto/spire/common/` and `/proto/private/`
 
-gRPC .proto files, their generated .pb.go, and README_pb.md.
+Protobuf `.proto` files and their generated `.pb.go` code. `/proto/spire/common/`
+holds shared message definitions (package `spire.common`), with plugin-related
+common types under `/proto/spire/common/plugin/`. `/proto/private/` holds internal
+definitions that are not part of the public API, such as
+`/proto/private/server/journal/`.
 
-The protobuf package names should be `spire.{server,agent,api,common}.<name>` and the go package name
-should be specified with `option go_package = "<name>";`
+Protobuf files under `/proto/spire/` use the `spire.` package namespace (e.g.
+`spire.common` and `spire.common.plugin`). The go package name is specified with
+the full import path, e.g.
+`option go_package = "github.com/spiffe/spire/proto/spire/common";`
+
+The public gRPC API and plugin interface protobufs are maintained in separate
+repositories, [`spire-api-sdk`](https://github.com/spiffe/spire-api-sdk) and
+[`spire-plugin-sdk`](https://github.com/spiffe/spire-plugin-sdk), rather than in
+this repository.
 
 ### Interfaces
 
@@ -105,14 +126,14 @@ Packages should be exported through interfaces. Interaction with packages must b
 interfaces
 
 Interfaces should be defined in their own file, named (in lowercase) after the name of the
-interface. eg. `foodata.go` implements `type FooData any`
+interface. e.g. `foodata.go` implements `type FooData any`
 
 ### Metrics
 
 As much as possible, label names should be constants defined in the `telemetry` package. Additionally,
 specific metrics should be centrally defined in the `telemetry` package or its subpackages. Functions
 desiring metrics should delegate counter, gauge, timer, etc. creation to such packages.
-The metrics emitted by SPIRE are listed in the [telemetry document](doc/telemetry.md) and should be kept up to date.
+The metrics emitted by SPIRE are listed in the [telemetry document](doc/telemetry/telemetry.md) and should be kept up to date.
 
 In addition, metrics should be unit-tested where reasonable.
 

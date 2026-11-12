@@ -10,14 +10,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/mitchellh/cli"
 	"github.com/spiffe/go-spiffe/v2/proto/spiffe/workload"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
-	"github.com/spiffe/spire/cmd/spire-server/cli/common"
 	commoncli "github.com/spiffe/spire/pkg/common/cli"
 	"github.com/spiffe/spire/pkg/common/x509util"
+	"github.com/spiffe/spire/test/clitest"
 	"github.com/spiffe/spire/test/fakes/fakeworkloadapi"
 	"github.com/spiffe/spire/test/spiretest"
 	"github.com/spiffe/spire/test/testca"
@@ -166,6 +167,157 @@ func TestFetchJWTCommand(t *testing.T) {
 		for _, format := range availableFormats {
 			t.Run(fmt.Sprintf("%s using %s format", tt.name, format), func(t *testing.T) {
 				test := setupTest(t, newFetchJWTCommandWithEnv, tt.fakeRequests...)
+				args := tt.args
+				args = append(args, "-output", format)
+
+				rc := test.cmd.Run(test.args(args...))
+
+				if tt.expectedStderr != "" {
+					assert.Equal(t, 1, rc)
+					assert.Equal(t, tt.expectedStderr, test.stderr.String())
+					return
+				}
+
+				assertOutputBasedOnFormat(t, format, test.stdout.String(), tt.expectedStdoutJSON, tt.expectedStdoutPretty...)
+				assert.Empty(t, test.stderr.String())
+				assert.Equal(t, 0, rc)
+			})
+		}
+	}
+}
+
+func TestFetchWITCommandHelp(t *testing.T) {
+	test := setupTest(t, newFetchWITCommandWithEnv)
+	test.cmd.Help()
+	require.Equal(t, fetchWITUsage, test.stderr.String())
+}
+
+func TestFetchWITCommandSynopsis(t *testing.T) {
+	test := setupTest(t, newFetchWITCommandWithEnv)
+	require.Equal(t, "Fetches a WIT-SVID from the Workload API", test.cmd.Synopsis())
+}
+
+func TestFetchWITCommand(t *testing.T) {
+	const (
+		witSVID1    = "wit-svid-for-domain1"
+		witSVID2    = "wit-svid-for-domain2"
+		witSVIDKey1 = `{"kty":"EC","crv":"P-256","x":"key1","y":"key1","d":"key1"}`
+		witSVIDKey2 = `{"kty":"EC","crv":"P-256","x":"key2","y":"key2","d":"key2"}`
+		bundleJWKS  = `{"keys":[]}`
+	)
+
+	tests := []struct {
+		name                 string
+		args                 []string
+		fakeRequests         []*fakeworkloadapi.FakeRequest
+		expectedStderr       string
+		expectedStdoutPretty []string
+		expectedStdoutJSON   string
+	}{
+		{
+			name: "success fetching wit with bundles",
+			args: []string{"-spiffeID", "spiffe://domain1.test"},
+			fakeRequests: []*fakeworkloadapi.FakeRequest{
+				{
+					Req: &workload.WITBundlesRequest{},
+					Resp: &workload.WITBundlesResponse{
+						Bundles: map[string]string{
+							"spiffe://domain1.test": bundleJWKS,
+							"spiffe://domain2.test": bundleJWKS,
+						},
+					},
+				},
+				{
+					Req: &workload.WITSVIDRequest{
+						SpiffeId: "spiffe://domain1.test",
+					},
+					Resp: &workload.WITSVIDResponse{
+						Svids: []*workload.WITSVID{
+							{
+								SpiffeId:   "spiffe://domain1.test",
+								WitSvid:    witSVID1,
+								WitSvidKey: witSVIDKey1,
+								Hint:       "external",
+							},
+							{
+								SpiffeId:   "spiffe://domain2.test",
+								WitSvid:    witSVID2,
+								WitSvidKey: witSVIDKey2,
+							},
+						},
+					},
+				},
+			},
+			expectedStdoutPretty: []string{
+				fmt.Sprintf("token(spiffe://domain1.test):\n\t%s", witSVID1),
+				fmt.Sprintf("key(spiffe://domain1.test):\n\t%s", witSVIDKey1),
+				fmt.Sprintf("hint(spiffe://domain1.test):\n\t%s", "external"),
+				fmt.Sprintf("token(spiffe://domain2.test):\n\t%s", witSVID2),
+				fmt.Sprintf("key(spiffe://domain2.test):\n\t%s", witSVIDKey2),
+				fmt.Sprintf("bundle(spiffe://domain1.test):\n\t%s", bundleJWKS),
+				fmt.Sprintf("bundle(spiffe://domain2.test):\n\t%s", bundleJWKS),
+			},
+			expectedStdoutJSON: fmt.Sprintf(`[
+  {
+    "svids": [
+      {
+        "hint": "external",
+        "spiffe_id": "spiffe://domain1.test",
+        "wit_svid": "%s",
+        "wit_svid_key": %s
+      },
+      {
+        "hint": "",
+        "spiffe_id": "spiffe://domain2.test",
+        "wit_svid": "%s",
+        "wit_svid_key": %s
+      }
+    ]
+  },
+  {
+    "bundles": {
+      "spiffe://domain1.test": %s,
+      "spiffe://domain2.test": %s
+    }
+  }
+]`, witSVID1, strconv.Quote(witSVIDKey1), witSVID2, strconv.Quote(witSVIDKey2), strconv.Quote(bundleJWKS), strconv.Quote(bundleJWKS)),
+		},
+		{
+			name: "fail with error fetching bundles",
+			fakeRequests: []*fakeworkloadapi.FakeRequest{
+				{
+					Req:  &workload.WITBundlesRequest{},
+					Resp: &workload.WITBundlesResponse{},
+					Err:  errors.New("error fetching bundles"),
+				},
+			},
+			expectedStderr: "rpc error: code = Unknown desc = error fetching bundles\n",
+		},
+		{
+			name: "fail with error fetching svid",
+			fakeRequests: []*fakeworkloadapi.FakeRequest{
+				{
+					Req: &workload.WITBundlesRequest{},
+					Resp: &workload.WITBundlesResponse{
+						Bundles: map[string]string{
+							"spiffe://domain1.test": bundleJWKS,
+						},
+					},
+				},
+				{
+					Req:  &workload.WITSVIDRequest{},
+					Resp: &workload.WITSVIDResponse{},
+					Err:  errors.New("error fetching svid"),
+				},
+			},
+			expectedStderr: "rpc error: code = Unknown desc = error fetching svid\n",
+		},
+	}
+
+	for _, tt := range tests {
+		for _, format := range availableFormats {
+			t.Run(fmt.Sprintf("%s using %s format", tt.name, format), func(t *testing.T) {
+				test := setupTest(t, newFetchWITCommandWithEnv, tt.fakeRequests...)
 				args := tt.args
 				args = append(args, "-output", format)
 
@@ -378,6 +530,59 @@ Writing bundle #0 to file %s
 	}
 }
 
+func TestFetchX509CommandFederatedBundlesSortedByTrustDomain(t *testing.T) {
+	testDir := t.TempDir()
+	td := spiffeid.RequireTrustDomainFromString("example.org")
+	ca := testca.New(t, td)
+	svid := ca.CreateX509SVID(spiffeid.RequireFromString("spiffe://example.org/foo"))
+
+	caA := testca.New(t, spiffeid.RequireTrustDomainFromString("a.test"))
+	caM := testca.New(t, spiffeid.RequireTrustDomainFromString("m.test"))
+	caZ := testca.New(t, spiffeid.RequireTrustDomainFromString("z.test"))
+
+	test := setupTest(t, newFetchX509Command, &fakeworkloadapi.FakeRequest{
+		Req: &workload.X509SVIDRequest{},
+		Resp: &workload.X509SVIDResponse{
+			Svids: []*workload.X509SVID{
+				{
+					SpiffeId:    svid.ID.String(),
+					X509Svid:    x509util.DERFromCertificates(svid.Certificates),
+					X509SvidKey: pkcs8FromSigner(t, svid.PrivateKey),
+					Bundle:      x509util.DERFromCertificates(ca.Bundle().X509Authorities()),
+				},
+			},
+			Crl: [][]byte{},
+			// Supply trust domains in non-alphabetical order to assert
+			// the response returns a sorted collection as expected
+			FederatedBundles: map[string][]byte{
+				"spiffe://z.test": x509util.DERFromCertificates(caZ.Bundle().X509Authorities()),
+				"spiffe://a.test": x509util.DERFromCertificates(caA.Bundle().X509Authorities()),
+				"spiffe://m.test": x509util.DERFromCertificates(caM.Bundle().X509Authorities()),
+			},
+		},
+	})
+
+	rc := test.cmd.Run(test.args("-write", testDir, "-output", "pretty"))
+	require.Equal(t, 0, rc)
+	require.Empty(t, test.stderr.String())
+
+	// After sorting by trust domain string, the expected file order is:
+	// [spiffe://a.test, spiffe://m.test, spiffe://z.test]
+	sortedCAs := []*testca.CA{caA, caM, caZ}
+	for j, federatedCA := range sortedCAs {
+		bundlePath := filepath.Join(testDir, fmt.Sprintf("federated_bundle.0.%d.pem", j))
+		content, err := os.ReadFile(bundlePath)
+		require.NoErrorf(t, err, "federated bundle file index %d not found", j)
+
+		expected := pem.EncodeToMemory(&pem.Block{
+			Type:  "CERTIFICATE",
+			Bytes: federatedCA.Bundle().X509Authorities()[0].Raw,
+		})
+		assert.Equalf(t, expected, content,
+			"federated_bundle.0.%d.pem: expected cert for trust domain at sorted index %d", j, j)
+	}
+}
+
 func TestValidateJWTCommandHelp(t *testing.T) {
 	test := setupTest(t, newValidateJWTCommand)
 	test.cmd.Help()
@@ -416,9 +621,10 @@ func TestValidateJWTCommand(t *testing.T) {
 						Claims: &structpb.Struct{
 							Fields: map[string]*structpb.Value{
 								"aud": {
-									Kind: &structpb.Value_ListValue{ListValue: &structpb.ListValue{
-										Values: []*structpb.Value{{Kind: &structpb.Value_StringValue{StringValue: "foo"}}},
-									},
+									Kind: &structpb.Value_ListValue{
+										ListValue: &structpb.ListValue{
+											Values: []*structpb.Value{{Kind: &structpb.Value_StringValue{StringValue: "foo"}}},
+										},
 									},
 								},
 							},
@@ -504,7 +710,7 @@ func setupTest(t *testing.T, newCmd func(env *commoncli.Env, clientMaker workloa
 	}, newWorkloadClient)
 
 	test := &apiTest{
-		addr:        common.GetAddr(addr),
+		addr:        clitest.GetAddr(addr),
 		stdin:       stdin,
 		stdout:      stdout,
 		stderr:      stderr,
@@ -538,7 +744,7 @@ func (s *apiTest) afterTest(t *testing.T) {
 }
 
 func (s *apiTest) args(extra ...string) []string {
-	return append([]string{common.AddrArg, s.addr}, extra...)
+	return append([]string{clitest.AddrArg, s.addr}, extra...)
 }
 
 func assertOutputBasedOnFormat(t *testing.T, format, stdoutString, expectedStdoutJSON string, expectedStdoutPretty ...string) {

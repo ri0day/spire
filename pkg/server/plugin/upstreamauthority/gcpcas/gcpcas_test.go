@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -12,11 +13,14 @@ import (
 	"time"
 
 	"cloud.google.com/go/security/privateca/apiv1/privatecapb"
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"github.com/spiffe/spire/pkg/common/catalog"
 	"github.com/spiffe/spire/pkg/common/pemutil"
 	commonutil "github.com/spiffe/spire/pkg/common/util"
 	"github.com/spiffe/spire/pkg/server/plugin/upstreamauthority"
 	"github.com/spiffe/spire/test/plugintest"
 	"github.com/spiffe/spire/test/testkey"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -101,7 +105,7 @@ func TestGcpCAS(t *testing.T) {
 		// Scenario:
 		//   We mock client's LoadCertificateAuthorities() to return in the following order:
 		//      * caZ is an intermediate CA which is signed by externalCAY
-		//      * caX is a root CA that is in GCP CAS with the second oldest expiry (T + 2)
+		//      * caX is a root CA that is in GCP CAS with the second-oldest expiry (T + 2)
 		//      * caM is a root CA that is in GCP CAS with the earliest expiry (T + 1) but it is DISABLED
 		//   Everything except caM are in ENABLED state
 		//   Also note that the above is not ordered by expiry time
@@ -132,11 +136,14 @@ func TestGcpCAS(t *testing.T) {
 		// mark the last CA (i.e. caM) as DISABLED
 		// The rest (caX, caZ, caY) will be marked as ENABLED
 		cas := [][]*x509.Certificate{{caX}, {caZ, caY}, {caM}}
-		return &fakeClient{cas, t, &pkeyCAx}, nil
+		return &fakeClient{cas, t, &pkeyCAx, make(map[string]bool)}, nil
 	}
 
 	upplugin := new(upstreamauthority.V1)
-	plugintest.Load(t, builtin(p), upplugin, plugintest.Configure(`
+	plugintest.Load(t, builtin(p), upplugin, plugintest.CoreConfig(catalog.CoreConfig{
+		TrustDomain: spiffeid.RequireTrustDomainFromString("example.org"),
+	}),
+		plugintest.Configure(`
 		root_cert_spec {
 			project_name = "proj1"
 			region_name = "us-central1"
@@ -144,7 +151,7 @@ func TestGcpCAS(t *testing.T) {
 			label_key = "proj-signer"
 			label_value = "true"
 		}
-    `))
+		`))
 
 	priv := testkey.NewEC384(t)
 	csr, err := commonutil.MakeCSRWithoutURISAN(priv)
@@ -158,11 +165,11 @@ func TestGcpCAS(t *testing.T) {
 	require.NotNil(t, x509Authorities)
 	// Confirm that we don't have unexpected CAs
 	require.Equal(t, 2, len(x509Authorities))
-	require.Equal(t, "caX", x509Authorities[0].Subject.CommonName)
-	require.Equal(t, "caX", x509Authorities[0].Issuer.CommonName)
+	require.Equal(t, "caX", x509Authorities[0].Certificate.Subject.CommonName)
+	require.Equal(t, "caX", x509Authorities[0].Certificate.Issuer.CommonName)
 	// We intentionally return the root externalcaY rather than intermediate caZ
-	require.Equal(t, "externalcaY", x509Authorities[1].Subject.CommonName)
-	require.Equal(t, "externalcaY", x509Authorities[1].Issuer.CommonName)
+	require.Equal(t, "externalcaY", x509Authorities[1].Certificate.Subject.CommonName)
+	require.Equal(t, "externalcaY", x509Authorities[1].Certificate.Issuer.CommonName)
 
 	require.NotNil(t, x509CA)
 	require.Equal(t, 1, len(x509CA))
@@ -170,17 +177,30 @@ func TestGcpCAS(t *testing.T) {
 	require.Equal(t, "caX", x509CA[0].Issuer.CommonName)
 
 	rootPool := x509.NewCertPool()
-	rootPool.AddCert(x509Authorities[0])
-	rootPool.AddCert(x509Authorities[1])
+	rootPool.AddCert(x509Authorities[0].Certificate)
+	rootPool.AddCert(x509Authorities[1].Certificate)
 	var opt x509.VerifyOptions
 	opt.Roots = rootPool
 	res, err := x509CA[0].Verify(opt)
 	require.NoError(t, err)
 	require.NotNil(t, res)
+
+	// Call MintX509CA a few more times with different CSRs to verify that each request
+	// generates a unique Certificate ID
+	for range 3 {
+		key, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+		require.NoError(t, err)
+
+		csr, err := commonutil.MakeCSRWithoutURISAN(key)
+		require.NoError(t, err)
+
+		_, _, _, err = upplugin.MintX509CA(ctx, csr, 30*time.Second)
+		require.NoError(t, err)
+	}
 }
 
 func generateCert(t *testing.T, cn string, issuer *x509.Certificate, issuerKey crypto.PrivateKey, ttlInHours int, keyfn func(testing.TB) *ecdsa.PrivateKey) (*x509.Certificate, crypto.PrivateKey, error) {
-	priv := keyfn(t)
+	keyPair := keyfn(t)
 	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
 	serialNumber, _ := rand.Int(rand.Reader, serialNumberLimit)
 
@@ -197,10 +217,10 @@ func generateCert(t *testing.T, cn string, issuer *x509.Certificate, issuerKey c
 	}
 	if issuer == nil {
 		issuer = template
-		issuerKey = priv
+		issuerKey = keyPair
 	}
 
-	derBytes, err := x509.CreateCertificate(rand.Reader, template, issuer, priv.Public(), issuerKey)
+	derBytes, err := x509.CreateCertificate(rand.Reader, template, issuer, keyPair.Public(), issuerKey)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -209,7 +229,7 @@ func generateCert(t *testing.T, cn string, issuer *x509.Certificate, issuerKey c
 		return nil, nil, err
 	}
 
-	return cert, priv, nil
+	return cert, keyPair, nil
 }
 
 type fakeClient struct { // implements CAClient interface
@@ -218,20 +238,29 @@ type fakeClient struct { // implements CAClient interface
 	t           *testing.T
 	// This is the private key corresponding to mockX509CAs[0][0]
 	privKeyOfEarliestCA *crypto.PrivateKey
+	// This holds the generated Certificate IDs for CreateCertificateRequests
+	usedCertificateIDs map[string]bool
 }
 
 func (client *fakeClient) CreateCertificate(_ context.Context, req *privatecapb.CreateCertificateRequest) (*privatecapb.Certificate, error) {
+	// Confirm that Certificate ID matches the regular expression
+	certID := req.CertificateId
+	assert.Regexp(client.t, `^[a-zA-Z0-9_-]{1,63}$`, certID, "Certificate ID must match ^[a-zA-Z0-9_-]{1,63}$")
+
+	assert.False(client.t, client.usedCertificateIDs[certID], "Certificate ID must be unique for all CSRs")
+	client.usedCertificateIDs[certID] = true
+
 	// Confirm that we were called with a request to sign using
 	// the very first CA from the CA List ( i.e. issuance order )
-	require.Equal(client.t, req.IssuingCertificateAuthorityId, client.mockX509CAs[0][0].Subject.CommonName)
+	assert.Equal(client.t, req.IssuingCertificateAuthorityId, client.mockX509CAs[0][0].Subject.CommonName)
 
 	// Mimic GCP GCA signing
 	// By first issuing a x509 cert and then converting it into GCP cert format
 	commonName := req.Certificate.GetConfig().GetSubjectConfig().GetSubject().GetCommonName()
 	x509ca, _, err := generateCert(client.t, commonName, client.mockX509CAs[0][0],
 		*client.privKeyOfEarliestCA, 1 /* TTL */, testkey.NewEC256)
-	require.NoError(client.t, err)
-	require.NotNil(client.t, x509ca)
+	assert.NoError(client.t, err)
+	assert.NotNil(client.t, x509ca)
 
 	ca := new(privatecapb.Certificate)
 	ca.Name = commonName

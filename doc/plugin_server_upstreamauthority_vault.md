@@ -2,6 +2,7 @@
 
 The vault plugin signs intermediate CA certificates for SPIRE using the Vault PKI Engine.
 The plugin does not support the `PublishJWTKey` RPC and is therefore not appropriate for use in nested SPIRE topologies where JWT-SVIDs are in use.
+This plugin is also compatible with the [OpenBao](https://openbao.org) API.
 
 ## Configuration
 
@@ -19,11 +20,27 @@ The plugin accepts the following configuration options:
 | approle_auth         | struct |          | Configuration for the AppRole authentication method                                                        |                      |
 | k8s_auth             | struct |          | Configuration for the Kubernetes authentication method                                                     |                      |
 
-The plugin supports **Client Certificate**, **Token** and **AppRole** authentication methods.
+## Environment Variables
+
+The plugin reads the following environment variables. Variables marked as standard are natively recognized by the Vault CLI and client libraries — see the [Vault documentation](https://developer.hashicorp.com/vault/docs/commands#configure-environment-variables) for the full reference.
+
+| Variable                  | Standard | Description                                                  |
+|:--------------------------|:---------|:-------------------------------------------------------------|
+| `VAULT_ADDR`              | Yes      | Address of the Vault server                                  |
+| `VAULT_CACERT`            | Yes      | Path to a CA certificate file                                |
+| `VAULT_CLIENT_CERT`       | Yes      | Path to a client certificate file (cert auth)                |
+| `VAULT_CLIENT_KEY`        | Yes      | Path to a client private key file (cert auth)                |
+| `VAULT_NAMESPACE`         | Yes      | Vault namespace (Enterprise only)                            |
+| `VAULT_TOKEN`             | Yes      | Vault token (token auth)                                     |
+| `VAULT_APPROLE_ID`        | **No**   | AppRole role ID — SPIRE-specific, not a Vault SDK variable   |
+| `VAULT_APPROLE_SECRET_ID` | **No**   | AppRole secret ID — SPIRE-specific, not a Vault SDK variable |
+
+The plugin supports **Client Certificate**, **Token**, **AppRole** and **Kubernetes** authentication methods.
 
 - **Client Certificate** method authenticates to Vault using a TLS client certificate.
-- **Token** method authenticates to Vault using the token in a HTTP Request header.
+- **Token** method authenticates to Vault using the token in an HTTP Request header.
 - **AppRole** method authenticates to Vault using a RoleID and SecretID that are issued from Vault.
+- **Kubernetes** method authenticates to Vault using a Kubernetes Service Account Token.
 
 The [`ca_ttl` SPIRE Server configurable](https://github.com/spiffe/spire/blob/main/doc/spire_server.md#server-configuration-file) should be less than or equal to the Vault's PKI secret engine TTL.
 To configure the TTL value, tune the engine.

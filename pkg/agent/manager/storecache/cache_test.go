@@ -1,11 +1,14 @@
 package storecache_test
 
 import (
+	"context"
 	"crypto/x509"
+	"fmt"
 	"net/url"
 	"testing"
 	"time"
 
+	"github.com/hashicorp/go-metrics"
 	"github.com/sirupsen/logrus"
 	"github.com/sirupsen/logrus/hooks/test"
 	"github.com/spiffe/go-spiffe/v2/bundle/spiffebundle"
@@ -13,8 +16,11 @@ import (
 	"github.com/spiffe/spire/pkg/agent/manager/cache"
 	"github.com/spiffe/spire/pkg/agent/manager/storecache"
 	"github.com/spiffe/spire/pkg/common/telemetry"
+	"github.com/spiffe/spire/pkg/common/telemetry/agent"
 	"github.com/spiffe/spire/proto/spire/common"
+	"github.com/spiffe/spire/test/fakes/fakemetrics"
 	"github.com/spiffe/spire/test/spiretest"
+	"github.com/spiffe/spire/test/testca"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -517,8 +523,6 @@ func TestUpdateEntries(t *testing.T) {
 			},
 		},
 	} {
-		tt := tt
-
 		t.Run(tt.name, func(t *testing.T) {
 			log, hook := test.NewNullLogger()
 			log.Level = logrus.DebugLevel
@@ -530,7 +534,7 @@ func TestUpdateEntries(t *testing.T) {
 
 			c.UpdateEntries(tt.initialUpdate, nil)
 			update := tt.setUpdate(*tt.initialUpdate)
-			// Dont care about initialization logs
+			// Don't care about initialization logs
 			hook.Reset()
 
 			// Set check SVID only in updates, creation will is tested in a different test
@@ -643,7 +647,7 @@ func TestUpdateEntriesRemoveEntry(t *testing.T) {
 		},
 	}
 
-	// Reset logs, this test dont cares about creating logs
+	// Reset logs, this test don't care about creating logs
 	hook.Reset()
 	// Update entry to remove 'bar'
 	c.UpdateEntries(update, nil)
@@ -691,18 +695,16 @@ func TestUpdateEntriesRemoveEntry(t *testing.T) {
 
 	require.Equal(t, expectedRecords, c.Records())
 
-	// Update SVIDs does not updates records that are in remove state
-	c.UpdateSVIDs(&cache.UpdateSVIDs{
-		X509SVIDs: map[string]*cache.X509SVID{
-			"bar": {
-				Chain: []*x509.Certificate{
-					{Raw: []byte{1}},
-				},
+	// Update SVIDs does not update records that are in remove state
+	c.UpdateX509SVIDs(map[string]*cache.X509SVID{
+		"bar": {
+			Chain: []*x509.Certificate{
+				{Raw: []byte{1}},
 			},
-			"foh": {
-				Chain: []*x509.Certificate{
-					{Raw: []byte{2}},
-				},
+		},
+		"foh": {
+			Chain: []*x509.Certificate{
+				{Raw: []byte{2}},
 			},
 		},
 	})
@@ -907,6 +909,140 @@ func TestUpdateEntriesCreatesNewEntriesOnCache(t *testing.T) {
 	spiretest.AssertLogsAnyOrder(t, hook.AllEntries(), expectedLogs)
 }
 
+func TestTaintX509SVIDs(t *testing.T) {
+	ctx := context.Background()
+	log, hook := test.NewNullLogger()
+	log.Level = logrus.DebugLevel
+	fakeMetrics := fakemetrics.New()
+	taintedAuthority := testca.New(t, td)
+	newAuthority := testca.New(t, td)
+
+	c := storecache.New(&storecache.Config{
+		Log:         log,
+		TrustDomain: td,
+		Metrics:     fakeMetrics,
+	})
+
+	// Create initial entries
+	entries := makeEntries(td, "e1", "e2", "e3", "e4", "e5")
+	updateEntries := &cache.UpdateEntries{
+		Bundles: map[spiffeid.TrustDomain]*spiffebundle.Bundle{
+			td: tdBundle,
+		},
+		RegistrationEntries: entries,
+	}
+
+	// Set entries to cache
+	c.UpdateEntries(updateEntries, nil)
+
+	noTaintedSVID := createX509SVID(td, "e3", newAuthority)
+	c.UpdateX509SVIDs(map[string]*cache.X509SVID{
+		"e1": createX509SVID(td, "e1", taintedAuthority),
+		"e2": createX509SVID(td, "e2", taintedAuthority),
+		"e3": noTaintedSVID,
+		"e5": createX509SVID(td, "e5", taintedAuthority),
+	})
+
+	for _, tt := range []struct {
+		name               string
+		taintedAuthorities []*x509.Certificate
+		expectSVID         map[string]*cache.X509SVID
+		expectLogs         []spiretest.LogEntry
+		expectMetrics      []fakemetrics.MetricItem
+	}{
+		{
+			name:               "taint SVIDs",
+			taintedAuthorities: taintedAuthority.X509Authorities(),
+			expectSVID: map[string]*cache.X509SVID{
+				"e1": nil,
+				"e2": nil,
+				"e3": noTaintedSVID,
+				"e4": nil,
+				"e5": nil,
+			},
+			expectLogs: []spiretest.LogEntry{
+				{
+					Level:   logrus.InfoLevel,
+					Message: "Tainted X.509 SVIDs",
+					Data: logrus.Fields{
+						telemetry.TaintedX509SVIDs: "3",
+					},
+				},
+			},
+			expectMetrics: []fakemetrics.MetricItem{
+				{
+					Type:   fakemetrics.AddSampleWithLabelsType,
+					Key:    []string{telemetry.CacheManager, telemetry.ExpiringSVIDs, agent.CacheTypeSVIDStore},
+					Val:    3,
+					Labels: []metrics.Label{{Name: telemetry.SVIDType, Value: agent.SVIDTypeX509}},
+				},
+				{
+					Type:   fakemetrics.IncrCounterWithLabelsType,
+					Key:    []string{telemetry.CacheManager, agent.CacheTypeSVIDStore, telemetry.ProcessTaintedX509SVIDs},
+					Val:    1,
+					Labels: []metrics.Label{{Name: "status", Value: "OK"}},
+				},
+				{
+					Type:   fakemetrics.MeasureSinceWithLabelsType,
+					Key:    []string{telemetry.CacheManager, agent.CacheTypeSVIDStore, telemetry.ProcessTaintedX509SVIDs, telemetry.ElapsedTime},
+					Val:    0,
+					Labels: []metrics.Label{{Name: "status", Value: "OK"}},
+				},
+			},
+		},
+		{
+			name:               "taint again",
+			taintedAuthorities: taintedAuthority.X509Authorities(),
+			expectSVID: map[string]*cache.X509SVID{
+				"e1": nil,
+				"e2": nil,
+				"e3": noTaintedSVID,
+				"e4": nil,
+				"e5": nil,
+			},
+			expectLogs: []spiretest.LogEntry{
+				{
+					Level:   logrus.InfoLevel,
+					Message: "Tainted X.509 SVIDs",
+					Data: logrus.Fields{
+						telemetry.TaintedX509SVIDs: "0",
+					},
+				},
+			},
+			expectMetrics: []fakemetrics.MetricItem{
+				{
+					Type:   fakemetrics.AddSampleWithLabelsType,
+					Key:    []string{telemetry.CacheManager, telemetry.ExpiringSVIDs, agent.CacheTypeSVIDStore},
+					Val:    0,
+					Labels: []metrics.Label{{Name: telemetry.SVIDType, Value: agent.SVIDTypeX509}},
+				},
+				{
+					Type:   fakemetrics.IncrCounterWithLabelsType,
+					Key:    []string{telemetry.CacheManager, agent.CacheTypeSVIDStore, telemetry.ProcessTaintedX509SVIDs},
+					Val:    1,
+					Labels: []metrics.Label{{Name: "status", Value: "OK"}},
+				},
+				{
+					Type:   fakemetrics.MeasureSinceWithLabelsType,
+					Key:    []string{telemetry.CacheManager, agent.CacheTypeSVIDStore, telemetry.ProcessTaintedX509SVIDs, telemetry.ElapsedTime},
+					Val:    0,
+					Labels: []metrics.Label{{Name: "status", Value: "OK"}},
+				},
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			hook.Reset()
+			fakeMetrics.Reset()
+
+			c.TaintX509SVIDs(ctx, tt.taintedAuthorities)
+			assert.Equal(t, tt.expectSVID, svidMapFromRecords(c.Records()))
+			spiretest.AssertLogs(t, hook.AllEntries(), tt.expectLogs)
+			assert.Equal(t, tt.expectMetrics, fakeMetrics.AllMetrics())
+		})
+	}
+}
+
 func TestUpdateSVIDs(t *testing.T) {
 	log, hook := test.NewNullLogger()
 	log.Level = logrus.DebugLevel
@@ -921,21 +1057,17 @@ func TestUpdateSVIDs(t *testing.T) {
 	c.UpdateEntries(update, nil)
 	hook.Reset()
 
-	updateSVIDs := &cache.UpdateSVIDs{
-		X509SVIDs: map[string]*cache.X509SVID{
-			"baz": {
-				Chain:      []*x509.Certificate{{URIs: []*url.URL{bazID.URL()}}},
-				PrivateKey: key,
-			},
-			"foh": {
-				Chain:      []*x509.Certificate{{URIs: []*url.URL{fohID.URL()}}},
-				PrivateKey: key,
-			},
-		},
-	}
-
 	// Run update SVIDs to set new SVIDs on cache
-	c.UpdateSVIDs(updateSVIDs)
+	c.UpdateX509SVIDs(map[string]*cache.X509SVID{
+		"baz": {
+			Chain:      []*x509.Certificate{{URIs: []*url.URL{bazID.URL()}}},
+			PrivateKey: key,
+		},
+		"foh": {
+			Chain:      []*x509.Certificate{{URIs: []*url.URL{fohID.URL()}}},
+			PrivateKey: key,
+		},
+	})
 
 	expectedRecords := []*storecache.Record{
 		{
@@ -1024,14 +1156,12 @@ func TestGetStaleEntries(t *testing.T) {
 	expiresAt := time.Now().Add(time.Minute)
 
 	// Call UpdateSVID to remove 'foh' from stale entries
-	c.UpdateSVIDs(&cache.UpdateSVIDs{
-		X509SVIDs: map[string]*cache.X509SVID{
-			"foh": {
-				Chain: []*x509.Certificate{
-					{
-						URIs:     []*url.URL{fohID.URL()},
-						NotAfter: expiresAt,
-					},
+	c.UpdateX509SVIDs(map[string]*cache.X509SVID{
+		"foh": {
+			Chain: []*x509.Certificate{
+				{
+					URIs:     []*url.URL{fohID.URL()},
+					NotAfter: expiresAt,
 				},
 			},
 		},
@@ -1087,10 +1217,8 @@ func TestCheckSVID(t *testing.T) {
 		Chain: []*x509.Certificate{{URIs: []*url.URL{fohID.URL()}}},
 	}
 	// Set an SVID to record
-	c.UpdateSVIDs(&cache.UpdateSVIDs{
-		X509SVIDs: map[string]*cache.X509SVID{
-			"foh": x509SVID,
-		},
+	c.UpdateX509SVIDs(map[string]*cache.X509SVID{
+		"foh": x509SVID,
 	})
 
 	// Creating new entry with same information instead of cloning and change revision
@@ -1112,6 +1240,80 @@ func TestCheckSVID(t *testing.T) {
 		assert.Equal(t, x509SVID, xs)
 		return true
 	})
+}
+
+func TestUpdateEntriesDropsSVIDInvalidatedByEntry(t *testing.T) {
+	withSelectors := func(e *common.RegistrationEntry) *common.RegistrationEntry {
+		e.Selectors = []*common.Selector{{Type: "a", Value: "d:3"}}
+		return e
+	}
+	withSPIFFEID := func(e *common.RegistrationEntry) *common.RegistrationEntry {
+		e.SpiffeId = barID.String()
+		return e
+	}
+
+	for _, tt := range []struct {
+		name        string
+		updated     *common.RegistrationEntry
+		removeFirst bool
+		// intermediate is applied before updated without renewing the SVID.
+		intermediate *common.RegistrationEntry
+		expectSVID   bool
+	}{
+		{name: "selectors and SPIFFE ID changed", updated: withSPIFFEID(withSelectors(createTestEntry()))},
+		{name: "removed and added back with new selectors and SPIFFE ID", updated: withSPIFFEID(withSelectors(createTestEntry())), removeFirst: true},
+		{name: "selectors changed", updated: withSelectors(createTestEntry()), expectSVID: true},
+		{name: "SPIFFE ID changed", updated: withSPIFFEID(createTestEntry()), expectSVID: true},
+		{name: "SPIFFE ID changed, then selectors changed without renewal", updated: withSPIFFEID(withSelectors(createTestEntry())), intermediate: withSPIFFEID(createTestEntry())},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			log, _ := test.NewNullLogger()
+			c := storecache.New(&storecache.Config{
+				Log:         log,
+				TrustDomain: td,
+			})
+			bundles := map[spiffeid.TrustDomain]*spiffebundle.Bundle{td: tdBundle}
+
+			c.UpdateEntries(&cache.UpdateEntries{
+				Bundles:             bundles,
+				RegistrationEntries: map[string]*common.RegistrationEntry{"foh": createTestEntry()},
+			}, nil)
+			svid := &cache.X509SVID{Chain: []*x509.Certificate{{URIs: []*url.URL{fohID.URL()}}}}
+			c.UpdateX509SVIDs(map[string]*cache.X509SVID{"foh": svid})
+
+			if tt.removeFirst {
+				c.UpdateEntries(&cache.UpdateEntries{Bundles: bundles}, nil)
+			}
+			if tt.intermediate != nil {
+				tt.intermediate.RevisionNumber = 2
+				c.UpdateEntries(&cache.UpdateEntries{
+					Bundles:             bundles,
+					RegistrationEntries: map[string]*common.RegistrationEntry{"foh": tt.intermediate},
+				}, nil)
+			}
+
+			tt.updated.RevisionNumber = 3
+			c.UpdateEntries(&cache.UpdateEntries{
+				Bundles:             bundles,
+				RegistrationEntries: map[string]*common.RegistrationEntry{"foh": tt.updated},
+			}, func(_, _ *common.RegistrationEntry, xs *cache.X509SVID) bool {
+				return xs == nil
+			})
+
+			records := c.ReadyToStore()
+			require.Len(t, records, 1)
+			assert.Equal(t, tt.updated, records[0].Entry)
+			if tt.expectSVID {
+				assert.Equal(t, svid, records[0].Svid)
+				assert.Empty(t, c.GetStaleEntries())
+			} else {
+				assert.Nil(t, records[0].Svid)
+				staleEntries := c.GetStaleEntries()
+				require.Len(t, staleEntries, 1)
+				assert.True(t, staleEntries[0].SVIDExpiresAt.IsZero())
+			}
+		})
+	}
 }
 
 func TestReadyToStore(t *testing.T) {
@@ -1240,4 +1442,46 @@ func createTestEntry() *common.RegistrationEntry {
 		StoreSvid:      true,
 		RevisionNumber: 1,
 	}
+}
+
+func svidMapFromRecords(records []*storecache.Record) map[string]*cache.X509SVID {
+	recordsMap := make(map[string]*cache.X509SVID, len(records))
+	for _, eachRecord := range records {
+		recordsMap[eachRecord.ID] = eachRecord.Svid
+	}
+	return recordsMap
+}
+
+func createX509SVID(td spiffeid.TrustDomain, id string, ca *testca.CA) *cache.X509SVID {
+	chain, key := ca.CreateX509Certificate(
+		testca.WithID(spiffeid.RequireFromPath(td, "/"+id)),
+	)
+	return &cache.X509SVID{
+		Chain:      chain,
+		PrivateKey: key,
+	}
+}
+
+func makeEntries(td spiffeid.TrustDomain, ids ...string) map[string]*common.RegistrationEntry {
+	entries := make(map[string]*common.RegistrationEntry, len(ids))
+	for _, id := range ids {
+		entries[id] = &common.RegistrationEntry{
+			EntryId:   id,
+			SpiffeId:  spiffeid.RequireFromPath(td, "/"+id).String(),
+			Selectors: makeSelectors(id),
+			StoreSvid: true,
+		}
+	}
+	return entries
+}
+
+func makeSelectors(values ...string) []*common.Selector {
+	var selectors []*common.Selector
+	for _, value := range values {
+		selectors = append(selectors, &common.Selector{
+			Type:  "t",
+			Value: fmt.Sprintf("v:%s", value),
+		})
+	}
+	return selectors
 }

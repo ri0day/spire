@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"slices"
 )
 
 type PreprocessFunc = func(ctx context.Context, fullMethod string, req any) (context.Context, error)
@@ -25,7 +26,7 @@ type Middleware interface {
 	Postprocess(ctx context.Context, fullMethod string, handlerInvoked bool, rpcErr error)
 }
 
-// Preprocess creates a middleware from a function that does preprocessing only.
+// Preprocess creates a middleware from a function that does pre-processing only.
 func Preprocess(fn PreprocessFunc) Middleware {
 	return funcs{
 		preprocess: fn,
@@ -102,7 +103,7 @@ func (ms middlewares) Preprocess(ctx context.Context, fullMethod string, req any
 }
 
 func (ms middlewares) Postprocess(ctx context.Context, fullMethod string, handlerInvoked bool, rpcErr error) {
-	for i := len(ms) - 1; i >= 0; i-- {
-		ms[i].Postprocess(ctx, fullMethod, handlerInvoked, rpcErr)
+	for _, m := range slices.Backward(ms) {
+		m.Postprocess(ctx, fullMethod, handlerInvoked, rpcErr)
 	}
 }

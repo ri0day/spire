@@ -7,15 +7,17 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/go-jose/go-jose/v3/jwt"
+	"github.com/go-jose/go-jose/v4/jwt"
 	"github.com/mitchellh/cli"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	svidv1 "github.com/spiffe/spire-api-sdk/proto/spire/api/server/svid/v1"
 	"github.com/spiffe/spire-api-sdk/proto/spire/api/types"
-	"github.com/spiffe/spire/cmd/spire-server/util"
+	serverutil "github.com/spiffe/spire/cmd/spire-server/util"
 	commoncli "github.com/spiffe/spire/pkg/common/cli"
 	"github.com/spiffe/spire/pkg/common/cliprinter"
 	"github.com/spiffe/spire/pkg/common/diskutil"
+	"github.com/spiffe/spire/pkg/common/jwtsvid"
+	"github.com/spiffe/spire/pkg/common/util"
 )
 
 func NewMintCommand() cli.Command {
@@ -23,7 +25,7 @@ func NewMintCommand() cli.Command {
 }
 
 func newMintCommand(env *commoncli.Env) cli.Command {
-	return util.AdaptCommand(env, &mintCommand{env: env})
+	return serverutil.AdaptCommand(env, &mintCommand{env: env})
 }
 
 type mintCommand struct {
@@ -38,6 +40,7 @@ type mintCommand struct {
 func (c *mintCommand) Name() string {
 	return "jwt mint"
 }
+
 func (c *mintCommand) Synopsis() string {
 	return "Mints a JWT-SVID"
 }
@@ -50,7 +53,7 @@ func (c *mintCommand) AppendFlags(fs *flag.FlagSet) {
 	cliprinter.AppendFlagWithCustomPretty(&c.printer, fs, c.env, prettyPrintMint)
 }
 
-func (c *mintCommand) Run(ctx context.Context, env *commoncli.Env, serverClient util.ServerClient) error {
+func (c *mintCommand) Run(ctx context.Context, env *commoncli.Env, serverClient serverutil.ServerClient) error {
 	if c.spiffeID == "" {
 		return errors.New("spiffeID must be specified")
 	}
@@ -61,13 +64,18 @@ func (c *mintCommand) Run(ctx context.Context, env *commoncli.Env, serverClient 
 	if err != nil {
 		return err
 	}
+	ttl, err := ttlToSeconds(c.ttl)
+	if err != nil {
+		return fmt.Errorf("invalid value for TTL: %w", err)
+	}
 
 	client := serverClient.NewSVIDClient()
-	resp, err := client.MintJWTSVID(ctx, &svidv1.MintJWTSVIDRequest{Id: &types.SPIFFEID{
-		TrustDomain: spiffeID.TrustDomain().Name(),
-		Path:        spiffeID.Path(),
-	},
-		Ttl:      ttlToSeconds(c.ttl),
+	resp, err := client.MintJWTSVID(ctx, &svidv1.MintJWTSVIDRequest{
+		Id: &types.SPIFFEID{
+			TrustDomain: spiffeID.TrustDomain().Name(),
+			Path:        spiffeID.Path(),
+		},
+		Ttl:      ttl,
 		Audience: c.audience,
 	})
 	if err != nil {
@@ -108,8 +116,9 @@ func (c *mintCommand) validateToken(token string, env *commoncli.Env) error {
 
 	return nil
 }
+
 func getJWTSVIDEndOfLife(token string) (time.Time, error) {
-	t, err := jwt.ParseSigned(token)
+	t, err := jwt.ParseSigned(token, jwtsvid.AllowedSignatureAlgorithms)
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -128,8 +137,8 @@ func getJWTSVIDEndOfLife(token string) (time.Time, error) {
 
 // ttlToSeconds returns the number of seconds in a duration, rounded up to
 // the nearest second
-func ttlToSeconds(ttl time.Duration) int32 {
-	return int32((ttl + time.Second - 1) / time.Second)
+func ttlToSeconds(ttl time.Duration) (int32, error) {
+	return util.CheckedCast[int32]((ttl + time.Second - 1) / time.Second)
 }
 
 func prettyPrintMint(env *commoncli.Env, results ...any) error {

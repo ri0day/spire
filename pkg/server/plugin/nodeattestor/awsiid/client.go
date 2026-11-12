@@ -5,8 +5,11 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/aws/aws-sdk-go-v2/service/autoscaling"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	"github.com/aws/aws-sdk-go-v2/service/eks"
 	"github.com/aws/aws-sdk-go-v2/service/iam"
+	"github.com/aws/aws-sdk-go-v2/service/organizations"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -18,13 +21,19 @@ var (
 type Client interface {
 	ec2.DescribeInstancesAPIClient
 	iam.GetInstanceProfileAPIClient
+	organizations.ListAccountsAPIClient
+	autoscaling.DescribeAutoScalingGroupsAPIClient
+	eks.ListNodegroupsAPIClient
+	eks.DescribeNodegroupAPIClient
 }
 
 type clientsCache struct {
-	mtx       sync.RWMutex
-	config    *SessionConfig
-	clients   map[string]*cacheEntry
-	newClient newClientCallback
+	mtx        sync.RWMutex
+	config     *SessionConfig
+	partitions map[string]*SessionConfig
+	orgConfig  *orgValidationConfig
+	clients    map[string]*cacheEntry
+	newClient  newClientCallback
 }
 
 type cacheEntry struct {
@@ -32,7 +41,7 @@ type cacheEntry struct {
 	client Client
 }
 
-type newClientCallback func(ctx context.Context, config *SessionConfig, region string, assumeRoleARN string) (Client, error)
+type newClientCallback func(ctx context.Context, config *SessionConfig, region string, assumeRoleARN string, orgRoleARN string) (Client, error)
 
 func newClientsCache(newClient newClientCallback) *clientsCache {
 	return &clientsCache{
@@ -41,11 +50,36 @@ func newClientsCache(newClient newClientCallback) *clientsCache {
 	}
 }
 
-func (cc *clientsCache) configure(config SessionConfig) {
+// configure sets the session config used for every region, or, if partitions is not empty, the session config used
+// for the regions of each partition.
+func (cc *clientsCache) configure(config SessionConfig, partitions map[string]*SessionConfig, orgConfig orgValidationConfig) {
 	cc.mtx.Lock()
 	cc.clients = make(map[string]*cacheEntry)
 	cc.config = &config
+	cc.partitions = partitions
+	cc.orgConfig = &orgConfig
 	cc.mtx.Unlock()
+}
+
+// sessionConfig returns the session config used for the region. If partitions are configured, it is the config of the
+// region's partition, and an error is returned if that partition is not configured.
+func (cc *clientsCache) sessionConfig(region string) (*SessionConfig, error) {
+	cc.mtx.RLock()
+	defer cc.mtx.RUnlock()
+
+	if cc.config == nil {
+		return nil, status.Error(codes.FailedPrecondition, "not configured")
+	}
+	if len(cc.partitions) == 0 {
+		return cc.config, nil
+	}
+
+	partition := partitionForRegion(region)
+	config, ok := cc.partitions[partition]
+	if !ok {
+		return nil, status.Errorf(codes.PermissionDenied, "region %q is in partition %q, which is not configured", region, partition)
+	}
+	return config, nil
 }
 
 func (cc *clientsCache) getClient(ctx context.Context, region, accountID string) (Client, error) {
@@ -72,16 +106,23 @@ func (cc *clientsCache) getClient(ctx context.Context, region, accountID string)
 		return r.client, nil
 	}
 
-	if cc.config == nil {
-		return nil, status.Error(codes.FailedPrecondition, "not configured")
+	config, err := cc.sessionConfig(region)
+	if err != nil {
+		return nil, err
 	}
 
 	var assumeRoleArn string
-	if cc.config.AssumeRole != "" {
-		assumeRoleArn = fmt.Sprintf("arn:%s:iam::%s:role/%s", cc.config.Partition, accountID, cc.config.AssumeRole)
+	if config.AssumeRole != "" {
+		assumeRoleArn = fmt.Sprintf("arn:%s:iam::%s:role/%s", config.Partition, accountID, config.AssumeRole)
 	}
 
-	client, err := cc.newClient(ctx, cc.config, region, assumeRoleArn)
+	// If organization attestation feature is enabled, assume org role
+	var orgRoleArn string
+	if cc.orgConfig.AccountRole != "" {
+		orgRoleArn = fmt.Sprintf("arn:%s:iam::%s:role/%s", config.Partition, cc.orgConfig.AccountID, cc.orgConfig.AccountRole)
+	}
+
+	client, err := cc.newClient(ctx, config, region, assumeRoleArn, orgRoleArn)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to create client: %v", err)
 	}
@@ -103,16 +144,33 @@ func (cc *clientsCache) getCachedClient(cacheKey string) *cacheEntry {
 	return r
 }
 
-func newClient(ctx context.Context, config *SessionConfig, region string, assumeRoleARN string) (Client, error) {
-	conf, err := newAWSConfig(ctx, config.AccessKeyID, config.SecretAccessKey, region, assumeRoleARN)
+func newClient(ctx context.Context, config *SessionConfig, region string, assumeRoleARN string, orgRoleArn string) (Client, error) {
+	conf, err := newAWSConfig(ctx, config, region, assumeRoleARN)
 	if err != nil {
 		return nil, err
 	}
+
+	// If the organizationAttestation feature is enabled, use the role configured for feature.
+	orgConf, err := newAWSConfig(ctx, config, region, orgRoleArn)
+	if err != nil {
+		return nil, err
+	}
+
+	eksClient := eks.NewFromConfig(conf)
+
 	return struct {
 		iam.GetInstanceProfileAPIClient
 		ec2.DescribeInstancesAPIClient
+		organizations.ListAccountsAPIClient
+		autoscaling.DescribeAutoScalingGroupsAPIClient
+		eks.ListNodegroupsAPIClient
+		eks.DescribeNodegroupAPIClient
 	}{
-		GetInstanceProfileAPIClient: iam.NewFromConfig(conf),
-		DescribeInstancesAPIClient:  ec2.NewFromConfig(conf),
+		GetInstanceProfileAPIClient:        iam.NewFromConfig(conf),
+		DescribeInstancesAPIClient:         ec2.NewFromConfig(conf),
+		ListAccountsAPIClient:              organizations.NewFromConfig(orgConf),
+		DescribeAutoScalingGroupsAPIClient: autoscaling.NewFromConfig(conf),
+		ListNodegroupsAPIClient:            eksClient,
+		DescribeNodegroupAPIClient:         eksClient,
 	}, nil
 }

@@ -152,9 +152,9 @@ func TestV1ComposeServerX509CA(t *testing.T) {
 		{
 			test: "attributes overridden by plugin",
 			attributesIn: credentialcomposer.X509CAAttributes{
-				Subject:           subject1,
-				PolicyIdentifiers: []asn1.ObjectIdentifier{{1, 2, 3, 4}},
-				ExtraExtensions:   []pkix.Extension{{Id: asn1.ObjectIdentifier{1, 2, 3, 4}, Value: []byte("ORIGINAL")}},
+				Subject:         subject1,
+				Policies:        []x509.OID{makeOID(t, 1, 2, 3, 4)},
+				ExtraExtensions: []pkix.Extension{{Id: asn1.ObjectIdentifier{1, 2, 3, 4}, Value: []byte("ORIGINAL")}},
 			},
 			expectRequestIn: &credentialcomposerv1.ComposeServerX509CARequest{
 				Attributes: &credentialcomposerv1.X509CAAttributes{
@@ -172,20 +172,20 @@ func TestV1ComposeServerX509CA(t *testing.T) {
 			responseOut: &credentialcomposerv1.ComposeServerX509CAResponse{
 				Attributes: &credentialcomposerv1.X509CAAttributes{
 					Subject:           subject2v1,
-					PolicyIdentifiers: []string{"4.3.2.1"},
+					PolicyIdentifiers: []string{"2.3.4.5"},
 					ExtraExtensions: []*credentialcomposerv1.X509Extension{
 						{
 							Critical: true,
-							Oid:      "4.3.2.1",
+							Oid:      "2.3.4.5",
 							Value:    []byte("NEW"),
 						},
 					},
 				},
 			},
 			expectAttributesOut: credentialcomposer.X509CAAttributes{
-				Subject:           subject2,
-				PolicyIdentifiers: []asn1.ObjectIdentifier{{4, 3, 2, 1}},
-				ExtraExtensions:   []pkix.Extension{{Id: asn1.ObjectIdentifier{4, 3, 2, 1}, Value: []byte("NEW"), Critical: true}},
+				Subject:         subject2,
+				Policies:        []x509.OID{makeOID(t, 2, 3, 4, 5)},
+				ExtraExtensions: []pkix.Extension{{Id: asn1.ObjectIdentifier{2, 3, 4, 5}, Value: []byte("NEW"), Critical: true}},
 			},
 		},
 		{
@@ -217,7 +217,7 @@ func TestV1ComposeServerX509CA(t *testing.T) {
 				},
 			},
 			expectCode:    codes.Internal,
-			expectMessage: `credentialcomposer(test): plugin returned invalid X509CA attributes: policy identifiers: invalid OID: non-integer part "NOT AN OID"`,
+			expectMessage: `credentialcomposer(test): plugin returned invalid X509CA attributes: policy identifiers: invalid oid`,
 		},
 		{
 			test: "plugin returns invalid attributes extra extensions",
@@ -236,7 +236,6 @@ func TestV1ComposeServerX509CA(t *testing.T) {
 			expectMessage: `credentialcomposer(test): plugin returned invalid X509CA attributes: extra extensions: invalid OID: non-integer part "NOT AN OID"`,
 		},
 	} {
-		tt := tt
 		t.Run(tt.test, func(t *testing.T) {
 			plugin := &fakeV1Plugin{err: tt.pluginErr, composeServerX509CAResponseOut: tt.responseOut}
 			cc := loadV1Plugin(t, plugin)
@@ -384,7 +383,6 @@ func TestV1ComposeServerX509SVID(t *testing.T) {
 			expectMessage: `credentialcomposer(test): plugin returned invalid X509SVID attributes: extra extensions: invalid OID: non-integer part "NOT AN OID"`,
 		},
 	} {
-		tt := tt
 		t.Run(tt.test, func(t *testing.T) {
 			plugin := &fakeV1Plugin{err: tt.pluginErr, composeServerX509SVIDResponseOut: tt.responseOut}
 			cc := loadV1Plugin(t, plugin)
@@ -567,7 +565,6 @@ func TestV1ComposeAgentX509SVID(t *testing.T) {
 			expectMessage: `credentialcomposer(test): plugin returned invalid X509SVID attributes: extra extensions: invalid OID: non-integer part "NOT AN OID"`,
 		},
 	} {
-		tt := tt
 		t.Run(tt.test, func(t *testing.T) {
 			plugin := &fakeV1Plugin{err: tt.pluginErr, composeAgentX509SVIDResponseOut: tt.responseOut}
 			cc := loadV1Plugin(t, plugin)
@@ -750,7 +747,6 @@ func TestV1ComposeWorkloadX509SVID(t *testing.T) {
 			expectMessage: `credentialcomposer(test): plugin returned invalid X509SVID attributes: extra extensions: invalid OID: non-integer part "NOT AN OID"`,
 		},
 	} {
-		tt := tt
 		t.Run(tt.test, func(t *testing.T) {
 			plugin := &fakeV1Plugin{err: tt.pluginErr, composeWorkloadX509SVIDResponseOut: tt.responseOut}
 			cc := loadV1Plugin(t, plugin)
@@ -847,7 +843,6 @@ func TestV1ComposeWorkloadJWTSVID(t *testing.T) {
 			expectAttributesOut: credentialcomposer.JWTSVIDAttributes{Claims: map[string]any{"NEW_KEY": "NEW_VALUE"}},
 		},
 	} {
-		tt := tt
 		t.Run(tt.test, func(t *testing.T) {
 			plugin := &fakeV1Plugin{err: tt.pluginErr, composeWorkloadJWTSVIDResponseOut: tt.responseOut}
 			cc := loadV1Plugin(t, plugin)
@@ -909,4 +904,10 @@ func (p *fakeV1Plugin) ComposeWorkloadX509SVID(_ context.Context, req *credentia
 func (p *fakeV1Plugin) ComposeWorkloadJWTSVID(_ context.Context, req *credentialcomposerv1.ComposeWorkloadJWTSVIDRequest) (*credentialcomposerv1.ComposeWorkloadJWTSVIDResponse, error) {
 	p.composeWorkloadJWTSVIDRequestIn = req
 	return p.composeWorkloadJWTSVIDResponseOut, p.err
+}
+
+func makeOID(tb testing.TB, ids ...uint64) x509.OID {
+	oid, err := x509.OIDFromInts(ids)
+	require.NoError(tb, err)
+	return oid
 }

@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/open-policy-agent/opa/rego"
-	"github.com/open-policy-agent/opa/storage"
-	"github.com/open-policy-agent/opa/storage/inmem"
-	"github.com/open-policy-agent/opa/util"
+	"github.com/open-policy-agent/opa/v1/ast"
+	"github.com/open-policy-agent/opa/v1/rego"
+	"github.com/open-policy-agent/opa/v1/storage"
+	"github.com/open-policy-agent/opa/v1/storage/inmem"
+	"github.com/open-policy-agent/opa/v1/util"
+	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -22,7 +24,7 @@ const (
 
 // Engine drives policy management.
 type Engine struct {
-	rego rego.PartialResult
+	query rego.PreparedEvalQuery
 }
 
 type OpaEngineConfig struct {
@@ -38,6 +40,9 @@ type LocalOpaProviderConfig struct {
 type Input struct {
 	// Caller is the authenticated identity of the actor making a request.
 	Caller string `json:"caller"`
+
+	// CallerFilePath is the file path of a local actor making a request.
+	CallerFilePath string `json:"caller_file_path"`
 
 	// FullMethod is the fully-qualified name of the proto rpc service method.
 	FullMethod string `json:"full_method"`
@@ -58,7 +63,7 @@ type Result struct {
 
 // NewEngineFromConfigOrDefault returns a new policy engine. Or if no
 // config is provided, provides the default policy
-func NewEngineFromConfigOrDefault(ctx context.Context, cfg *OpaEngineConfig) (*Engine, error) {
+func NewEngineFromConfigOrDefault(ctx context.Context, logger logrus.FieldLogger, cfg *OpaEngineConfig) (*Engine, error) {
 	if cfg == nil {
 		return DefaultAuthPolicy(ctx)
 	}
@@ -104,19 +109,20 @@ func newEngine(ctx context.Context, cfg *OpaEngineConfig) (*Engine, error) {
 
 // NewEngineFromRego is a helper to create the Engine object
 func NewEngineFromRego(ctx context.Context, regoPolicy string, dataStore storage.Store) (*Engine, error) {
-	rego := rego.New(
+	rg := rego.New(
 		rego.Query("data.spire.result"),
 		rego.Package("spire"),
 		rego.Module("spire.rego", regoPolicy),
 		rego.Store(dataStore),
+		rego.SetRegoVersion(ast.RegoV1),
 	)
-	pr, err := rego.PartialResult(ctx)
+	query, err := rg.PrepareForEval(ctx, rego.WithPartialEval())
 	if err != nil {
 		return nil, err
 	}
 
 	e := &Engine{
-		rego: pr,
+		query: query,
 	}
 
 	// Test policy with some simple calls to ensure that the
@@ -130,7 +136,7 @@ func NewEngineFromRego(ctx context.Context, regoPolicy string, dataStore storage
 
 // Eval determines whether access should be allowed on a resource.
 func (e *Engine) Eval(ctx context.Context, input Input) (result Result, err error) {
-	rs, err := e.rego.Rego(rego.Input(input)).Eval(ctx)
+	rs, err := e.query.Eval(ctx, rego.EvalInput(input))
 	if err != nil {
 		return Result{}, err
 	}

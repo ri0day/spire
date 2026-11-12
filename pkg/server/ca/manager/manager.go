@@ -6,6 +6,7 @@ import (
 	"crypto"
 	"crypto/rand"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -13,6 +14,8 @@ import (
 	"github.com/andres-erbsen/clock"
 	"github.com/sirupsen/logrus"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"github.com/spiffe/spire/pkg/common/backoff"
+	"github.com/spiffe/spire/pkg/common/coretypes/x509certificate"
 	"github.com/spiffe/spire/pkg/common/telemetry"
 	telemetry_server "github.com/spiffe/spire/pkg/common/telemetry/server"
 	"github.com/spiffe/spire/pkg/common/x509util"
@@ -25,7 +28,6 @@ import (
 	"github.com/spiffe/spire/pkg/server/plugin/notifier"
 	"github.com/spiffe/spire/proto/private/server/journal"
 	"github.com/spiffe/spire/proto/spire/common"
-	"github.com/zeebo/errs"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -39,40 +41,65 @@ const (
 	preparationThresholdCap     = thirtyDays
 	preparationThresholdDivisor = 2
 
-	sevenDays                  = 7 * 24 * time.Hour
-	activationThresholdCap     = sevenDays
-	activationThresholdDivisor = 6
+	subscribeBundleBackoffInterval = 5 * time.Second
+
+	taintBackoffInterval       = 5 * time.Second
+	taintBackoffMaxElapsedTime = 1 * time.Minute
 )
 
 type ManagedCA interface {
 	SetX509CA(*ca.X509CA)
 	SetJWTKey(*ca.JWTKey)
+	SetWITKey(*ca.WITKey)
+	NotifyTaintedX509Authorities([]*x509.Certificate)
 }
 
-type JwtKeyPublisher interface {
+type AuthorityManager interface {
+	GetCurrentJWTKeySlot() Slot
+	GetNextJWTKeySlot() Slot
+	PrepareJWTKey(ctx context.Context) error
+	RotateJWTKey(ctx context.Context)
+	GetCurrentX509CASlot() Slot
+	GetNextX509CASlot() Slot
+	PrepareX509CA(ctx context.Context) error
+	RotateX509CA(ctx context.Context) error
+	GetCurrentWITKeySlot() Slot
+	GetNextWITKeySlot() Slot
+	PrepareWITKey(ctx context.Context) error
+	RotateWITKey(ctx context.Context)
+	IsUpstreamAuthority() bool
+	IsJWTSVIDsDisabled() bool
+	IsWITSVIDsDisabled() bool
 	PublishJWTKey(ctx context.Context, jwtKey *common.PublicKey) ([]*common.PublicKey, error)
+	PublishWITKey(ctx context.Context, witKey *common.PublicKey) ([]*common.PublicKey, error)
+	NotifyTaintedX509Authority(ctx context.Context, authorityID string) error
+	SubscribeToLocalBundle(ctx context.Context) error
 }
 
 type Config struct {
-	CredBuilder   *credtemplate.Builder
-	CredValidator *credvalidator.Validator
-	CA            ManagedCA
-	Catalog       catalog.Catalog
-	TrustDomain   spiffeid.TrustDomain
-	X509CAKeyType keymanager.KeyType
-	JWTKeyType    keymanager.KeyType
-	Dir           string
-	Log           logrus.FieldLogger
-	Metrics       telemetry.Metrics
-	Clock         clock.Clock
+	CredBuilder     *credtemplate.Builder
+	CredValidator   *credvalidator.Validator
+	CA              ManagedCA
+	Catalog         catalog.Catalog
+	TrustDomain     spiffeid.TrustDomain
+	X509CAKeyType   keymanager.KeyType
+	DisableJWTSVIDs bool
+	DisableWITSVIDs bool
+	JWTKeyType      keymanager.KeyType
+	WITKeyType      keymanager.KeyType
+	Dir             string
+	Log             logrus.FieldLogger
+	Metrics         telemetry.Metrics
+	Clock           clock.Clock
 }
 
 type Manager struct {
-	c                  Config
-	caTTL              time.Duration
-	bundleUpdatedCh    chan struct{}
-	upstreamClient     *ca.UpstreamClient
-	upstreamPluginName string
+	c                            Config
+	caTTL                        time.Duration
+	bundleUpdatedCh              chan struct{}
+	taintedUpstreamAuthoritiesCh chan []*x509.Certificate
+	upstreamClient               *ca.UpstreamClient
+	upstreamPluginName           string
 
 	currentX509CA *x509CASlot
 	nextX509CA    *x509CASlot
@@ -82,10 +109,20 @@ type Manager struct {
 	nextJWTKey    *jwtKeySlot
 	jwtKeyMutex   sync.RWMutex
 
+	currentWITKey *witKeySlot
+	nextWITKey    *witKeySlot
+	witKeyMutex   sync.RWMutex
+
 	journal *Journal
 
 	// Used to log a warning only once when the UpstreamAuthority does not support JWT-SVIDs.
 	jwtUnimplementedWarnOnce sync.Once
+
+	// Used to log a warning only once when the UpstreamAuthority does not support WIT-SVIDs.
+	witUnimplementedWarnOnce sync.Once
+
+	// Used for testing backoff, must not be set in regular code
+	triggerBackOffCh chan error
 }
 
 func NewManager(ctx context.Context, c Config) (*Manager, error) {
@@ -94,19 +131,22 @@ func NewManager(ctx context.Context, c Config) (*Manager, error) {
 	}
 
 	m := &Manager{
-		c:               c,
-		caTTL:           c.CredBuilder.Config().X509CATTL,
-		bundleUpdatedCh: make(chan struct{}, 1),
+		c:                            c,
+		caTTL:                        c.CredBuilder.Config().X509CATTL,
+		bundleUpdatedCh:              make(chan struct{}, 1),
+		taintedUpstreamAuthoritiesCh: make(chan []*x509.Certificate, 1),
 	}
 
 	if upstreamAuthority, ok := c.Catalog.GetUpstreamAuthority(); ok {
 		m.upstreamClient = ca.NewUpstreamClient(ca.UpstreamClientConfig{
 			UpstreamAuthority: upstreamAuthority,
 			BundleUpdater: &bundleUpdater{
-				log:           c.Log,
-				trustDomainID: c.TrustDomain.IDString(),
-				ds:            c.Catalog.GetDataStore(),
-				updated:       m.bundleUpdated,
+				log:                         c.Log,
+				trustDomainID:               c.TrustDomain.IDString(),
+				ds:                          c.Catalog.GetDataStore(),
+				updated:                     m.bundleUpdated,
+				upstreamAuthoritiesTainted:  m.notifyUpstreamAuthoritiesTainted,
+				processedTaintedAuthorities: map[string]struct{}{},
 			},
 		})
 		m.upstreamPluginName = upstreamAuthority.Name()
@@ -131,8 +171,8 @@ func NewManager(ctx context.Context, c Config) (*Manager, error) {
 		m.currentX509CA = currentX509CA.(*x509CASlot)
 
 		if !currentX509CA.IsEmpty() && !currentX509CA.ShouldActivateNext(now) {
-			// activate the X509CA immediately if it is set and not within
-			// activation time of the next X509CA.
+			// activate the X509 CA immediately if it is set and not within
+			// activation time of the next X509 CA.
 			m.activateX509CA(ctx)
 		}
 	}
@@ -158,6 +198,24 @@ func NewManager(ctx context.Context, c Config) (*Manager, error) {
 		m.nextJWTKey = nextJWTKey.(*jwtKeySlot)
 	}
 
+	if currentWITKey, ok := slots[CurrentWITKeySlot]; ok {
+		m.currentWITKey = currentWITKey.(*witKeySlot)
+
+		if !currentWITKey.IsEmpty() && !currentWITKey.ShouldActivateNext(now) {
+			// activate the WIT key immediately if it is set and not within
+			// activation time of the next WIT key.
+			m.activateWITKey(ctx)
+		}
+	}
+
+	if nextWITKey, ok := slots[NextWITKeySlot]; ok {
+		m.nextWITKey = nextWITKey.(*witKeySlot)
+	}
+
+	if m.nextX509CA != nil && !m.nextX509CA.IsEmpty() {
+		m.setX509CARotateMaxTTLGauge(m.c.Clock.Now())
+	}
+
 	return m, nil
 }
 
@@ -165,6 +223,24 @@ func (m *Manager) Close() {
 	if m.upstreamClient != nil {
 		_ = m.upstreamClient.Close()
 	}
+}
+
+func (m *Manager) NotifyTaintedX509Authority(ctx context.Context, authorityID string) error {
+	taintedAuthority, err := m.fetchRootCAByAuthorityID(ctx, authorityID)
+	if err != nil {
+		return err
+	}
+
+	m.c.CA.NotifyTaintedX509Authorities([]*x509.Certificate{taintedAuthority})
+	return nil
+}
+
+func (m *Manager) IsJWTSVIDsDisabled() bool {
+	return m.c.DisableJWTSVIDs
+}
+
+func (m *Manager) IsWITSVIDsDisabled() bool {
+	return m.c.DisableWITSVIDs
 }
 
 func (m *Manager) GetCurrentX509CASlot() Slot {
@@ -227,21 +303,59 @@ func (m *Manager) PrepareX509CA(ctx context.Context) (err error) {
 	// Set key from new CA, to be able to get it after
 	// slot moved to old state
 	slot.authorityID = x509util.SubjectKeyIDToString(x509CA.Certificate.SubjectKeyId)
+	slot.upstreamAuthorityID = x509util.SubjectKeyIDToString(x509CA.Certificate.AuthorityKeyId)
 	slot.publicKey = slot.x509CA.Certificate.PublicKey
-	slot.notAfter = slot.x509CA.Certificate.NotAfter
+	slot.notAfter = slot.x509CA.NotAfter
+
+	// Compare against request time, rather than NotBefore (which may be
+	// backdated), and allow for upstream clock skew plus certificate timestamp
+	// truncation to seconds.
+	if m.upstreamClient != nil && slot.notAfter.Add(credtemplate.NotBeforeCushion+time.Second).Before(now.Add(m.caTTL)) {
+		log.WithFields(logrus.Fields{
+			telemetry.Alert:           true,
+			telemetry.AlertType:       telemetry.ShortenedLifetimeAlertType,
+			telemetry.RequestedTTL:    m.caTTL.Seconds(),
+			telemetry.EffectiveTTL:    slot.notAfter.Sub(now).Seconds(),
+			telemetry.ChainExpiration: slot.notAfter,
+			telemetry.PluginName:      m.upstreamPluginName,
+		}).Warn("Upstream authority issued an X509 CA with a shorter usable lifetime than requested")
+	}
+
+	if slot.notAfter.Before(slot.x509CA.Certificate.NotAfter) {
+		log.WithFields(logrus.Fields{
+			telemetry.Alert:                 true,
+			telemetry.AlertType:             telemetry.ShortenedLifetimeAlertType,
+			telemetry.CertificateExpiration: slot.x509CA.Certificate.NotAfter,
+			telemetry.ChainExpiration:       slot.notAfter,
+		}).Warn("Upstream authority issued an X509 CA that outlives its certificate chain; rotation will use the chain expiration")
+	}
+	if slot == m.nextX509CA && !slot.notAfter.After(m.currentX509CA.notAfter) {
+		log.WithFields(logrus.Fields{
+			telemetry.Alert:                   true,
+			telemetry.AlertType:               telemetry.ShortenedLifetimeAlertType,
+			telemetry.CurrentChainExpiration:  m.currentX509CA.notAfter,
+			telemetry.PreparedChainExpiration: slot.notAfter,
+		}).Warn("Prepared X509 CA does not extend the current X509 CA lifetime")
+	}
+	m.setX509CARotateMaxTTLGauge(now)
 
 	if err := m.journal.AppendX509CA(ctx, slot.id, slot.issuedAt, slot.x509CA); err != nil {
 		log.WithError(err).Error("Unable to append X509 CA to journal")
 	}
 
 	m.c.Log.WithFields(logrus.Fields{
-		telemetry.Slot:             slot.id,
-		telemetry.IssuedAt:         slot.issuedAt,
-		telemetry.Expiration:       slot.x509CA.Certificate.NotAfter,
-		telemetry.SelfSigned:       m.upstreamClient == nil,
-		telemetry.LocalAuthorityID: slot.authorityID,
+		telemetry.Slot:                slot.id,
+		telemetry.IssuedAt:            slot.issuedAt,
+		telemetry.Expiration:          slot.notAfter,
+		telemetry.SelfSigned:          m.upstreamClient == nil,
+		telemetry.LocalAuthorityID:    slot.authorityID,
+		telemetry.UpstreamAuthorityID: slot.upstreamAuthorityID,
 	}).Info("X509 CA prepared")
 	return nil
+}
+
+func (m *Manager) IsUpstreamAuthority() bool {
+	return m.upstreamClient != nil
 }
 
 func (m *Manager) ActivateX509CA(ctx context.Context) {
@@ -251,17 +365,22 @@ func (m *Manager) ActivateX509CA(ctx context.Context) {
 	m.activateX509CA(ctx)
 }
 
-func (m *Manager) RotateX509CA(ctx context.Context) {
+func (m *Manager) RotateX509CA(ctx context.Context) error {
 	m.x509CAMutex.Lock()
 	defer m.x509CAMutex.Unlock()
+	if !m.nextX509CA.NotAfter().After(m.c.Clock.Now()) {
+		m.nextX509CA.Reset()
+		return errors.New("prepared X509 CA has expired")
+	}
 
 	m.currentX509CA, m.nextX509CA = m.nextX509CA, m.currentX509CA
 	m.nextX509CA.Reset()
-	if err := m.journal.UpdateX509CAStatus(ctx, m.nextX509CA.issuedAt, journal.Status_OLD); err != nil {
+	if err := m.journal.UpdateX509CAStatus(ctx, m.nextX509CA.AuthorityID(), journal.Status_OLD); err != nil {
 		m.c.Log.WithError(err).Error("Failed to update status on X509CA journal entry")
 	}
 
 	m.activateX509CA(ctx)
+	return nil
 }
 
 func (m *Manager) GetCurrentJWTKeySlot() Slot {
@@ -279,6 +398,10 @@ func (m *Manager) GetNextJWTKeySlot() Slot {
 }
 
 func (m *Manager) PrepareJWTKey(ctx context.Context) (err error) {
+	if m.IsJWTSVIDsDisabled() {
+		return nil
+	}
+
 	counter := telemetry_server.StartServerCAManagerPrepareJWTKeyCall(m.c.Metrics)
 	defer counter.Done(&err)
 
@@ -339,6 +462,9 @@ func (m *Manager) PrepareJWTKey(ctx context.Context) (err error) {
 }
 
 func (m *Manager) ActivateJWTKey(ctx context.Context) {
+	if m.IsJWTSVIDsDisabled() {
+		return
+	}
 	m.jwtKeyMutex.RLock()
 	defer m.jwtKeyMutex.RUnlock()
 
@@ -346,13 +472,17 @@ func (m *Manager) ActivateJWTKey(ctx context.Context) {
 }
 
 func (m *Manager) RotateJWTKey(ctx context.Context) {
+	if m.IsJWTSVIDsDisabled() {
+		return
+	}
+
 	m.jwtKeyMutex.Lock()
 	defer m.jwtKeyMutex.Unlock()
 
 	m.currentJWTKey, m.nextJWTKey = m.nextJWTKey, m.currentJWTKey
 	m.nextJWTKey.Reset()
 
-	if err := m.journal.UpdateJWTKeyStatus(ctx, m.nextJWTKey.issuedAt, journal.Status_OLD); err != nil {
+	if err := m.journal.UpdateJWTKeyStatus(ctx, m.nextJWTKey.AuthorityID(), journal.Status_OLD); err != nil {
 		m.c.Log.WithError(err).Error("Failed to update status on JWTKey journal entry")
 	}
 
@@ -396,12 +526,176 @@ func (m *Manager) PublishJWTKey(ctx context.Context, jwtKey *common.PublicKey) (
 		}
 	}
 
-	bundle, err := m.appendBundle(ctx, nil, []*common.PublicKey{jwtKey})
+	bundle, err := m.appendBundle(ctx, nil, []*common.PublicKey{jwtKey}, nil)
 	if err != nil {
 		return nil, err
 	}
 
 	return bundle.JwtSigningKeys, nil
+}
+
+func (m *Manager) GetCurrentWITKeySlot() Slot {
+	m.witKeyMutex.RLock()
+	defer m.witKeyMutex.RUnlock()
+
+	return m.currentWITKey
+}
+
+func (m *Manager) GetNextWITKeySlot() Slot {
+	m.witKeyMutex.RLock()
+	defer m.witKeyMutex.RUnlock()
+
+	return m.nextWITKey
+}
+
+func (m *Manager) PrepareWITKey(ctx context.Context) (err error) {
+	if m.IsWITSVIDsDisabled() {
+		return nil
+	}
+
+	counter := telemetry_server.StartServerCAManagerPrepareWITKeyCall(m.c.Metrics)
+	defer counter.Done(&err)
+
+	m.witKeyMutex.Lock()
+	defer m.witKeyMutex.Unlock()
+
+	// If current slot is not empty, use next to prepare
+	slot := m.currentWITKey
+	if !slot.IsEmpty() {
+		slot = m.nextWITKey
+	}
+
+	log := m.c.Log.WithField(telemetry.Slot, slot.id)
+	log.Debug("Preparing WIT key")
+
+	slot.Reset()
+
+	now := m.c.Clock.Now()
+	notAfter := now.Add(m.caTTL)
+
+	km := m.c.Catalog.GetKeyManager()
+	signer, err := km.GenerateKey(ctx, slot.KmKeyID(), m.c.WITKeyType)
+	if err != nil {
+		return err
+	}
+
+	witKey, err := newWITKey(signer, notAfter)
+	if err != nil {
+		return err
+	}
+
+	publicKey, err := publicKeyFromWITKey(witKey)
+	if err != nil {
+		return err
+	}
+
+	if _, err := m.PublishWITKey(ctx, publicKey); err != nil {
+		return err
+	}
+
+	slot.issuedAt = now
+	slot.witKey = witKey
+	slot.status = journal.Status_PREPARED
+	slot.authorityID = witKey.Kid
+	slot.notAfter = witKey.NotAfter
+
+	if err := m.journal.AppendWITKey(ctx, slot.id, slot.issuedAt, slot.witKey); err != nil {
+		log.WithError(err).Error("Unable to append WIT key to journal")
+	}
+
+	m.c.Log.WithFields(logrus.Fields{
+		telemetry.Slot:             slot.id,
+		telemetry.IssuedAt:         slot.issuedAt,
+		telemetry.Expiration:       slot.witKey.NotAfter,
+		telemetry.LocalAuthorityID: slot.authorityID,
+	}).Info("WIT key prepared")
+	return nil
+}
+
+func (m *Manager) ActivateWITKey(ctx context.Context) {
+	if m.IsWITSVIDsDisabled() {
+		return
+	}
+	m.witKeyMutex.RLock()
+	defer m.witKeyMutex.RUnlock()
+
+	m.activateWITKey(ctx)
+}
+
+func (m *Manager) RotateWITKey(ctx context.Context) {
+	if m.IsWITSVIDsDisabled() {
+		return
+	}
+
+	m.witKeyMutex.Lock()
+	defer m.witKeyMutex.Unlock()
+
+	m.currentWITKey, m.nextWITKey = m.nextWITKey, m.currentWITKey
+	m.nextWITKey.Reset()
+
+	if err := m.journal.UpdateWITKeyStatus(ctx, m.nextWITKey.AuthorityID(), journal.Status_OLD); err != nil {
+		m.c.Log.WithError(err).Error("Failed to update status on WITKey journal entry")
+	}
+
+	m.activateWITKey(ctx)
+}
+
+// PublishWITKey publishes the passed WIT key to the upstream server using the
+// configured UpstreamAuthority plugin, then appends to the bundle the WIT keys
+// returned by the upstream server, and finally it returns the updated list of
+// WIT keys contained in the bundle. It follows the same fallback rules as
+// PublishJWTKey.
+func (m *Manager) PublishWITKey(ctx context.Context, witKey *common.PublicKey) ([]*common.PublicKey, error) {
+	if m.upstreamClient != nil {
+		publishCtx, cancel := context.WithTimeout(ctx, publishJWKTimeout)
+		defer cancel()
+		upstreamWITKeys, err := m.upstreamClient.PublishWITKey(publishCtx, witKey)
+		switch {
+		case status.Code(err) == codes.Unimplemented:
+			m.witUnimplementedWarnOnce.Do(func() {
+				m.c.Log.WithField("plugin_name", m.upstreamPluginName).Warn("UpstreamAuthority plugin does not support WIT-SVIDs. Workloads managed " +
+					"by this server may have trouble communicating with workloads outside " +
+					"this cluster when using WIT-SVIDs.")
+			})
+		case err != nil:
+			return nil, err
+		default:
+			return upstreamWITKeys, nil
+		}
+	}
+
+	bundle, err := m.appendBundle(ctx, nil, nil, []*common.PublicKey{witKey})
+	if err != nil {
+		return nil, err
+	}
+
+	return bundle.WitSigningKeys, nil
+}
+
+func (m *Manager) SubscribeToLocalBundle(ctx context.Context) error {
+	if m.upstreamClient == nil {
+		return nil
+	}
+
+	// The upstream authority may be unreachable, for example when an upstream
+	// server is restarting. Bailing out here would end the task and take the
+	// whole server down, so retry with backoff until the subscription succeeds
+	// or the context is canceled.
+	subscribeBackoff := backoff.NewBackoff(m.c.Clock, subscribeBundleBackoffInterval)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-m.c.Clock.After(subscribeBackoff.NextBackOff()):
+		}
+
+		err := m.upstreamClient.SubscribeToLocalBundle(ctx)
+		if err == nil || status.Code(err) == codes.Unimplemented {
+			return nil
+		}
+		m.c.Log.WithError(err).Warn("Failed to subscribe to local bundle updates on upstream authority")
+	}
 }
 
 func (m *Manager) PruneBundle(ctx context.Context) (err error) {
@@ -412,7 +706,6 @@ func (m *Manager) PruneBundle(ctx context.Context) (err error) {
 	expiresBefore := m.c.Clock.Now().Add(-safetyThresholdBundle)
 
 	changed, err := ds.PruneBundle(ctx, m.c.TrustDomain.IDString(), expiresBefore)
-
 	if err != nil {
 		return fmt.Errorf("unable to prune bundle: %w", err)
 	}
@@ -434,19 +727,26 @@ func (m *Manager) PruneCAJournals(ctx context.Context) (err error) {
 	expiresBefore := m.c.Clock.Now().Add(-safetyThresholdCAJournals)
 
 	err = ds.PruneCAJournals(ctx, expiresBefore.Unix())
-
 	if err != nil {
 		return fmt.Errorf("unable to prune CA journals: %w", err)
 	}
 	return nil
 }
 
-func (m *Manager) NotifyOnBundleUpdate(ctx context.Context) {
+// ProcessBundleUpdates Notify any bundle update, or process tainted authorities
+func (m *Manager) ProcessBundleUpdates(ctx context.Context) {
 	for {
 		select {
 		case <-m.bundleUpdatedCh:
 			if err := m.notifyBundleUpdated(ctx); err != nil {
 				m.c.Log.WithError(err).Warn("Failed to notify on bundle update")
+			}
+		case taintedAuthorities := <-m.taintedUpstreamAuthoritiesCh:
+			if err := m.notifyTaintedAuthorities(ctx, taintedAuthorities); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				m.c.Log.WithError(err).Error("Failed to force intermediate bundle rotation")
 			}
 		case <-ctx.Done():
 			return
@@ -484,7 +784,7 @@ func (m *Manager) activateJWTKey(ctx context.Context) {
 	telemetry_server.IncrActivateJWTKeyManagerCounter(m.c.Metrics)
 
 	m.currentJWTKey.status = journal.Status_ACTIVE
-	if err := m.journal.UpdateJWTKeyStatus(ctx, m.currentJWTKey.issuedAt, journal.Status_ACTIVE); err != nil {
+	if err := m.journal.UpdateJWTKeyStatus(ctx, m.currentJWTKey.AuthorityID(), journal.Status_ACTIVE); err != nil {
 		log.WithError(err).Error("Failed to update to activated status on JWTKey journal entry")
 	}
 
@@ -493,27 +793,79 @@ func (m *Manager) activateJWTKey(ctx context.Context) {
 
 func (m *Manager) activateX509CA(ctx context.Context) {
 	log := m.c.Log.WithFields(logrus.Fields{
-		telemetry.Slot:             m.currentX509CA.id,
-		telemetry.IssuedAt:         m.currentX509CA.issuedAt,
-		telemetry.Expiration:       m.currentX509CA.x509CA.Certificate.NotAfter,
-		telemetry.LocalAuthorityID: m.currentX509CA.authorityID,
+		telemetry.Slot:                m.currentX509CA.id,
+		telemetry.IssuedAt:            m.currentX509CA.issuedAt,
+		telemetry.Expiration:          m.currentX509CA.NotAfter(),
+		telemetry.LocalAuthorityID:    m.currentX509CA.authorityID,
+		telemetry.UpstreamAuthorityID: m.currentX509CA.upstreamAuthorityID,
 	})
+	now := m.c.Clock.Now()
+	config := m.c.CredBuilder.Config()
+	requiredTTL := max(config.X509SVIDTTL, config.AgentSVIDTTL)
+	ttlName := "default_x509_svid_ttl"
+	if config.AgentSVIDTTL > config.X509SVIDTTL {
+		ttlName = "agent_ttl"
+	}
+	remainingTTL := m.currentX509CA.NotAfter().Sub(now)
+	if remainingTTL+time.Second < requiredTTL {
+		log.WithFields(logrus.Fields{
+			telemetry.Alert:        true,
+			telemetry.AlertType:    telemetry.ShortenedLifetimeAlertType,
+			telemetry.TTLName:      ttlName,
+			telemetry.RequestedTTL: requiredTTL.Seconds(),
+			telemetry.EffectiveTTL: remainingTTL.Seconds(),
+		}).Warn("Activating X509 CA with insufficient remaining lifetime for configured workload or agent SVID TTLs; shorter lifetimes may be issued")
+	}
 	log.Info("X509 CA activated")
 	telemetry_server.IncrActivateX509CAManagerCounter(m.c.Metrics)
 
 	m.currentX509CA.status = journal.Status_ACTIVE
-	if err := m.journal.UpdateX509CAStatus(ctx, m.currentX509CA.issuedAt, journal.Status_ACTIVE); err != nil {
+	if err := m.journal.UpdateX509CAStatus(ctx, m.currentX509CA.AuthorityID(), journal.Status_ACTIVE); err != nil {
 		log.WithError(err).Error("Failed to update to activated status on X509CA journal entry")
 	}
 
-	ttl := m.currentX509CA.x509CA.Certificate.NotAfter.Sub(m.c.Clock.Now())
-	telemetry_server.SetX509CARotateGauge(m.c.Metrics, m.c.TrustDomain.Name(), float32(ttl.Seconds()))
+	expiration := m.currentX509CA.NotAfter()
+	telemetry_server.SetX509CARotateGauge(m.c.Metrics, m.c.TrustDomain.Name(), expiration, now)
+	m.setX509CARotateMaxTTLGauge(now)
 	m.c.Log.WithFields(logrus.Fields{
 		telemetry.TrustDomainID: m.c.TrustDomain.IDString(),
-		telemetry.TTL:           ttl.Seconds(),
+		telemetry.TTL:           expiration.Sub(now).Seconds(),
 	}).Debug("Successfully rotated X.509 CA")
 
 	m.c.CA.SetX509CA(m.currentX509CA.x509CA)
+}
+
+func (m *Manager) setX509CARotateMaxTTLGauge(now time.Time) {
+	var expiration time.Time
+	if m.currentX509CA != nil && !m.currentX509CA.IsEmpty() {
+		expiration = m.currentX509CA.NotAfter()
+	}
+	if m.nextX509CA != nil && !m.nextX509CA.IsEmpty() && m.nextX509CA.NotAfter().After(expiration) {
+		expiration = m.nextX509CA.NotAfter()
+	}
+	if expiration.IsZero() {
+		return
+	}
+	telemetry_server.SetX509CARotateMaxExpirationGauge(m.c.Metrics, m.c.TrustDomain.Name(), expiration)
+	telemetry_server.SetX509CARotateMaxTTLGauge(m.c.Metrics, m.c.TrustDomain.Name(), expiration, now)
+}
+
+func (m *Manager) activateWITKey(ctx context.Context) {
+	log := m.c.Log.WithFields(logrus.Fields{
+		telemetry.Slot:             m.currentWITKey.id,
+		telemetry.IssuedAt:         m.currentWITKey.issuedAt,
+		telemetry.Expiration:       m.currentWITKey.witKey.NotAfter,
+		telemetry.LocalAuthorityID: m.currentWITKey.authorityID,
+	})
+	log.Info("WIT key activated")
+	telemetry_server.IncrActivateWITKeyManagerCounter(m.c.Metrics)
+
+	m.currentWITKey.status = journal.Status_ACTIVE
+	if err := m.journal.UpdateWITKeyStatus(ctx, m.currentWITKey.AuthorityID(), journal.Status_ACTIVE); err != nil {
+		log.WithError(err).Error("Failed to update to activated status on WITKey journal entry")
+	}
+
+	m.c.CA.SetWITKey(m.currentWITKey.witKey)
 }
 
 func (m *Manager) bundleUpdated() {
@@ -529,6 +881,116 @@ func (m *Manager) dropBundleUpdated() {
 	default:
 	}
 }
+
+func (m *Manager) notifyUpstreamAuthoritiesTainted(taintedAuthorities []*x509.Certificate) {
+	select {
+	case m.taintedUpstreamAuthoritiesCh <- taintedAuthorities:
+	default:
+	}
+}
+
+func (m *Manager) fetchRootCAByAuthorityID(ctx context.Context, authorityID string) (*x509.Certificate, error) {
+	bundle, err := m.fetchRequiredBundle(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, rootCA := range bundle.RootCas {
+		if rootCA.TaintedKey {
+			cert, err := x509.ParseCertificate(rootCA.DerBytes)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse RootCA: %w", err)
+			}
+
+			skID := x509util.SubjectKeyIDToString(cert.SubjectKeyId)
+			if authorityID == skID {
+				return cert, nil
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("no tainted root CA found with authority ID: %q", authorityID)
+}
+
+func (m *Manager) notifyTaintedAuthorities(ctx context.Context, taintedAuthorities []*x509.Certificate) error {
+	taintBackoff := backoff.NewBackoff(
+		m.c.Clock,
+		taintBackoffInterval,
+		backoff.WithMaxElapsedTime(taintBackoffMaxElapsedTime),
+	)
+
+	for {
+		err := m.processTaintedUpstreamAuthorities(ctx, taintedAuthorities)
+		if err == nil {
+			break
+		}
+
+		nextDuration := taintBackoff.NextBackOff()
+		if nextDuration == backoff.Stop {
+			return err
+		}
+		m.c.Log.WithError(err).Warn("Failed to process tainted keys on upstream authority")
+		if m.triggerBackOffCh != nil {
+			m.triggerBackOffCh <- err
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-m.c.Clock.After(nextDuration):
+			continue
+		}
+	}
+
+	return nil
+}
+
+func (m *Manager) processTaintedUpstreamAuthorities(ctx context.Context, taintedAuthorities []*x509.Certificate) error {
+	// Nothing to rotate if no upstream authority is used
+	if m.upstreamClient == nil {
+		return errors.New("processing of tainted upstream authorities must not be reached when not using an upstream authority; please report this bug")
+	}
+
+	if len(taintedAuthorities) == 0 {
+		// No tainted keys found
+		return nil
+	}
+
+	m.c.Log.Debug("Processing tainted keys on upstream authority")
+
+	currentSlotCA := m.currentX509CA.x509CA
+	if ok := isX509AuthorityTainted(currentSlotCA, taintedAuthorities); ok {
+		m.c.Log.Info("Current root CA is signed by a tainted upstream authority, preparing rotation")
+		if ok := m.shouldPrepareX509CA(taintedAuthorities); ok {
+			if err := m.PrepareX509CA(ctx); err != nil {
+				return fmt.Errorf("failed to prepare x509 authority: %w", err)
+			}
+		}
+
+		// Activate the prepared X.509 authority
+		if err := m.RotateX509CA(ctx); err != nil {
+			return err
+		}
+	}
+
+	// Now that we have rotated the intermediate, we can notify about the
+	// tainted authorities, so agents and downstream servers can start forcing
+	// the rotation of their SVIDs.
+	ds := m.c.Catalog.GetDataStore()
+	for _, each := range taintedAuthorities {
+		skID := x509util.SubjectKeyIDToString(each.SubjectKeyId)
+		if err := ds.TaintX509CA(ctx, m.c.TrustDomain.IDString(), skID); err != nil {
+			return fmt.Errorf("could not taint X509 CA in datastore: %w", err)
+		}
+	}
+
+	// Intermediate is safe. Notify rotator to force rotation
+	// of tainted X.509 SVID.
+	m.c.CA.NotifyTaintedX509Authorities(taintedAuthorities)
+
+	return nil
+}
+
 func (m *Manager) notifyBundleUpdated(ctx context.Context) error {
 	var bundle *common.Bundle
 	return m.notify(ctx, "bundle updated", false,
@@ -576,17 +1038,18 @@ func (m *Manager) notify(ctx context.Context, event string, advise bool, pre fun
 		}(n)
 	}
 
-	var allErrs errs.Group
-	for i := 0; i < len(notifiers); i++ {
+	var allErrs error
+	for range notifiers {
 		// don't select on the ctx here as we can rely on the plugins to
 		// respond to context cancellation and return an error.
 		if err := <-errsCh; err != nil {
-			allErrs.Add(err)
+			allErrs = errors.Join(allErrs, err)
 		}
 	}
-	if err := allErrs.Err(); err != nil {
-		return errs.New("one or more notifiers returned an error: %v", err)
+	if allErrs != nil {
+		return fmt.Errorf("one or more notifiers returned an error: %w", allErrs)
 	}
+
 	return nil
 }
 
@@ -596,7 +1059,7 @@ func (m *Manager) fetchRequiredBundle(ctx context.Context) (*common.Bundle, erro
 		return nil, err
 	}
 	if bundle == nil {
-		return nil, errs.New("trust domain bundle is missing")
+		return nil, errors.New("trust domain bundle is missing")
 	}
 	return bundle, nil
 }
@@ -605,7 +1068,7 @@ func (m *Manager) fetchOptionalBundle(ctx context.Context) (*common.Bundle, erro
 	ds := m.c.Catalog.GetDataStore()
 	bundle, err := ds.FetchBundle(ctx, m.c.TrustDomain.IDString())
 	if err != nil {
-		return nil, errs.Wrap(err)
+		return nil, err
 	}
 	return bundle, nil
 }
@@ -630,7 +1093,12 @@ func (m *Manager) upstreamSignX509CA(ctx context.Context, signer crypto.Signer) 
 		Clock:         m.c.Clock,
 	}
 
-	caChain, err := m.upstreamClient.MintX509CA(ctx, csr, m.caTTL, validator.ValidateUpstreamX509CA)
+	var notAfter time.Time
+	caChain, err := m.upstreamClient.MintX509CA(ctx, csr, m.caTTL, func(x509CA, upstreamRoots []*x509.Certificate) error {
+		var err error
+		notAfter, err = validator.ValidateUpstreamX509CA(x509CA, upstreamRoots)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -639,6 +1107,7 @@ func (m *Manager) upstreamSignX509CA(ctx context.Context, signer crypto.Signer) 
 		Signer:        signer,
 		Certificate:   caChain[0],
 		UpstreamChain: caChain,
+		NotAfter:      notAfter,
 	}, nil
 }
 
@@ -659,17 +1128,18 @@ func (m *Manager) selfSignX509CA(ctx context.Context, signer crypto.Signer) (*ca
 		return nil, fmt.Errorf("invalid downstream X509 CA: %w", err)
 	}
 
-	if _, err := m.appendBundle(ctx, []*x509.Certificate{cert}, nil); err != nil {
+	if _, err := m.appendBundle(ctx, []*x509.Certificate{cert}, nil, nil); err != nil {
 		return nil, err
 	}
 
 	return &ca.X509CA{
 		Signer:      signer,
 		Certificate: cert,
+		NotAfter:    cert.NotAfter,
 	}, nil
 }
 
-func (m *Manager) appendBundle(ctx context.Context, caChain []*x509.Certificate, jwtSigningKeys []*common.PublicKey) (*common.Bundle, error) {
+func (m *Manager) appendBundle(ctx context.Context, caChain []*x509.Certificate, jwtSigningKeys []*common.PublicKey, witSigningKeys []*common.PublicKey) (*common.Bundle, error) {
 	var rootCAs []*common.Certificate
 	for _, caCert := range caChain {
 		rootCAs = append(rootCAs, &common.Certificate{
@@ -682,6 +1152,7 @@ func (m *Manager) appendBundle(ctx context.Context, caChain []*x509.Certificate,
 		TrustDomainId:  m.c.TrustDomain.IDString(),
 		RootCas:        rootCAs,
 		JwtSigningKeys: jwtSigningKeys,
+		WitSigningKeys: witSigningKeys,
 	})
 	if err != nil {
 		return nil, err
@@ -691,55 +1162,93 @@ func (m *Manager) appendBundle(ctx context.Context, caChain []*x509.Certificate,
 	return res, nil
 }
 
-// MaxSVIDTTL returns the maximum SVID lifetime that can be guaranteed to not
-// be cut artificially short by a scheduled rotation.
-func MaxSVIDTTL() time.Duration {
-	return activationThresholdCap
-}
-
-// MaxSVIDTTLForCATTL returns the maximum SVID TTL that can be guaranteed given
-// a specific CA TTL. In other words, given a CA TTL, what is the largest SVID
-// TTL that is guaranteed to not be cut artificially short by a scheduled
-// rotation?
-func MaxSVIDTTLForCATTL(caTTL time.Duration) time.Duration {
-	maxTTL := caTTL / activationThresholdDivisor
-	if maxTTL > activationThresholdCap {
-		maxTTL = activationThresholdCap
+func (m *Manager) shouldPrepareX509CA(taintedAuthorities []*x509.Certificate) bool {
+	slot := m.nextX509CA
+	switch {
+	case slot.IsEmpty():
+		return true
+	case slot.Status() == journal.Status_PREPARED:
+		isTainted := isX509AuthorityTainted(slot.x509CA, taintedAuthorities)
+		m.c.Log.Info("Next authority is tainted, prepare new X.509 authority")
+		return isTainted
+	default:
+		return false
 	}
-
-	return maxTTL
-}
-
-// MinCATTLForSVIDTTL returns the minimum CA TTL necessary to guarantee an SVID
-// TTL of the provided value. In other words, given an SVID TTL, what is the
-// minimum CA TTL that will guarantee that the SVIDs lifetime won't be cut
-// artificially short by a scheduled rotation?
-func MinCATTLForSVIDTTL(svidTTL time.Duration) time.Duration {
-	return svidTTL * activationThresholdDivisor
 }
 
 type bundleUpdater struct {
-	log           logrus.FieldLogger
-	trustDomainID string
-	ds            datastore.DataStore
-	updated       func()
+	log                         logrus.FieldLogger
+	trustDomainID               string
+	ds                          datastore.DataStore
+	updated                     func()
+	upstreamAuthoritiesTainted  func([]*x509.Certificate)
+	processedTaintedAuthorities map[string]struct{}
 }
 
-func (u *bundleUpdater) AppendX509Roots(ctx context.Context, roots []*x509.Certificate) error {
+func (u *bundleUpdater) SyncX509Roots(ctx context.Context, roots []*x509certificate.X509Authority) error {
 	bundle := &common.Bundle{
 		TrustDomainId: u.trustDomainID,
 		RootCas:       make([]*common.Certificate, 0, len(roots)),
 	}
 
-	for _, root := range roots {
-		bundle.RootCas = append(bundle.RootCas, &common.Certificate{
-			DerBytes: root.Raw,
-		})
-	}
-	if _, err := u.appendBundle(ctx, bundle); err != nil {
+	x509Authorities, err := u.fetchX509Authorities(ctx)
+	if err != nil {
 		return err
 	}
-	return nil
+
+	newAuthorities := make(map[string]struct{}, len(roots))
+	var taintedAuthorities []*x509.Certificate
+	for _, root := range roots {
+		skID := x509util.SubjectKeyIDToString(root.Certificate.SubjectKeyId)
+		// Collect all skIDs
+		newAuthorities[skID] = struct{}{}
+
+		// Verify if new root ca is tainted
+		if root.Tainted {
+			// Taint x.509 authority, if required
+			if found, ok := x509Authorities[skID]; ok && !found.Tainted {
+				_, alreadyProcessed := u.processedTaintedAuthorities[skID]
+				if !alreadyProcessed {
+					u.processedTaintedAuthorities[skID] = struct{}{}
+					// Add to the list of new tainted authorities
+					taintedAuthorities = append(taintedAuthorities, found.Certificate)
+					u.log.WithField(telemetry.SubjectKeyID, skID).Info("X.509 authority tainted")
+				}
+				// Prevent to add tainted keys, since status is updated before
+				continue
+			}
+		}
+
+		bundle.RootCas = append(bundle.RootCas, &common.Certificate{
+			DerBytes:   root.Certificate.Raw,
+			TaintedKey: root.Tainted,
+		})
+	}
+
+	// Notify about tainted authorities to force the rotation of
+	// intermediates and update the database. This is done in a separate thread
+	// to prevent agents and downstream servers to start the rotation before the
+	// current server starts the rotation of the intermediate.
+	if len(taintedAuthorities) > 0 {
+		u.upstreamAuthoritiesTainted(taintedAuthorities)
+	}
+
+	for skID, authority := range x509Authorities {
+		// Only tainted keys can ke revoked
+		if authority.Tainted {
+			// In case a stored tainted authority is not found,
+			// from latest bundle update, then revoke it
+			if _, found := newAuthorities[skID]; !found {
+				if err := u.ds.RevokeX509CA(ctx, u.trustDomainID, skID); err != nil {
+					return fmt.Errorf("failed to revoke a tainted key %q: %w", skID, err)
+				}
+				u.log.WithField(telemetry.SubjectKeyID, skID).Info("X.509 authority revoked")
+			}
+		}
+	}
+
+	_, err = u.appendBundle(ctx, bundle)
+	return err
 }
 
 func (u *bundleUpdater) AppendJWTKeys(ctx context.Context, keys []*common.PublicKey) ([]*common.PublicKey, error) {
@@ -753,8 +1262,45 @@ func (u *bundleUpdater) AppendJWTKeys(ctx context.Context, keys []*common.Public
 	return bundle.JwtSigningKeys, nil
 }
 
+func (u *bundleUpdater) AppendWITKeys(ctx context.Context, keys []*common.PublicKey) ([]*common.PublicKey, error) {
+	bundle, err := u.appendBundle(ctx, &common.Bundle{
+		TrustDomainId:  u.trustDomainID,
+		WitSigningKeys: keys,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return bundle.WitSigningKeys, nil
+}
+
 func (u *bundleUpdater) LogError(err error, msg string) {
 	u.log.WithError(err).Error(msg)
+}
+
+func (u *bundleUpdater) fetchX509Authorities(ctx context.Context) (map[string]*x509certificate.X509Authority, error) {
+	bundle, err := u.ds.FetchBundle(ctx, u.trustDomainID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch bundle: %w", err)
+	}
+	// Bundle not found
+	if bundle == nil {
+		return nil, nil
+	}
+
+	authorities := map[string]*x509certificate.X509Authority{}
+	for _, eachRoot := range bundle.RootCas {
+		cert, err := x509.ParseCertificate(eachRoot.DerBytes)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse root certificate: %w", err)
+		}
+
+		authorities[x509util.SubjectKeyIDToString(cert.SubjectKeyId)] = &x509certificate.X509Authority{
+			Certificate: cert,
+			Tainted:     eachRoot.TaintedKey,
+		}
+	}
+
+	return authorities, nil
 }
 
 func (u *bundleUpdater) appendBundle(ctx context.Context, bundle *common.Bundle) (*common.Bundle, error) {
@@ -773,6 +1319,19 @@ func newJWTKey(signer crypto.Signer, expiresAt time.Time) (*ca.JWTKey, error) {
 	}
 
 	return &ca.JWTKey{
+		Signer:   signer,
+		Kid:      kid,
+		NotAfter: expiresAt,
+	}, nil
+}
+
+func newWITKey(signer crypto.Signer, expiresAt time.Time) (*ca.WITKey, error) {
+	kid, err := newKeyID()
+	if err != nil {
+		return nil, err
+	}
+
+	return &ca.WITKey{
 		Signer:   signer,
 		Kid:      kid,
 		NotAfter: expiresAt,
@@ -800,7 +1359,7 @@ func keyIDFromBytes(choices []byte) string {
 func publicKeyFromJWTKey(jwtKey *ca.JWTKey) (*common.PublicKey, error) {
 	pkixBytes, err := x509.MarshalPKIXPublicKey(jwtKey.Signer.Public())
 	if err != nil {
-		return nil, errs.Wrap(err)
+		return nil, err
 	}
 
 	return &common.PublicKey{
@@ -808,4 +1367,38 @@ func publicKeyFromJWTKey(jwtKey *ca.JWTKey) (*common.PublicKey, error) {
 		Kid:       jwtKey.Kid,
 		NotAfter:  jwtKey.NotAfter.Unix(),
 	}, nil
+}
+
+func publicKeyFromWITKey(witKey *ca.WITKey) (*common.PublicKey, error) {
+	pkixBytes, err := x509.MarshalPKIXPublicKey(witKey.Signer.Public())
+	if err != nil {
+		return nil, err
+	}
+
+	return &common.PublicKey{
+		PkixBytes: pkixBytes,
+		Kid:       witKey.Kid,
+		NotAfter:  witKey.NotAfter.Unix(),
+	}, nil
+}
+
+// isX509AuthorityTainted verifies if the provided X.509 authority is tainted
+func isX509AuthorityTainted(x509CA *ca.X509CA, taintedAuthorities []*x509.Certificate) bool {
+	rootPool := x509.NewCertPool()
+	for _, taintedKey := range taintedAuthorities {
+		rootPool.AddCert(taintedKey)
+	}
+
+	intermediatePool := x509.NewCertPool()
+	for _, intermediateCA := range x509CA.UpstreamChain {
+		intermediatePool.AddCert(intermediateCA)
+	}
+
+	// Verify certificate chain, using tainted authority as root
+	_, err := x509CA.Certificate.Verify(x509.VerifyOptions{
+		Intermediates: intermediatePool,
+		Roots:         rootPool,
+	})
+
+	return err == nil
 }

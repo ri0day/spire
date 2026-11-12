@@ -3,6 +3,7 @@ package awss3
 import (
 	"bytes"
 	"context"
+	"net/url"
 	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -14,6 +15,8 @@ import (
 	"github.com/spiffe/spire-plugin-sdk/proto/spire/plugin/types"
 	configv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/service/common/config/v1"
 	"github.com/spiffe/spire/pkg/common/catalog"
+	"github.com/spiffe/spire/pkg/common/pluginconf"
+	"github.com/spiffe/spire/pkg/server/plugin/bundlepublisher/common"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -43,10 +46,68 @@ type Config struct {
 	Bucket          string `hcl:"bucket" json:"bucket"`
 	ObjectKey       string `hcl:"object_key" json:"object_key"`
 	Format          string `hcl:"format" json:"format"`
+	Endpoint        string `hcl:"endpoint" json:"endpoint"`
+	RefreshHint     string `hcl:"refresh_hint" json:"refresh_hint"`
 
 	// bundleFormat is used to store the content of Format, parsed
 	// as bundleformat.Format.
 	bundleFormat bundleformat.Format
+
+	// parsedRefreshHint is used to store the content of RefreshHint, parsed
+	// as an int64.
+	parsedRefreshHint int64
+}
+
+func buildConfig(coreConfig catalog.CoreConfig, hclText string, status *pluginconf.Status) *Config {
+	newConfig := new(Config)
+
+	if err := hcl.Decode(newConfig, hclText); err != nil {
+		status.ReportErrorf("unable to decode configuration: %v", err)
+		return nil
+	}
+
+	if newConfig.Region == "" {
+		status.ReportError("configuration is missing the region")
+	}
+	if newConfig.Bucket == "" {
+		status.ReportError("configuration is missing the bucket name")
+	}
+	if newConfig.ObjectKey == "" {
+		status.ReportError("configuration is missing the object key")
+	}
+	if newConfig.Format == "" {
+		status.ReportError("configuration is missing the bundle format")
+	}
+	if newConfig.Endpoint != "" {
+		if _, err := url.ParseRequestURI(newConfig.Endpoint); err != nil {
+			status.ReportErrorf("could not parse endpoint url: %v", err)
+		}
+	}
+
+	bundleFormat, err := bundleformat.FromString(newConfig.Format)
+	if err != nil {
+		status.ReportErrorf("could not parse bundle format from configuration: %v", err)
+	} else {
+		// This plugin only supports some bundleformats.
+		switch bundleFormat {
+		case bundleformat.JWKS:
+		case bundleformat.SPIFFE:
+		case bundleformat.PEM:
+		default:
+			status.ReportErrorf("bundle format %q is not supported", newConfig.Format)
+		}
+		newConfig.bundleFormat = bundleFormat
+	}
+
+	if newConfig.RefreshHint != "" {
+		refreshHint, err := common.ParseRefreshHint(newConfig.RefreshHint, status)
+		if err != nil {
+			status.ReportErrorf("could not parse refresh_hint: %v", err)
+		}
+		newConfig.parsedRefreshHint = refreshHint
+	}
+
+	return newConfig
 }
 
 // Plugin is the main representation of this bundle publisher plugin.
@@ -72,12 +133,15 @@ func (p *Plugin) SetLogger(log hclog.Logger) {
 
 // Configure configures the plugin.
 func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) (*configv1.ConfigureResponse, error) {
-	config, err := parseAndValidateConfig(req.HclConfiguration)
+	newConfig, notes, err := pluginconf.Build(req, buildConfig)
 	if err != nil {
 		return nil, err
 	}
+	for _, note := range notes {
+		p.log.Warn(note)
+	}
 
-	awsCfg, err := newAWSConfig(ctx, config)
+	awsCfg, err := newAWSConfig(ctx, newConfig)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to create client configuration: %v", err)
 	}
@@ -85,17 +149,28 @@ func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) 
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to create client: %v", err)
 	}
-	p.s3Client = s3Client
 
-	p.setConfig(config)
+	// Store the config and client together under one lock so that
+	// PublishBundle always observes a matching pair, even when Configure
+	// runs concurrently as a result of a dynamic reconfiguration.
+	p.setConfig(newConfig, s3Client)
 	p.setBundle(nil)
 	return &configv1.ConfigureResponse{}, nil
+}
+
+func (p *Plugin) Validate(ctx context.Context, req *configv1.ValidateRequest) (*configv1.ValidateResponse, error) {
+	_, notes, err := pluginconf.Build(req, buildConfig)
+
+	return &configv1.ValidateResponse{
+		Valid: err == nil,
+		Notes: notes,
+	}, nil
 }
 
 // PublishBundle puts the bundle in the configured S3 bucket name and
 // object key.
 func (p *Plugin) PublishBundle(ctx context.Context, req *bundlepublisherv1.PublishBundleRequest) (*bundlepublisherv1.PublishBundleResponse, error) {
-	config, err := p.getConfig()
+	config, s3Client, err := p.getConfig()
 	if err != nil {
 		return nil, err
 	}
@@ -110,13 +185,18 @@ func (p *Plugin) PublishBundle(ctx context.Context, req *bundlepublisherv1.Publi
 		return &bundlepublisherv1.PublishBundleResponse{}, nil
 	}
 
-	formatter := bundleformat.NewFormatter(req.Bundle)
+	bundleToPublish := proto.Clone(req.Bundle).(*types.Bundle)
+	if config.parsedRefreshHint != 0 {
+		bundleToPublish.RefreshHint = config.parsedRefreshHint
+	}
+
+	formatter := bundleformat.NewFormatter(bundleToPublish)
 	bundleBytes, err := formatter.Format(config.bundleFormat)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "could not format bundle: %v", err.Error())
 	}
 
-	_, err = p.s3Client.PutObject(ctx, &s3.PutObjectInput{
+	_, err = s3Client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(config.Bucket),
 		Body:   bytes.NewReader(bundleBytes),
 		Key:    aws.String(config.ObjectKey),
@@ -133,21 +213,23 @@ func (p *Plugin) PublishBundle(ctx context.Context, req *bundlepublisherv1.Publi
 
 // getBundle gets the latest bundle that the plugin has.
 func (p *Plugin) getBundle() *types.Bundle {
-	p.configMtx.RLock()
-	defer p.configMtx.RUnlock()
+	p.bundleMtx.RLock()
+	defer p.bundleMtx.RUnlock()
 
 	return p.bundle
 }
 
-// getConfig gets the configuration of the plugin.
-func (p *Plugin) getConfig() (*Config, error) {
+// getConfig gets the configuration of the plugin along with the client
+// created for it. Both are returned together so callers always observe a
+// matching pair.
+func (p *Plugin) getConfig() (*Config, simpleStorageService, error) {
 	p.configMtx.RLock()
 	defer p.configMtx.RUnlock()
 
 	if p.config == nil {
-		return nil, status.Error(codes.FailedPrecondition, "not configured")
+		return nil, nil, status.Error(codes.FailedPrecondition, "not configured")
 	}
-	return p.config, nil
+	return p.config, p.s3Client, nil
 }
 
 // setBundle updates the current bundle in the plugin with the provided bundle.
@@ -158,12 +240,14 @@ func (p *Plugin) setBundle(bundle *types.Bundle) {
 	p.bundle = bundle
 }
 
-// setConfig sets the configuration for the plugin.
-func (p *Plugin) setConfig(config *Config) {
+// setConfig sets the configuration for the plugin along with the client
+// created for it, updating both atomically under one lock.
+func (p *Plugin) setConfig(config *Config, client simpleStorageService) {
 	p.configMtx.Lock()
 	defer p.configMtx.Unlock()
 
 	p.config = config
+	p.s3Client = client
 }
 
 // builtin creates a new BundlePublisher built-in plugin.
@@ -181,46 +265,4 @@ func newPlugin(newS3ClientFunc func(c aws.Config) (simpleStorageService, error))
 			newS3ClientFunc: newS3ClientFunc,
 		},
 	}
-}
-
-// parseAndValidateConfig returns an error if any configuration provided does
-// not meet acceptable criteria
-func parseAndValidateConfig(c string) (*Config, error) {
-	config := new(Config)
-
-	if err := hcl.Decode(config, c); err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "unable to decode configuration: %v", err)
-	}
-
-	if config.Region == "" {
-		return nil, status.Error(codes.InvalidArgument, "configuration is missing the region")
-	}
-
-	if config.Bucket == "" {
-		return nil, status.Error(codes.InvalidArgument, "configuration is missing the bucket name")
-	}
-
-	if config.ObjectKey == "" {
-		return nil, status.Error(codes.InvalidArgument, "configuration is missing the object key")
-	}
-
-	if config.Format == "" {
-		return nil, status.Error(codes.InvalidArgument, "configuration is missing the bundle format")
-	}
-	bundleFormat, err := bundleformat.FromString(config.Format)
-	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "could not parse bundle format from configuration: %v", err)
-	}
-	// The bundleformat package may support formats that this plugin does not
-	// support. Validate that the format is a supported format in this plugin.
-	switch bundleFormat {
-	case bundleformat.JWKS:
-	case bundleformat.SPIFFE:
-	case bundleformat.PEM:
-	default:
-		return nil, status.Errorf(codes.InvalidArgument, "format not supported %q", config.Format)
-	}
-
-	config.bundleFormat = bundleFormat
-	return config, nil
 }

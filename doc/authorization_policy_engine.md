@@ -1,7 +1,7 @@
 # Authorization policy engine
 
 **Warning**: Use of custom authorization policies is experimental and can
-result in security degredation if not configured correctly. Please refer to
+result in security degradation if not configured correctly. Please refer to
 [this section](#extending-the-policy) for more details on extending the default
 policy.
 
@@ -85,11 +85,12 @@ The inputs that are passed into the policy are:
 - `input`: the input from the SPIRE server for the authorization call
 - `data`: the databinding from the policy data file
 
-| input field | Description                                                                                                                      | Example                                    |
-|-------------|----------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------|
-| caller      | The SPIFFE ID (if available) of the caller                                                                                       | spiffe://example.org/workload1             |
-| full_method | The full method name of the API call based on the [SPIRE API](https://github.com/spiffe/spire-api-sdk/tree/main/proto/spire/api) | /spire.api.server.svid.v1.SVID/MintJWTSVID |
-| req         | The API call request body (not available on client or bidirectional streaming RPC calls)                                         | { "filter": {} }                           |
+| input field      | Description                                                                                                                      | Example                                    |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------ |
+| caller           | The SPIFFE ID (if available) of the caller                                                                                       | spiffe://example.org/workload1             |
+| caller_file_path | The binary path (if available) of the caller                                                                                     | /spire-controller-manager                  |
+| full_method      | The full method name of the API call based on the [SPIRE API](https://github.com/spiffe/spire-api-sdk/tree/main/proto/spire/api) | /spire.api.server.svid.v1.SVID/MintJWTSVID |
+| req              | The API call request body (not available on client or bidirectional streaming RPC calls)                                         | { "filter": {} }                           |
 
 The request (`req`) is the marshalled JSON object from the [SPIRE
 api sdk](https://github.com/spiffe/spire-api-sdk/). Note that it is not
@@ -134,12 +135,12 @@ what is required to carry out the default SPIRE authorization decisions.
 
 ##### Default policy.rego
 
-The default rego policy is located [here](/pkg/server/authpolicy/policy.rego).
+The default rego policy is located in [policy.rego](/pkg/server/authpolicy/policy.rego).
 
 ##### Default policy\_data.json (databindings)
 
-The default policy\_data.json is located
-[here](/pkg/server/authpolicy/policy_data.json).
+The default policy\_data.json is located in
+[policy_data.json](/pkg/server/authpolicy/policy_data.json).
 
 The default policy data file contains a field called "apis".
 This field has a list of APIs that is current being configured with the rego
@@ -325,7 +326,7 @@ this example, we will fully lock down the ability to delete entries.
 
 This can be easily done by leveraging the set of default rules. In the default
 policy data file, there are general allow restrictions for APIs. For example,
-for the batch deletion of entries, here is the exerpt:
+for the batch deletion of entries, here is the excerpt:
 
 ```rego
 {

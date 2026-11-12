@@ -55,6 +55,9 @@ message AttestedNode {
 
     // CanReattest field (can the attestation safely be deleted and recreated automatically)
     bool can_reattest = 8;
+
+    // AgentVersion is the version of the SPIRE agent
+    string agent_version = 9;
 }
 
 /** This is a curated record that the Server uses to set up and
@@ -75,7 +78,7 @@ message RegistrationEntry {
     repeated string federates_with = 5;
     /** Entry ID */
     string entry_id = 6;
-    /** Whether or not the workload is an admin workload. Admin workloads
+    /** whether the workload is an admin workload. Admin workloads
     can use their SVID's to authenticate with the Server APIs, for
     example. */
     bool admin = 7;
@@ -96,6 +99,28 @@ message RegistrationEntry {
     string hint = 14;
     /** Time of creation, in seconds from epoch */
     int64 created_at = 15;
+    /** This nested message is reserved to contain a number of optional fields
+    controlling the various aspects of the agent's behaviour with respect to a
+    given registration entry. It serves to enable introducing and testing out new
+    tunables, without having to modify the datastore schema. Over time, some of
+    the fields contained therein may be considered eligible for their dedicated
+    attributes in the datastore. */
+    message AdditionalAttributes {
+        /** Flag indicating whether the agent should prefetch and cache X509 SVID.
+        Can be set to `true` if the workload is unlikely to request an X509 SVID.
+        This is meant to prevent unnecessary effort spent on generating SVIDs of types,
+        which are unlikely to be needed.*/
+        bool disable_x509_svid_prefetch = 1;
+        /** Flag indicating whether JWT-SVIDs issued for this entry should include
+        a "jti" (JWT ID) claim. When true, the agent bypasses the JWT-SVID cache so
+        each request yields a fresh token with a unique JTI — useful for audit trails
+        and replay protection. When false (default), behavior is backwards compatible:
+        no JTI claim, caching enabled.*/
+        bool jwt_svid_include_jti = 2;
+    }
+    optional AdditionalAttributes additional_attributes = 16;
+    /** Time to live for WIT-SVIDs generated from this entry. */
+    int32 wit_svid_ttl = 17;
 }
 
 /** The RegistrationEntryMask is used to update only selected fields of the RegistrationEntry */
@@ -113,6 +138,8 @@ message RegistrationEntryMask {
     bool store_svid = 11;
     bool jwt_svid_ttl = 12;
     bool hint = 13;
+    bool additional_attributes = 14;
+    bool wit_svid_ttl = 15;
 }
 
 
@@ -125,6 +152,7 @@ message RegistrationEntries {
 /** Certificate represents a ASN.1/DER encoded X509 certificate */
 message Certificate {
     bytes der_bytes = 1;
+    bool tainted_key = 2;
 }
 
 /** PublicKey represents a PKIX encoded public key */
@@ -138,7 +166,7 @@ message PublicKey {
     /** not after (seconds since unix epoch, 0 means "never expires") */
     int64 not_after = 3;
 
-    /** Whether or not the key is tainted */
+    /** whether the key is tainted */
     bool tainted_key = 4;
 }
 
@@ -160,13 +188,8 @@ message Bundle {
      * incremented every time the bundle is updated */
     uint64 sequence_number = 5;
 
-    /** list of X.509 tainted keys */
-    repeated X509TaintedKey x509_tainted_keys = 6;
-}
-
-message X509TaintedKey {
-        /** tainted public key*/
-	bytes public_key = 1;
+    /** list of WIT signing keys */
+    repeated PublicKey wit_signing_keys = 6;
 }
 
 message BundleMask {
@@ -175,6 +198,7 @@ message BundleMask {
     bool refresh_hint = 3;
     bool sequence_number = 4;
     bool x509_tainted_keys = 5;
+    bool wit_signing_keys = 6;
 }
 
 message AttestedNodeMask{
@@ -184,4 +208,5 @@ message AttestedNodeMask{
     bool new_cert_serial_number = 4;
     bool new_cert_not_after = 5;
     bool can_reattest = 6;
+    bool agent_version = 7;
 }

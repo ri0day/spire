@@ -1,18 +1,16 @@
 package logger_test
 
 import (
-	"io"
-	"testing"
-
-	"github.com/spiffe/spire/test/spiretest"
-
 	"bytes"
 	"context"
+	"testing"
+
+	"github.com/spiffe/spire/test/clitest"
+	"github.com/spiffe/spire/test/spiretest"
 
 	"github.com/mitchellh/cli"
 	loggerv1 "github.com/spiffe/spire-api-sdk/proto/spire/api/server/logger/v1"
 	"github.com/spiffe/spire-api-sdk/proto/spire/api/types"
-	"github.com/spiffe/spire/cmd/spire-server/cli/common"
 	commoncli "github.com/spiffe/spire/pkg/common/cli"
 	"google.golang.org/grpc"
 )
@@ -55,7 +53,7 @@ func setupCliTest(t *testing.T, server *mockLoggerService, newClient func(*commo
 		stdin:  stdin,
 		stdout: stdout,
 		stderr: stderr,
-		args:   []string{common.AddrArg, common.GetAddr(addr)},
+		args:   []string{clitest.AddrArg, clitest.GetAddr(addr)},
 		server: server,
 		client: client,
 	}
@@ -89,22 +87,4 @@ func (s *mockLoggerService) SetLogLevel(_ context.Context, req *loggerv1.SetLogL
 func (s *mockLoggerService) ResetLogLevel(context.Context, *loggerv1.ResetLogLevelRequest) (*types.Logger, error) {
 	s.receivedSetValue = nil
 	return s.returnLogger, s.returnErr
-}
-
-var _ io.Writer = &errorWriter{}
-
-type errorWriter struct {
-	ReturnError error
-	Buffer      bytes.Buffer
-}
-
-func (e *errorWriter) Write(p []byte) (n int, err error) {
-	if e.ReturnError != nil {
-		return 0, e.ReturnError
-	}
-	return e.Buffer.Write(p)
-}
-
-func (e *errorWriter) String() string {
-	return e.Buffer.String()
 }

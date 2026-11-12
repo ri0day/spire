@@ -9,19 +9,23 @@ import (
 	"time"
 
 	"github.com/andres-erbsen/clock"
-	observer "github.com/imkira/go-observer"
 	"github.com/spiffe/go-spiffe/v2/bundle/spiffebundle"
+	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/spire/pkg/agent/client"
-	"github.com/spiffe/spire/pkg/agent/common/backoff"
 	"github.com/spiffe/spire/pkg/agent/manager/cache"
 	"github.com/spiffe/spire/pkg/agent/manager/storecache"
 	"github.com/spiffe/spire/pkg/agent/storage"
 	"github.com/spiffe/spire/pkg/agent/svid"
+	"github.com/spiffe/spire/pkg/common/backoff"
+	"github.com/spiffe/spire/pkg/common/errorutil"
 	"github.com/spiffe/spire/pkg/common/nodeutil"
+	"github.com/spiffe/spire/pkg/common/observer"
 	"github.com/spiffe/spire/pkg/common/rotationutil"
 	"github.com/spiffe/spire/pkg/common/telemetry"
 	"github.com/spiffe/spire/pkg/common/util"
+	"github.com/spiffe/spire/pkg/common/version"
+	"github.com/spiffe/spire/pkg/common/x509util"
 	"github.com/spiffe/spire/pkg/server/api/limits"
 	"github.com/spiffe/spire/proto/spire/common"
 )
@@ -32,9 +36,16 @@ const (
 	synchronizeMaxIntervalMultiple = 48
 	// for larger sync interval set max interval as 8 mins
 	synchronizeMaxInterval = 8 * time.Minute
-	// default sync interval is used between retries of initial sync
-	defaultSyncInterval = 5 * time.Second
 )
+
+// DefaultSyncInterval is the interval between synchronizations with the server
+// used when none is configured. It is also the interval used between retries of
+// the initial sync.
+const DefaultSyncInterval = 5 * time.Second
+
+// ErrWITSVIDsDisabled is returned by WIT-SVID related operations when the
+// manager was not configured to enable WIT-SVIDs.
+var ErrWITSVIDsDisabled = errors.New("WIT-SVIDs are not enabled")
 
 // Manager provides cache management functionalities for agents.
 type Manager interface {
@@ -44,9 +55,23 @@ type Manager interface {
 	// Run runs the manager. It will block until the context is cancelled.
 	Run(ctx context.Context) error
 
-	// SubscribeToCacheChanges returns a Subscriber on which cache entry updates are sent
+	// SubscribeToX509CacheChanges returns a Subscriber on which cache entry updates are sent
 	// for a particular set of selectors.
-	SubscribeToCacheChanges(ctx context.Context, key cache.Selectors) (cache.Subscriber, error)
+	SubscribeToX509CacheChanges(ctx context.Context, key cache.Selectors) (cache.Subscriber[cache.X509WorkloadUpdate], error)
+
+	// SubscribeToWITCacheChanges returns a Subscriber on which cache entry updates are sent
+	// for a particular set of selectors. It fails with ErrWITSVIDsDisabled if WIT-SVIDs are
+	// not enabled.
+	SubscribeToWITCacheChanges(ctx context.Context, key cache.Selectors) (cache.Subscriber[cache.WITWorkloadUpdate], error)
+
+	// SubscribeToEntryAndBundleChanges returns a Subscriber on which the
+	// registration entries matching a particular set of selectors are sent,
+	// along with the bundles they rely on. Updates are sent each time selectors,
+	// federation relationships or bundles are changed.
+	// The first update is available as soon as the method returns. Unlike
+	// SubscribeToX509CacheChanges, it does not cause X509-SVIDs to be minted
+	// for the matching entries.
+	SubscribeToEntryAndBundleChanges(key cache.Selectors) cache.Subscriber[cache.EntriesAndBundlesUpdate]
 
 	// SubscribeToSVIDChanges returns a new observer.Stream on which svid.State instances are received
 	// each time an SVID rotation finishes.
@@ -66,64 +91,43 @@ type Manager interface {
 	// SetRotationFinishedHook sets a hook that will be called when a rotation finished
 	SetRotationFinishedHook(func())
 
-	// MatchingRegistrationEntries returns all of the cached registration entries whose
+	// MatchingRegistrationEntries returns all the cached registration entries whose
 	// selectors are a subset of the passed selectors.
 	MatchingRegistrationEntries(selectors []*common.Selector) []*common.RegistrationEntry
 
 	// FetchWorkloadUpdates gets the latest workload update for the selectors
-	FetchWorkloadUpdate(selectors []*common.Selector) *cache.WorkloadUpdate
+	FetchWorkloadUpdate(selectors []*common.Selector) *cache.X509WorkloadUpdate
+
+	// FetchEntriesAndBundles gets the registration entries matching the
+	// selectors, along with the bundles they rely on. Unlike
+	// FetchWorkloadUpdate, it does not depend on X509-SVIDs having been minted
+	// for the matching entries.
+	FetchEntriesAndBundles(selectors []*common.Selector) *cache.EntriesAndBundlesUpdate
 
 	// FetchJWTSVID returns a JWT SVID for the specified SPIFFEID and audience. If there
 	// is no JWT cached, the manager will get one signed upstream.
 	FetchJWTSVID(ctx context.Context, entry *common.RegistrationEntry, audience []string) (*client.JWTSVID, error)
 
-	// CountSVIDs returns the amount of X509 SVIDs on memory
-	CountSVIDs() int
+	// CountX509SVIDs returns the amount of X509 SVIDs on memory
+	CountX509SVIDs() int
+
+	// CountJWTSVIDs returns the amount of JWT SVIDs on memory
+	CountJWTSVIDs() int
+
+	// CountSVIDStoreX509SVIDs returns the amount of x509 SVIDs on SVIDStore in-memory cache
+	CountSVIDStoreX509SVIDs() int
 
 	// GetLastSync returns the last successful rotation timestamp
 	GetLastSync() time.Time
 
 	// GetBundle get latest cached bundle
 	GetBundle() *cache.Bundle
-}
 
-// Cache stores each registration entry, signed X509-SVIDs for those entries,
-// bundles, and JWT SVIDs for the agent.
-type Cache interface {
-	SVIDCache
+	// GetBundles gets the latest cached bundles for all trust domains.
+	GetBundles() map[spiffeid.TrustDomain]*cache.Bundle
 
-	// Bundle gets latest cached bundle
-	Bundle() *spiffebundle.Bundle
-
-	// SyncSVIDsWithSubscribers syncs SVID cache
-	SyncSVIDsWithSubscribers()
-
-	// SubscribeToWorkloadUpdates creates a subscriber for given selector set.
-	SubscribeToWorkloadUpdates(ctx context.Context, selectors cache.Selectors) (cache.Subscriber, error)
-
-	// SubscribeToBundleChanges creates a stream for providing bundle changes
-	SubscribeToBundleChanges() *cache.BundleStream
-
-	// MatchingRegistrationEntries with given selectors
-	MatchingRegistrationEntries(selectors []*common.Selector) []*common.RegistrationEntry
-
-	// CountSVIDs in cache stored
-	CountSVIDs() int
-
-	// FetchWorkloadUpdate for given selectors
-	FetchWorkloadUpdate(selectors []*common.Selector) *cache.WorkloadUpdate
-
-	// GetJWTSVID provides JWT-SVID
-	GetJWTSVID(id spiffeid.ID, audience []string) (*client.JWTSVID, bool)
-
-	// SetJWTSVID adds JWT-SVID to cache
-	SetJWTSVID(id spiffeid.ID, audience []string, svid *client.JWTSVID)
-
-	// Entries get all registration entries
-	Entries() []*common.RegistrationEntry
-
-	// Identities get all identities in cache
-	Identities() []cache.Identity
+	// GetX509Bundle returns an X509 bundle source
+	GetX509Bundle() x509bundle.Source
 }
 
 type manager struct {
@@ -131,20 +135,30 @@ type manager struct {
 
 	// Fields protected by mtx mutex.
 	mtx *sync.RWMutex
-	// Protects multiple goroutines from requesting SVID signings at the same time
+	// Serializes SVID signings with each other and with cache entry updates
 	updateSVIDMu sync.RWMutex
 
-	cache Cache
-	svid  svid.Rotator
+	bundleCache *cache.BundleCache
+	x509Cache   *cache.X509SVIDLRUCache
+	// witCache is nil unless WIT-SVIDs are enabled
+	witCache *cache.WITLRUCache
+	jwtCache *cache.JWTSVIDCache
+	svid     svid.Rotator
 
 	storage storage.Storage
 
 	// synchronizeBackoff calculator for fetch interval, backing off if error is returned on
 	// fetch attempt
 	synchronizeBackoff backoff.BackOff
-	svidSyncBackoff    backoff.BackOff
+	// X509 and WIT SVID minting use independent retry schedules so failures in
+	// the optional WIT profile do not delay X509-SVID issuance.
+	x509SVIDSyncBackoff backoff.BackOff
+	witSVIDSyncBackoff  backoff.BackOff
 	// csrSizeLimitedBackoff backs off the number of csrs if error is returned on fetch svid attempt
 	csrSizeLimitedBackoff backoff.SizeLimitedBackOff
+	// witSizeLimitedBackoff backs off the number of WIT-SVIDs requested at once if an error
+	// is returned on a fetch attempt
+	witSizeLimitedBackoff backoff.SizeLimitedBackOff
 
 	client client.Client
 
@@ -162,22 +176,60 @@ type manager struct {
 	// cache.
 	syncedEntries map[string]*common.RegistrationEntry
 	syncedBundles map[string]*common.Bundle
+
+	// processedTaintedX509Authorities holds all the already processed tainted X.509 Authorities
+	// to prevent processing them again.
+	processedTaintedX509Authorities map[string]struct{}
+
+	// processedTaintedJWTAuthorities holds all the already processed tainted JWT Authorities
+	// to prevent processing them again.
+	processedTaintedJWTAuthorities map[string]struct{}
+}
+
+func newSynchronizeBackoff(clk clock.Clock, syncInterval time.Duration, c *SyncRetryBackoffConfig) backoff.BackOff {
+	maxInterval := EffectiveSyncRetryMaxInterval(syncInterval, c)
+
+	var opts []backoff.Options
+	if c != nil {
+		if c.Multiplier != nil {
+			opts = append(opts, backoff.WithMultiplier(*c.Multiplier))
+		}
+		if c.Jitter != nil {
+			opts = append(opts, backoff.WithRandomizationFactor(*c.Jitter))
+		}
+	}
+
+	return backoff.NewBackoff(clk, syncInterval, append(opts, backoff.WithMaxInterval(maxInterval))...)
 }
 
 func (m *manager) Initialize(ctx context.Context) error {
 	m.storeSVID(m.svid.State().SVID, m.svid.State().Reattestable)
-	m.storeBundle(m.cache.Bundle())
+	m.storeBundle(m.bundleCache.Bundle())
 
-	// upper limit of backoff is 8 mins
-	synchronizeBackoffMaxInterval := min(synchronizeMaxInterval, synchronizeMaxIntervalMultiple*m.c.SyncInterval)
-
-	m.synchronizeBackoff = backoff.NewBackoff(m.clk, m.c.SyncInterval, backoff.WithMaxInterval(synchronizeBackoffMaxInterval))
-	m.svidSyncBackoff = backoff.NewBackoff(m.clk, cache.SVIDSyncInterval, backoff.WithMaxInterval(maxSVIDSyncInterval))
+	m.synchronizeBackoff = newSynchronizeBackoff(m.clk, m.c.SyncInterval, m.c.SyncRetryBackoff)
+	m.x509SVIDSyncBackoff = backoff.NewBackoff(m.clk, cache.SVIDSyncInterval, backoff.WithMaxInterval(maxSVIDSyncInterval))
+	if m.witCache != nil {
+		m.witSVIDSyncBackoff = backoff.NewBackoff(m.clk, cache.SVIDSyncInterval, backoff.WithMaxInterval(maxSVIDSyncInterval))
+	}
 	m.csrSizeLimitedBackoff = backoff.NewSizeLimitedBackOff(limits.SignLimitPerIP)
+	m.witSizeLimitedBackoff = backoff.NewSizeLimitedBackOff(limits.SignLimitPerIP)
 	m.syncedEntries = make(map[string]*common.RegistrationEntry)
 	m.syncedBundles = make(map[string]*common.Bundle)
 
+	// Post agent status with version information to the server
+	if err := m.client.PostStatus(ctx, version.Version()); err != nil {
+		// Log the error but don't fail initialization - the server may not support this yet
+		m.c.Log.WithField(telemetry.AgentVersion, version.Version()).WithError(err).Error("Failed to post agent status")
+	}
+
 	err := m.synchronize(ctx)
+	if err == nil && m.witCache != nil {
+		// WIT-SVIDs are optional. Attempt the initial mint so they are available
+		// immediately, but leave failures to the independent WIT retry loop.
+		if witErr := m.syncWITSVIDs(ctx); witErr != nil {
+			m.c.Log.WithError(witErr).Error("WIT-SVID sync failed")
+		}
+	}
 	if nodeutil.ShouldAgentReattest(err) {
 		m.c.Log.WithError(err).Error("Agent needs to re-attest: removing SVID and shutting down")
 		m.deleteSVID()
@@ -192,33 +244,55 @@ func (m *manager) Initialize(ctx context.Context) error {
 func (m *manager) Run(ctx context.Context) error {
 	defer m.client.Release()
 
-	err := util.RunTasks(ctx,
-		m.runSynchronizer,
-		m.runSyncSVIDs,
-		m.runSVIDObserver,
-		m.runBundleObserver,
-		m.svid.Run)
+	for {
+		tasks := []func(context.Context) error{
+			m.runSynchronizer,
+			m.runSyncX509SVIDs,
+			m.runSVIDObserver,
+			m.runBundleObserver,
+			m.svid.Run,
+		}
+		if m.witCache != nil {
+			tasks = append(tasks, m.runSyncWITSVIDs)
+		}
+		err := util.RunTasks(ctx, tasks...)
 
-	switch {
-	case err == nil || errors.Is(err, context.Canceled):
-		m.c.Log.Info("Cache manager stopped")
-		return nil
-	case nodeutil.ShouldAgentReattest(err):
-		m.c.Log.WithError(err).Warn("Agent needs to re-attest; removing SVID and shutting down")
-		m.deleteSVID()
-		return err
-	case nodeutil.ShouldAgentShutdown(err):
-		m.c.Log.WithError(err).Warn("Agent is banned: removing SVID and shutting down")
-		m.deleteSVID()
-		return err
-	default:
-		m.c.Log.WithError(err).Error("Cache manager crashed")
-		return err
+		switch {
+		case err == nil || errors.Is(err, context.Canceled) || errorutil.IsSIGINTOrSIGTERMError(err):
+			m.c.Log.Info("Cache manager stopped")
+			return nil
+		case nodeutil.ShouldAgentReattest(err):
+			m.c.Log.WithError(err).Warn("Agent needs to re-attest; will attempt to re-attest")
+			reattestError := m.svid.Reattest(ctx)
+			if reattestError != nil {
+				m.c.Log.WithError(reattestError).Error("Agent failed re-attestation; removing SVID and shutting down")
+				m.deleteSVID()
+				return err
+			}
+		case nodeutil.ShouldAgentShutdown(err):
+			m.c.Log.WithError(err).Warn("Agent is banned: removing SVID and shutting down")
+			m.deleteSVID()
+			return err
+		default:
+			m.c.Log.WithError(err).Error("Cache manager crashed")
+			return err
+		}
 	}
 }
 
-func (m *manager) SubscribeToCacheChanges(ctx context.Context, selectors cache.Selectors) (cache.Subscriber, error) {
-	return m.cache.SubscribeToWorkloadUpdates(ctx, selectors)
+func (m *manager) SubscribeToX509CacheChanges(ctx context.Context, selectors cache.Selectors) (cache.Subscriber[cache.X509WorkloadUpdate], error) {
+	return m.x509Cache.SubscribeToWorkloadUpdates(ctx, selectors)
+}
+
+func (m *manager) SubscribeToWITCacheChanges(ctx context.Context, selectors cache.Selectors) (cache.Subscriber[cache.WITWorkloadUpdate], error) {
+	if m.witCache == nil {
+		return nil, ErrWITSVIDsDisabled
+	}
+	return m.witCache.SubscribeToWorkloadUpdates(ctx, selectors)
+}
+
+func (m *manager) SubscribeToEntryAndBundleChanges(selectors cache.Selectors) cache.Subscriber[cache.EntriesAndBundlesUpdate] {
+	return m.x509Cache.SubscribeToEntryAndBundleUpdates(selectors)
 }
 
 func (m *manager) SubscribeToSVIDChanges() observer.Stream {
@@ -226,7 +300,7 @@ func (m *manager) SubscribeToSVIDChanges() observer.Stream {
 }
 
 func (m *manager) SubscribeToBundleChanges() *cache.BundleStream {
-	return m.cache.SubscribeToBundleChanges()
+	return m.bundleCache.SubscribeToBundleChanges()
 }
 
 func (m *manager) GetRotationMtx() *sync.RWMutex {
@@ -242,31 +316,56 @@ func (m *manager) SetRotationFinishedHook(f func()) {
 }
 
 func (m *manager) MatchingRegistrationEntries(selectors []*common.Selector) []*common.RegistrationEntry {
-	return m.cache.MatchingRegistrationEntries(selectors)
+	return m.x509Cache.MatchingRegistrationEntries(selectors)
 }
 
-func (m *manager) CountSVIDs() int {
-	return m.cache.CountSVIDs()
+func (m *manager) CountX509SVIDs() int {
+	return m.x509Cache.CountSVIDs()
+}
+
+func (m *manager) CountJWTSVIDs() int {
+	return m.jwtCache.CountJWTSVIDs()
+}
+
+func (m *manager) CountSVIDStoreX509SVIDs() int {
+	return m.svidStoreCache.CountX509SVIDs()
 }
 
 // FetchWorkloadUpdates gets the latest workload update for the selectors
-func (m *manager) FetchWorkloadUpdate(selectors []*common.Selector) *cache.WorkloadUpdate {
-	return m.cache.FetchWorkloadUpdate(selectors)
+func (m *manager) FetchWorkloadUpdate(selectors []*common.Selector) *cache.X509WorkloadUpdate {
+	return m.x509Cache.FetchWorkloadUpdate(selectors)
+}
+
+func (m *manager) FetchEntriesAndBundles(selectors []*common.Selector) *cache.EntriesAndBundlesUpdate {
+	return m.x509Cache.FetchEntriesAndBundles(selectors)
 }
 
 func (m *manager) FetchJWTSVID(ctx context.Context, entry *common.RegistrationEntry, audience []string) (*client.JWTSVID, error) {
 	spiffeID, err := spiffeid.FromString(entry.SpiffeId)
 	if err != nil {
-		return nil, errors.New("Invalid SPIFFE ID: " + err.Error())
+		return nil, fmt.Errorf("invalid SPIFFE ID: %w", err)
 	}
+
+	// When the entry opts into a JTI claim, every request must yield a fresh token,
+	// so the JWT-SVID cache is bypassed.
+	bypassCache := entry.GetAdditionalAttributes().GetJwtSvidIncludeJti()
 
 	now := m.clk.Now()
-	cachedSVID, ok := m.cache.GetJWTSVID(spiffeID, audience)
-	if ok && !m.c.RotationStrategy.JWTSVIDExpiresSoon(cachedSVID, now) {
-		return cachedSVID, nil
+	var cachedSVID *client.JWTSVID
+	var ok bool
+	if !bypassCache {
+		cachedSVID, ok = m.jwtCache.GetJWTSVID(spiffeID, audience)
+		if ok && !m.c.RotationStrategy.JWTSVIDExpiresSoon(cachedSVID, now) {
+			return cachedSVID, nil
+		}
 	}
 
-	newSVID, err := m.client.NewJWTSVID(ctx, entry.EntryId, audience)
+	// Determine if an unexpired JWT-SVID exists in the cache to pass
+	// to NewJWTSVID method. If this is true, we'll fall back to the
+	// cache hit more quickly rather than wait longer for the Server
+	isCacheHit := ok && !rotationutil.JWTSVIDExpired(cachedSVID, now)
+
+	newSVID, svidSPIFFEID, err := m.client.NewJWTSVID(ctx, entry.EntryId, audience, isCacheHit)
 	switch {
 	case err == nil:
 	case cachedSVID == nil:
@@ -278,12 +377,14 @@ func (m *manager) FetchJWTSVID(ctx context.Context, entry *common.RegistrationEn
 		return cachedSVID, nil
 	}
 
-	m.cache.SetJWTSVID(spiffeID, audience, newSVID)
+	if !bypassCache {
+		m.jwtCache.SetJWTSVID(svidSPIFFEID, audience, newSVID)
+	}
 	return newSVID, nil
 }
 
 func (m *manager) runSynchronizer(ctx context.Context) error {
-	syncInterval := min(m.synchronizeBackoff.NextBackOff(), defaultSyncInterval)
+	syncInterval := min(m.synchronizeBackoff.NextBackOff(), DefaultSyncInterval)
 	for {
 		select {
 		case <-m.clk.After(syncInterval):
@@ -292,10 +393,37 @@ func (m *manager) runSynchronizer(ctx context.Context) error {
 		}
 
 		err := m.synchronize(ctx)
+		if err == nil {
+			err = m.c.TrustBundleSources.SetSuccessIfRunning()
+			if err != nil {
+				return err
+			}
+		}
 		switch {
-		case nodeutil.IsUnknownAuthorityError(err):
-			m.c.Log.WithError(err).Info("Synchronize failed, non-recoverable error")
-			return fmt.Errorf("failed to sync with SPIRE Server: %w", err)
+		case x509util.IsUnknownAuthorityError(err):
+			if m.c.RebootstrapMode == "never" {
+				m.c.Log.WithError(err).Info("Synchronize failed, non-recoverable error")
+				return fmt.Errorf("failed to sync with SPIRE Server: %w", err)
+			}
+			startTime, err := m.c.TrustBundleSources.GetStartTime()
+			if err != nil {
+				return err
+			}
+			seconds := time.Since(startTime)
+			if seconds < m.c.RebootstrapDelay {
+				m.c.Log.WithField("time_left", m.c.RebootstrapDelay-seconds).Info("Trust Bundle and Server don't agree, ignoring for now")
+			} else {
+				m.c.Log.Warn("Trust Bundle and Server don't agree, rebootstrapping")
+				err = m.c.TrustBundleSources.SetForceRebootstrap()
+				if err != nil {
+					return err
+				}
+				return errors.New("shutting down for rebootstrapping")
+			}
+			m.synchronizeBackoff.Reset()
+			syncInterval = m.synchronizeBackoff.NextBackOff()
+			syncInterval = min(syncInterval, DefaultSyncInterval)
+			continue
 		case err != nil && nodeutil.ShouldAgentReattest(err):
 			fallthrough
 		case nodeutil.ShouldAgentShutdown(err):
@@ -311,28 +439,47 @@ func (m *manager) runSynchronizer(ctx context.Context) error {
 
 			// Clamp the sync interval to the default value when the agent doesn't have any SVIDs cached
 			// AND the previous sync request succeeded
-			if m.cache.CountSVIDs() == 0 {
-				syncInterval = min(syncInterval, defaultSyncInterval)
+			if m.x509Cache.CountSVIDs() == 0 {
+				syncInterval = min(syncInterval, DefaultSyncInterval)
 			}
 		}
 	}
 }
 
-func (m *manager) runSyncSVIDs(ctx context.Context) error {
+func (m *manager) runSyncX509SVIDs(ctx context.Context) error {
 	for {
 		select {
-		case <-m.clk.After(m.svidSyncBackoff.NextBackOff()):
+		case <-m.clk.After(m.x509SVIDSyncBackoff.NextBackOff()):
 		case <-ctx.Done():
 			return nil
 		}
 
-		err := m.syncSVIDs(ctx)
+		err := m.syncX509SVIDs(ctx)
 		switch {
 		case err != nil:
 			// Just log the error and wait for next synchronization
 			m.c.Log.WithError(err).Error("SVID sync failed")
 		default:
-			m.svidSyncBackoff.Reset()
+			m.x509SVIDSyncBackoff.Reset()
+		}
+	}
+}
+
+func (m *manager) runSyncWITSVIDs(ctx context.Context) error {
+	for {
+		select {
+		case <-m.clk.After(m.witSVIDSyncBackoff.NextBackOff()):
+		case <-ctx.Done():
+			return nil
+		}
+
+		err := m.syncWITSVIDs(ctx)
+		switch {
+		case err != nil:
+			// Just log the error and wait for next synchronization
+			m.c.Log.WithError(err).Error("WIT-SVID sync failed")
+		default:
+			m.witSVIDSyncBackoff.Reset()
 		}
 	}
 }
@@ -352,10 +499,15 @@ func (m *manager) GetLastSync() time.Time {
 }
 
 func (m *manager) GetBundle() *cache.Bundle {
-	m.mtx.RLock()
-	defer m.mtx.RUnlock()
+	return m.bundleCache.Bundle()
+}
 
-	return m.cache.Bundle()
+func (m *manager) GetBundles() map[spiffeid.TrustDomain]*cache.Bundle {
+	return m.bundleCache.Bundles()
+}
+
+func (m *manager) GetX509Bundle() x509bundle.Source {
+	return m.bundleCache
 }
 
 func (m *manager) runSVIDObserver(ctx context.Context) error {

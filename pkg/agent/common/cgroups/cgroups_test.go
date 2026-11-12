@@ -1,10 +1,9 @@
 package cgroups
 
 import (
-	"io"
 	"os"
-	"strings"
 	"testing"
+	"testing/fstest"
 
 	"github.com/stretchr/testify/require"
 )
@@ -23,9 +22,21 @@ const (
 2:blkio:/user.slice
 1:name=systemd:/user.slice/user-1000.slice/session-2.scope
 `
-	// cgBadFormat is a malformed set of cgroup entries (no slash separator)
+	// cgBadFormat is a malformed set of cgroup entries (missing cgroup-path)
 	cgBadFormat = `11:hugetlb
 `
+	// cgUnified is a good set of cgroup entries including unified
+	cgUnified = `10:devices:/user.slice
+9:net_cls,net_prio:/
+8:blkio:/
+7:freezer:/
+6:perf_event:/
+5:cpuset:/
+4:memory:/user.slice
+3:pids:/user.slice/user-1000.slice/user@1000.service
+2:cpu,cpuacct:/
+1:name=systemd:/user.slice/user-1000.slice/user@1000.service/gnome-terminal-server.service
+0::/user.slice/user-1000.slice/user@1000.service/gnome-terminal-server.service`
 )
 
 var (
@@ -42,13 +53,25 @@ var (
 		{"2", "blkio", "/user.slice"},
 		{"1", "name=systemd", "/user.slice/user-1000.slice/session-2.scope"},
 	}
+
+	expectUnifiedCgroup = []Cgroup{
+		{"10", "devices", "/user.slice"},
+		{"9", "net_cls,net_prio", "/"},
+		{"8", "blkio", "/"},
+		{"7", "freezer", "/"},
+		{"6", "perf_event", "/"},
+		{"5", "cpuset", "/"},
+		{"4", "memory", "/user.slice"},
+		{"3", "pids", "/user.slice/user-1000.slice/user@1000.service"},
+		{"2", "cpu,cpuacct", "/"},
+		{"1", "name=systemd", "/user.slice/user-1000.slice/user@1000.service/gnome-terminal-server.service"},
+		{"0", "", "/user.slice/user-1000.slice/user@1000.service/gnome-terminal-server.service"},
+	}
 )
 
 func TestCgroups(t *testing.T) {
-	cgroups, err := GetCgroups(123, FakeFileSystem{
-		Files: map[string]string{
-			"/proc/123/cgroup": cgSimple,
-		},
+	cgroups, err := GetCgroups(123, fstest.MapFS{
+		"proc/123/cgroup": {Data: []byte(cgSimple)},
 	})
 	require.NoError(t, err)
 	require.Len(t, cgroups, 11)
@@ -56,29 +79,24 @@ func TestCgroups(t *testing.T) {
 }
 
 func TestCgroupsNotFound(t *testing.T) {
-	cgroups, err := GetCgroups(123, FakeFileSystem{})
+	cgroups, err := GetCgroups(123, fstest.MapFS{})
 	require.True(t, os.IsNotExist(err))
 	require.Nil(t, cgroups)
 }
 
 func TestCgroupsBadFormat(t *testing.T) {
-	cgroups, err := GetCgroups(123, FakeFileSystem{
-		Files: map[string]string{
-			"/proc/123/cgroup": cgBadFormat,
-		},
+	cgroups, err := GetCgroups(123, fstest.MapFS{
+		"proc/123/cgroup": {Data: []byte(cgBadFormat)},
 	})
-	require.EqualError(t, err, `cgroup entry contains 2 colons, but expected at least 2 colons: "11:hugetlb"`)
+	require.EqualError(t, err, `invalid cgroup entry, contains 2 colon separated fields but expected at least 3: "11:hugetlb"`)
 	require.Nil(t, cgroups)
 }
 
-type FakeFileSystem struct {
-	Files map[string]string
-}
-
-func (fs FakeFileSystem) Open(path string) (io.ReadCloser, error) {
-	data, ok := fs.Files[path]
-	if !ok {
-		return nil, os.ErrNotExist
-	}
-	return io.NopCloser(strings.NewReader(data)), nil
+func TestUnifiedCgroups(t *testing.T) {
+	cgroups, err := GetCgroups(1234, fstest.MapFS{
+		"proc/1234/cgroup": {Data: []byte(cgUnified)},
+	})
+	require.NoError(t, err)
+	require.Len(t, cgroups, 11)
+	require.Equal(t, expectUnifiedCgroup, cgroups)
 }

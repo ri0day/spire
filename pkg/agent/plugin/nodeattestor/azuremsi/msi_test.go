@@ -7,10 +7,12 @@ import (
 	"net/http"
 	"testing"
 
-	jose "github.com/go-jose/go-jose/v3"
-	"github.com/go-jose/go-jose/v3/jwt"
+	jose "github.com/go-jose/go-jose/v4"
+	"github.com/go-jose/go-jose/v4/jwt"
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/spire/pkg/agent/plugin/nodeattestor"
 	nodeattestortest "github.com/spiffe/spire/pkg/agent/plugin/nodeattestor/test"
+	"github.com/spiffe/spire/pkg/common/catalog"
 	"github.com/spiffe/spire/pkg/common/plugin/azure"
 	"github.com/spiffe/spire/test/plugintest"
 	"github.com/spiffe/spire/test/spiretest"
@@ -49,7 +51,12 @@ func (s *MSIAttestorSuite) TestAidAttestationNotConfigured() {
 func (s *MSIAttestorSuite) TestAidAttestationFailedToObtainToken() {
 	s.tokenErr = errors.New("FAILED")
 
-	attestor := s.loadAttestor(plugintest.Configure(""))
+	attestor := s.loadAttestor(
+		plugintest.CoreConfig(catalog.CoreConfig{
+			TrustDomain: spiffeid.RequireTrustDomainFromString("example.org"),
+		}),
+		plugintest.Configure(""),
+	)
 	err := attestor.Attest(context.Background(), streamBuilder.Build())
 	s.RequireGRPCStatus(err, codes.Internal, "nodeattestor(azure_msi): unable to fetch token: FAILED")
 }
@@ -57,9 +64,14 @@ func (s *MSIAttestorSuite) TestAidAttestationFailedToObtainToken() {
 func (s *MSIAttestorSuite) TestAidAttestationSuccess() {
 	s.token = s.makeAccessToken("PRINCIPALID", "TENANTID")
 
-	expectPayload := []byte(fmt.Sprintf(`{"token":%q}`, s.token))
+	expectPayload := fmt.Appendf(nil, `{"token":%q}`, s.token)
 
-	attestor := s.loadAttestor(plugintest.Configure(""))
+	attestor := s.loadAttestor(
+		plugintest.CoreConfig(catalog.CoreConfig{
+			TrustDomain: spiffeid.RequireTrustDomainFromString("example.org"),
+		}),
+		plugintest.Configure(""),
+	)
 	err := attestor.Attest(context.Background(), streamBuilder.ExpectAndBuild(expectPayload))
 	s.Require().NoError(err)
 }
@@ -67,15 +79,33 @@ func (s *MSIAttestorSuite) TestAidAttestationSuccess() {
 func (s *MSIAttestorSuite) TestConfigure() {
 	// malformed configuration
 	var err error
-	s.loadAttestor(plugintest.CaptureConfigureError(&err), plugintest.Configure("blah"))
+	s.loadAttestor(
+		plugintest.CaptureConfigureError(&err),
+		plugintest.CoreConfig(catalog.CoreConfig{
+			TrustDomain: spiffeid.RequireTrustDomainFromString("example.org"),
+		}),
+		plugintest.Configure("blah"),
+	)
 	s.RequireGRPCStatusContains(err, codes.InvalidArgument, "unable to decode configuration")
 
 	// success
-	s.loadAttestor(plugintest.CaptureConfigureError(&err), plugintest.Configure(""))
+	s.loadAttestor(
+		plugintest.CaptureConfigureError(&err),
+		plugintest.CoreConfig(catalog.CoreConfig{
+			TrustDomain: spiffeid.RequireTrustDomainFromString("example.org"),
+		}),
+		plugintest.Configure(""),
+	)
 	s.Require().NoError(err)
 
 	// success with resource_id
-	s.loadAttestor(plugintest.CaptureConfigureError(&err), plugintest.Configure(`resource_id = "foo"`))
+	s.loadAttestor(
+		plugintest.CaptureConfigureError(&err),
+		plugintest.CoreConfig(catalog.CoreConfig{
+			TrustDomain: spiffeid.RequireTrustDomainFromString("example.org"),
+		}),
+		plugintest.Configure(`resource_id = "foo"`),
+	)
 	s.Require().NoError(err)
 }
 
@@ -99,17 +129,16 @@ func (s *MSIAttestorSuite) loadAttestor(options ...plugintest.Option) nodeattest
 
 func (s *MSIAttestorSuite) makeAccessToken(principalID, tenantID string) string {
 	claims := azure.MSITokenClaims{
-		Claims: jwt.Claims{
-			Subject: principalID,
-		},
+		Subject:  principalID,
 		TenantID: tenantID,
 	}
 
-	signingKey := jose.SigningKey{Algorithm: jose.HS256, Key: []byte("KEY")}
+	key := make([]byte, 256)
+	signingKey := jose.SigningKey{Algorithm: jose.HS256, Key: key}
 	signer, err := jose.NewSigner(signingKey, nil)
 	s.Require().NoError(err)
 
-	token, err := jwt.Signed(signer).Claims(claims).CompactSerialize()
+	token, err := jwt.Signed(signer).Claims(claims).Serialize()
 	s.Require().NoError(err)
 	return token
 }

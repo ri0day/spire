@@ -4,13 +4,15 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"net"
+	"os"
 	"reflect"
-	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	proxyproto "github.com/pires/go-proxyproto"
 	"github.com/sirupsen/logrus/hooks/test"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
@@ -19,14 +21,17 @@ import (
 	bundlev1 "github.com/spiffe/spire-api-sdk/proto/spire/api/server/bundle/v1"
 	debugv1 "github.com/spiffe/spire-api-sdk/proto/spire/api/server/debug/v1"
 	entryv1 "github.com/spiffe/spire-api-sdk/proto/spire/api/server/entry/v1"
+	localauthorityv1 "github.com/spiffe/spire-api-sdk/proto/spire/api/server/localauthority/v1"
 	loggerv1 "github.com/spiffe/spire-api-sdk/proto/spire/api/server/logger/v1"
 	svidv1 "github.com/spiffe/spire-api-sdk/proto/spire/api/server/svid/v1"
 	trustdomainv1 "github.com/spiffe/spire-api-sdk/proto/spire/api/server/trustdomain/v1"
 	"github.com/spiffe/spire-api-sdk/proto/spire/api/types"
+	"github.com/spiffe/spire/pkg/common/tlspolicy"
 	"github.com/spiffe/spire/pkg/common/util"
 	"github.com/spiffe/spire/pkg/server/authpolicy"
 	"github.com/spiffe/spire/pkg/server/ca/manager"
 	"github.com/spiffe/spire/pkg/server/cache/entrycache"
+	"github.com/spiffe/spire/pkg/server/cache/nodecache"
 	"github.com/spiffe/spire/pkg/server/datastore"
 	"github.com/spiffe/spire/pkg/server/endpoints/bundle"
 	"github.com/spiffe/spire/pkg/server/svid"
@@ -87,20 +92,24 @@ func TestNew(t *testing.T) {
 	serverCA := fakeserverca.New(t, testTD, nil)
 
 	endpoints, err := New(ctx, Config{
-		TCPAddr:          tcpAddr,
-		LocalAddr:        localAddr,
-		SVIDObserver:     svidObserver,
-		TrustDomain:      testTD,
-		Catalog:          cat,
-		ServerCA:         serverCA,
-		BundleEndpoint:   bundle.EndpointConfig{Address: tcpAddr},
-		JWTKeyPublisher:  &fakeJWTKeyPublisher{},
-		Log:              log,
-		RootLog:          log,
-		Metrics:          metrics,
-		RateLimit:        rateLimit,
-		Clock:            clk,
-		AuthPolicyEngine: pe,
+		TCPAddr:                  tcpAddr,
+		LocalAddr:                localAddr,
+		SVIDObserver:             svidObserver,
+		TrustDomain:              testTD,
+		Catalog:                  cat,
+		ServerCA:                 serverCA,
+		BundleEndpoint:           bundle.EndpointConfig{Address: tcpAddr},
+		AuthorityManager:         &fakeAuthorityManager{},
+		Log:                      log,
+		RootLog:                  log,
+		Metrics:                  metrics,
+		RateLimit:                rateLimit,
+		Clock:                    clk,
+		AuthPolicyEngine:         pe,
+		AuditLogExcludeAgentSync: true,
+		TLSPolicy: tlspolicy.Policy{
+			RequirePQKEM: true,
+		},
 	})
 	require.NoError(t, err)
 	assert.Equal(t, tcpAddr, endpoints.TCPAddr)
@@ -115,10 +124,24 @@ func TestNew(t *testing.T) {
 	assert.NotNil(t, endpoints.APIServers.LoggerServer)
 	assert.NotNil(t, endpoints.APIServers.SVIDServer)
 	assert.NotNil(t, endpoints.BundleEndpointServer)
+	assert.NotNil(t, endpoints.APIServers.LocalAUthorityServer)
 	assert.NotNil(t, endpoints.EntryFetcherPruneEventsTask)
+	assert.True(t, endpoints.TLSPolicy.RequirePQKEM)
+	assert.True(t, endpoints.AuditLogExcludeAgentSync)
 	assert.Equal(t, cat.GetDataStore(), endpoints.DataStore)
 	assert.Equal(t, log, endpoints.Log)
 	assert.Equal(t, metrics, endpoints.Metrics)
+}
+
+func TestEndpointsListenerTLSConfigEmptyPolicy(t *testing.T) {
+	policy, err := tlspolicy.NewPolicy(false, nil, nil)
+	require.NoError(t, err)
+
+	spiffeTLSConfig := tlsconfig.MTLSServerConfig(nil, nil, nil)
+	spiffeTLSConfig.MinVersion = tls.VersionTLS12
+	require.NoError(t, tlspolicy.ApplyPolicy(spiffeTLSConfig, policy, tlspolicy.WithServerTLSConfig()))
+	require.Nil(t, spiffeTLSConfig.CipherSuites)
+	require.Nil(t, spiffeTLSConfig.CurvePreferences)
 }
 
 func TestNewErrorCreatingAuthorizedEntryFetcher(t *testing.T) {
@@ -151,7 +174,6 @@ func TestNewErrorCreatingAuthorizedEntryFetcher(t *testing.T) {
 		Catalog:          cat,
 		ServerCA:         serverCA,
 		BundleEndpoint:   bundle.EndpointConfig{Address: tcpAddr},
-		JWTKeyPublisher:  &fakeJWTKeyPublisher{},
 		Log:              log,
 		Metrics:          metrics,
 		RateLimit:        rateLimit,
@@ -189,13 +211,23 @@ func TestListenAndServe(t *testing.T) {
 	clk := clock.NewMock(t)
 
 	buildCacheFn := func(ctx context.Context) (entrycache.Cache, error) {
-		return entrycache.BuildFromDataStore(ctx, ds)
+		return entrycache.BuildFromDataStore(ctx, testTD.String(), ds)
 	}
+
+	// Prime the datastore with the:
+	// - bundle used to verify client certificates.
+	// - agent attested node information
+	// - admin registration entry
+	// - downstream registration entry
+	prepareDataStore(t, ds, []*testca.CA{ca, federatedCA}, agentSVID)
 
 	ef, err := NewAuthorizedEntryFetcherWithFullCache(context.Background(), buildCacheFn, log, clk, ds, defaultCacheReloadInterval, defaultPruneEventsOlderThan)
 	require.NoError(t, err)
 
 	pe, err := authpolicy.DefaultAuthPolicy(ctx)
+	require.NoError(t, err)
+
+	nodeCache, err := nodecache.New(ctx, log, ds, clk, true, true)
 	require.NoError(t, err)
 
 	endpoints := Endpoints{
@@ -206,31 +238,27 @@ func TestListenAndServe(t *testing.T) {
 		DataStore:    ds,
 		BundleCache:  bundle.NewCache(ds, clk),
 		APIServers: APIServers{
-			AgentServer:       agentServer{},
-			BundleServer:      bundleServer{},
-			DebugServer:       debugServer{},
-			EntryServer:       entryServer{},
-			HealthServer:      healthServer{},
-			LoggerServer:      loggerServer{},
-			SVIDServer:        svidServer{},
-			TrustDomainServer: trustDomainServer{},
+			AgentServer:          agentServer{},
+			BundleServer:         bundleServer{},
+			DebugServer:          debugServer{},
+			EntryServer:          entryServer{},
+			HealthServer:         healthServer{},
+			LoggerServer:         loggerServer{},
+			SVIDServer:           svidServer{},
+			TrustDomainServer:    trustDomainServer{},
+			LocalAUthorityServer: localAuthorityServer{},
 		},
 		BundleEndpointServer:         bundleEndpointServer,
 		Log:                          log,
 		Metrics:                      metrics,
 		RateLimit:                    rateLimit,
+		NodeCacheRebuildTask:         nodeCache.PeriodicRebuild,
 		EntryFetcherCacheRebuildTask: ef.RunRebuildCacheTask,
 		EntryFetcherPruneEventsTask:  ef.PruneEventsTask,
 		AuthPolicyEngine:             pe,
 		AdminIDs:                     []spiffeid.ID{foreignAdminSVID.ID},
+		nodeCache:                    nodeCache,
 	}
-
-	// Prime the datastore with the:
-	// - bundle used to verify client certificates.
-	// - agent attested node information
-	// - admin registration entry
-	// - downstream registration entry
-	prepareDataStore(t, ds, []*testca.CA{ca, federatedCA}, agentSVID)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
@@ -242,45 +270,70 @@ func TestListenAndServe(t *testing.T) {
 	}()
 
 	dialTCP := func(tlsConfig *tls.Config) *grpc.ClientConn {
-		conn, err := grpc.DialContext(ctx, endpoints.TCPAddr.String(),
-			grpc.WithBlock(),
+		conn, err := grpc.NewClient(
+			endpoints.TCPAddr.String(),
 			grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)),
 		)
 		require.NoError(t, err)
 		return conn
 	}
 
+	// Await /tmp/spire-test-*/sockets to become available (within 10s)
+	// Avoids flaky tests in CI, where we occasionally see failures
+	// due to the socket not being ready when first used by the test
+	require.Eventually(t, func() bool {
+		_, err := os.Stat(endpoints.LocalAddr.String())
+		return err == nil
+	}, 10*time.Second, 10*time.Millisecond, "socket %q not available", endpoints.LocalAddr.String())
+
 	target, err := util.GetTargetName(endpoints.LocalAddr)
 	require.NoError(t, err)
 
-	localConn, err := util.GRPCDialContext(ctx, target, grpc.WithBlock())
+	localConn, err := util.NewGRPCClient(target)
 	require.NoError(t, err)
 	defer localConn.Close()
 
-	noauthConn := dialTCP(tlsconfig.TLSClientConfig(ca.X509Bundle(), tlsconfig.AuthorizeID(serverID)))
+	noauthConfig := tlsconfig.TLSClientConfig(ca.X509Bundle(), tlsconfig.AuthorizeID(serverID))
+	require.NoError(t, tlspolicy.ApplyPolicy(noauthConfig, endpoints.TLSPolicy))
+	noauthConn := dialTCP(noauthConfig)
 	defer noauthConn.Close()
 
-	agentConn := dialTCP(tlsconfig.MTLSClientConfig(agentSVID, ca.X509Bundle(), tlsconfig.AuthorizeID(serverID)))
+	agentConfig := tlsconfig.MTLSClientConfig(agentSVID, ca.X509Bundle(), tlsconfig.AuthorizeID(serverID))
+	require.NoError(t, tlspolicy.ApplyPolicy(agentConfig, endpoints.TLSPolicy))
+	agentConn := dialTCP(agentConfig)
 	defer agentConn.Close()
 
-	adminConn := dialTCP(tlsconfig.MTLSClientConfig(adminSVID, ca.X509Bundle(), tlsconfig.AuthorizeID(serverID)))
+	adminConfig := tlsconfig.MTLSClientConfig(adminSVID, ca.X509Bundle(), tlsconfig.AuthorizeID(serverID))
+	require.NoError(t, tlspolicy.ApplyPolicy(adminConfig, endpoints.TLSPolicy))
+	adminConn := dialTCP(adminConfig)
 	defer adminConn.Close()
 
 	downstreamConn := dialTCP(tlsconfig.MTLSClientConfig(downstreamSVID, ca.X509Bundle(), tlsconfig.AuthorizeID(serverID)))
 	defer downstreamConn.Close()
 
-	federatedAdminConn := dialTCP(tlsconfig.MTLSClientConfig(foreignAdminSVID, ca.X509Bundle(), tlsconfig.AuthorizeID(serverID)))
+	federatedAdminConfig := tlsconfig.MTLSClientConfig(foreignAdminSVID, ca.X509Bundle(), tlsconfig.AuthorizeID(serverID))
+	require.NoError(t, tlspolicy.ApplyPolicy(federatedAdminConfig, endpoints.TLSPolicy))
+	federatedAdminConn := dialTCP(federatedAdminConfig)
 	defer federatedAdminConn.Close()
 
 	t.Run("Bad Client SVID", func(t *testing.T) {
 		// Create an SVID from a different CA. This ensures that we verify
 		// incoming certificates against the trust bundle.
 		badSVID := testca.New(t, testTD).CreateX509SVID(agentID)
-		ctx, cancel := context.WithTimeout(ctx, time.Second)
-		defer cancel()
-		badConn, err := grpc.DialContext(ctx, endpoints.TCPAddr.String(), grpc.WithBlock(), grpc.FailOnNonTempDialError(true),
-			grpc.WithTransportCredentials(credentials.NewTLS(tlsconfig.MTLSClientConfig(badSVID, ca.X509Bundle(), tlsconfig.AuthorizeID(serverID)))),
+
+		tlsConfig := tlsconfig.MTLSClientConfig(badSVID, ca.X509Bundle(), tlsconfig.AuthorizeID(serverID))
+		require.NoError(t, tlspolicy.ApplyPolicy(tlsConfig, endpoints.TLSPolicy))
+
+		badConn, err := grpc.NewClient(
+			endpoints.TCPAddr.String(),
+			grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)),
 		)
+
+		require.NoError(t, err)
+
+		// Call an API using the server clientConn to cause gRPC to attempt to dial the server
+		healthClient := grpc_health_v1.NewHealthClient(badConn)
+		_, err = healthClient.Check(ctx, &grpc_health_v1.HealthCheckRequest{})
 		if !assert.Error(t, err, "dialing should have failed") {
 			// close the conn if the dialing unexpectedly succeeded
 			badConn.Close()
@@ -321,8 +374,12 @@ func TestListenAndServe(t *testing.T) {
 		testTrustDomainAPI(ctx, t, conns)
 	})
 
+	t.Run("LocalAuthority", func(t *testing.T) {
+		testLocalAuthorityAPI(ctx, t, conns)
+	})
+
 	t.Run("Access denied to remote caller", func(t *testing.T) {
-		testRemoteCaller(ctx, t, target)
+		testRemoteCaller(t, target)
 	})
 
 	t.Run("Invalidate connection with misconfigured foreign admin caller", func(t *testing.T) {
@@ -331,25 +388,21 @@ func TestListenAndServe(t *testing.T) {
 		unfederatedConfig := tlsconfig.MTLSClientConfig(unfederatedForeignAdminSVID, ca.X509Bundle(), tlsconfig.AuthorizeID(serverID))
 
 		for _, config := range []*tls.Config{unauthenticatedConfig, unauthorizedConfig, unfederatedConfig} {
-			conn, err := grpc.DialContext(ctx, endpoints.TCPAddr.String(),
+			require.NoError(t, tlspolicy.ApplyPolicy(config, endpoints.TLSPolicy))
+
+			conn, err := grpc.NewClient(endpoints.TCPAddr.String(),
 				grpc.WithTransportCredentials(credentials.NewTLS(config)),
 			)
 			require.NoError(t, err)
+			defer conn.Close()
 
 			_, err = entryv1.NewEntryClient(conn).ListEntries(ctx, nil)
 			require.Error(t, err)
 
-			switch {
-			// This message can be returned on macOS
-			case strings.Contains(err.Error(), "write: broken pipe"):
-			// This message can be returned on Windows
-			case strings.Contains(err.Error(), "connection was forcibly closed by the remote host"):
-			case strings.Contains(err.Error(), "connection reset by peer"):
-			case strings.Contains(err.Error(), "tls: bad certificate"):
-				return
-			default:
-				t.Errorf("expected invalid connection for misconfigured foreign admin caller: %s", err.Error())
-			}
+			// When TLS handshake fails due to invalid certificates, the server
+			// terminates the connection, which gRPC reports as Unavailable.
+			// We check the gRPC error code rather than OS-specific error messages.
+			require.Equal(t, codes.Unavailable, status.Convert(err).Code(), "expected Unavailable status for misconfigured foreign admin caller")
 		}
 	})
 
@@ -448,8 +501,7 @@ func testAgentAPI(ctx context.Context, t *testing.T, conns testConns) {
 			"AttestAgent":     true,
 			"RenewAgent":      true,
 			"CreateJoinToken": false,
-			// TODO: Must be true for agent (#3908)
-			"PostStatus": false,
+			"PostStatus":      true,
 		})
 	})
 
@@ -500,6 +552,7 @@ func testHealthAPI(ctx context.Context, t *testing.T, conns testConns) {
 	t.Run("Local", func(t *testing.T) {
 		testAuthorization(ctx, t, grpc_health_v1.NewHealthClient(conns.local), map[string]bool{
 			"Check": true,
+			"List":  true,
 			"Watch": true,
 		})
 	})
@@ -589,6 +642,7 @@ func testBundleAPI(ctx context.Context, t *testing.T, conns testConns) {
 			"GetBundle":                  true,
 			"AppendBundle":               true,
 			"PublishJWTAuthority":        false,
+			"PublishWITAuthority":        false,
 			"CountBundles":               true,
 			"ListFederatedBundles":       true,
 			"GetFederatedBundle":         true,
@@ -604,6 +658,7 @@ func testBundleAPI(ctx context.Context, t *testing.T, conns testConns) {
 			"GetBundle":                  true,
 			"AppendBundle":               false,
 			"PublishJWTAuthority":        false,
+			"PublishWITAuthority":        false,
 			"CountBundles":               false,
 			"ListFederatedBundles":       false,
 			"GetFederatedBundle":         false,
@@ -619,6 +674,7 @@ func testBundleAPI(ctx context.Context, t *testing.T, conns testConns) {
 			"GetBundle":                  true,
 			"AppendBundle":               false,
 			"PublishJWTAuthority":        false,
+			"PublishWITAuthority":        false,
 			"CountBundles":               false,
 			"ListFederatedBundles":       false,
 			"GetFederatedBundle":         true,
@@ -634,6 +690,7 @@ func testBundleAPI(ctx context.Context, t *testing.T, conns testConns) {
 			"GetBundle":                  true,
 			"AppendBundle":               true,
 			"PublishJWTAuthority":        false,
+			"PublishWITAuthority":        false,
 			"CountBundles":               true,
 			"ListFederatedBundles":       true,
 			"GetFederatedBundle":         true,
@@ -649,6 +706,7 @@ func testBundleAPI(ctx context.Context, t *testing.T, conns testConns) {
 			"GetBundle":                  true,
 			"AppendBundle":               true,
 			"PublishJWTAuthority":        false,
+			"PublishWITAuthority":        false,
 			"CountBundles":               true,
 			"ListFederatedBundles":       true,
 			"GetFederatedBundle":         true,
@@ -664,6 +722,7 @@ func testBundleAPI(ctx context.Context, t *testing.T, conns testConns) {
 			"GetBundle":                  true,
 			"AppendBundle":               false,
 			"PublishJWTAuthority":        true,
+			"PublishWITAuthority":        true,
 			"CountBundles":               false,
 			"ListFederatedBundles":       false,
 			"GetFederatedBundle":         false,
@@ -760,8 +819,10 @@ func testSVIDAPI(ctx context.Context, t *testing.T, conns testConns) {
 		testAuthorization(ctx, t, svidv1.NewSVIDClient(conns.local), map[string]bool{
 			"MintX509SVID":        true,
 			"MintJWTSVID":         true,
+			"MintWITSVID":         true,
 			"BatchNewX509SVID":    false,
 			"NewJWTSVID":          false,
+			"BatchNewWITSVID":     false,
 			"NewDownstreamX509CA": false,
 		})
 	})
@@ -770,8 +831,10 @@ func testSVIDAPI(ctx context.Context, t *testing.T, conns testConns) {
 		testAuthorization(ctx, t, svidv1.NewSVIDClient(conns.noAuth), map[string]bool{
 			"MintX509SVID":        false,
 			"MintJWTSVID":         false,
+			"MintWITSVID":         false,
 			"BatchNewX509SVID":    false,
 			"NewJWTSVID":          false,
+			"BatchNewWITSVID":     false,
 			"NewDownstreamX509CA": false,
 		})
 	})
@@ -780,8 +843,10 @@ func testSVIDAPI(ctx context.Context, t *testing.T, conns testConns) {
 		testAuthorization(ctx, t, svidv1.NewSVIDClient(conns.agent), map[string]bool{
 			"MintX509SVID":        false,
 			"MintJWTSVID":         false,
+			"MintWITSVID":         false,
 			"BatchNewX509SVID":    true,
 			"NewJWTSVID":          true,
+			"BatchNewWITSVID":     true,
 			"NewDownstreamX509CA": false,
 		})
 	})
@@ -790,8 +855,10 @@ func testSVIDAPI(ctx context.Context, t *testing.T, conns testConns) {
 		testAuthorization(ctx, t, svidv1.NewSVIDClient(conns.admin), map[string]bool{
 			"MintX509SVID":        true,
 			"MintJWTSVID":         true,
+			"MintWITSVID":         true,
 			"BatchNewX509SVID":    false,
 			"NewJWTSVID":          false,
+			"BatchNewWITSVID":     false,
 			"NewDownstreamX509CA": false,
 		})
 	})
@@ -800,8 +867,10 @@ func testSVIDAPI(ctx context.Context, t *testing.T, conns testConns) {
 		testAuthorization(ctx, t, svidv1.NewSVIDClient(conns.federatedAdmin), map[string]bool{
 			"MintX509SVID":        true,
 			"MintJWTSVID":         true,
+			"MintWITSVID":         true,
 			"BatchNewX509SVID":    false,
 			"NewJWTSVID":          false,
+			"BatchNewWITSVID":     false,
 			"NewDownstreamX509CA": false,
 		})
 	})
@@ -810,8 +879,10 @@ func testSVIDAPI(ctx context.Context, t *testing.T, conns testConns) {
 		testAuthorization(ctx, t, svidv1.NewSVIDClient(conns.downstream), map[string]bool{
 			"MintX509SVID":        false,
 			"MintJWTSVID":         false,
+			"MintWITSVID":         false,
 			"BatchNewX509SVID":    false,
 			"NewJWTSVID":          false,
+			"BatchNewWITSVID":     false,
 			"NewDownstreamX509CA": true,
 		})
 	})
@@ -885,6 +956,140 @@ func testTrustDomainAPI(ctx context.Context, t *testing.T, conns testConns) {
 	})
 }
 
+func testLocalAuthorityAPI(ctx context.Context, t *testing.T, conns testConns) {
+	t.Run("Local", func(t *testing.T) {
+		testAuthorization(ctx, t, localauthorityv1.NewLocalAuthorityClient(conns.local), map[string]bool{
+			"GetJWTAuthorityState":        true,
+			"PrepareJWTAuthority":         true,
+			"ActivateJWTAuthority":        true,
+			"TaintJWTAuthority":           true,
+			"RevokeJWTAuthority":          true,
+			"GetX509AuthorityState":       true,
+			"PrepareX509Authority":        true,
+			"ActivateX509Authority":       true,
+			"TaintX509Authority":          true,
+			"TaintX509UpstreamAuthority":  true,
+			"RevokeX509Authority":         true,
+			"RevokeX509UpstreamAuthority": true,
+			"GetWITAuthorityState":        true,
+			"PrepareWITAuthority":         true,
+			"ActivateWITAuthority":        true,
+			"TaintWITAuthority":           true,
+			"RevokeWITAuthority":          true,
+		})
+	})
+
+	t.Run("NoAuth", func(t *testing.T) {
+		testAuthorization(ctx, t, localauthorityv1.NewLocalAuthorityClient(conns.noAuth), map[string]bool{
+			"GetJWTAuthorityState":        false,
+			"PrepareJWTAuthority":         false,
+			"ActivateJWTAuthority":        false,
+			"TaintJWTAuthority":           false,
+			"RevokeJWTAuthority":          false,
+			"GetX509AuthorityState":       false,
+			"PrepareX509Authority":        false,
+			"ActivateX509Authority":       false,
+			"TaintX509Authority":          false,
+			"TaintX509UpstreamAuthority":  false,
+			"RevokeX509Authority":         false,
+			"RevokeX509UpstreamAuthority": false,
+			"GetWITAuthorityState":        false,
+			"PrepareWITAuthority":         false,
+			"ActivateWITAuthority":        false,
+			"TaintWITAuthority":           false,
+			"RevokeWITAuthority":          false,
+		})
+	})
+
+	t.Run("Agent", func(t *testing.T) {
+		testAuthorization(ctx, t, localauthorityv1.NewLocalAuthorityClient(conns.agent), map[string]bool{
+			"GetJWTAuthorityState":        false,
+			"PrepareJWTAuthority":         false,
+			"ActivateJWTAuthority":        false,
+			"TaintJWTAuthority":           false,
+			"RevokeJWTAuthority":          false,
+			"GetX509AuthorityState":       false,
+			"PrepareX509Authority":        false,
+			"ActivateX509Authority":       false,
+			"TaintX509Authority":          false,
+			"TaintX509UpstreamAuthority":  false,
+			"RevokeX509Authority":         false,
+			"RevokeX509UpstreamAuthority": false,
+			"GetWITAuthorityState":        false,
+			"PrepareWITAuthority":         false,
+			"ActivateWITAuthority":        false,
+			"TaintWITAuthority":           false,
+			"RevokeWITAuthority":          false,
+		})
+	})
+
+	t.Run("Admin", func(t *testing.T) {
+		testAuthorization(ctx, t, localauthorityv1.NewLocalAuthorityClient(conns.admin), map[string]bool{
+			"GetJWTAuthorityState":        true,
+			"PrepareJWTAuthority":         true,
+			"ActivateJWTAuthority":        true,
+			"TaintJWTAuthority":           true,
+			"RevokeJWTAuthority":          true,
+			"GetX509AuthorityState":       true,
+			"PrepareX509Authority":        true,
+			"ActivateX509Authority":       true,
+			"TaintX509Authority":          true,
+			"TaintX509UpstreamAuthority":  true,
+			"RevokeX509Authority":         true,
+			"RevokeX509UpstreamAuthority": true,
+			"GetWITAuthorityState":        true,
+			"PrepareWITAuthority":         true,
+			"ActivateWITAuthority":        true,
+			"TaintWITAuthority":           true,
+			"RevokeWITAuthority":          true,
+		})
+	})
+
+	t.Run("Federated Admin", func(t *testing.T) {
+		testAuthorization(ctx, t, localauthorityv1.NewLocalAuthorityClient(conns.federatedAdmin), map[string]bool{
+			"GetJWTAuthorityState":        true,
+			"PrepareJWTAuthority":         true,
+			"ActivateJWTAuthority":        true,
+			"TaintJWTAuthority":           true,
+			"RevokeJWTAuthority":          true,
+			"GetX509AuthorityState":       true,
+			"PrepareX509Authority":        true,
+			"ActivateX509Authority":       true,
+			"TaintX509Authority":          true,
+			"TaintX509UpstreamAuthority":  true,
+			"RevokeX509Authority":         true,
+			"RevokeX509UpstreamAuthority": true,
+			"GetWITAuthorityState":        true,
+			"PrepareWITAuthority":         true,
+			"ActivateWITAuthority":        true,
+			"TaintWITAuthority":           true,
+			"RevokeWITAuthority":          true,
+		})
+	})
+
+	t.Run("Downstream", func(t *testing.T) {
+		testAuthorization(ctx, t, localauthorityv1.NewLocalAuthorityClient(conns.downstream), map[string]bool{
+			"GetJWTAuthorityState":        false,
+			"PrepareJWTAuthority":         false,
+			"ActivateJWTAuthority":        false,
+			"TaintJWTAuthority":           false,
+			"RevokeJWTAuthority":          false,
+			"GetX509AuthorityState":       false,
+			"PrepareX509Authority":        false,
+			"ActivateX509Authority":       false,
+			"TaintX509Authority":          false,
+			"TaintX509UpstreamAuthority":  false,
+			"RevokeX509Authority":         false,
+			"RevokeX509UpstreamAuthority": false,
+			"GetWITAuthorityState":        false,
+			"PrepareWITAuthority":         false,
+			"ActivateWITAuthority":        false,
+			"TaintWITAuthority":           false,
+			"RevokeWITAuthority":          false,
+		})
+	})
+}
+
 // testAuthorization issues an RPC for each method on the client interface and
 // asserts whether the RPC was authorized or not. If a method is not
 // represented in the expectedAuthResults, or a method in expectedAuthResults
@@ -893,7 +1098,7 @@ func testAuthorization(ctx context.Context, t *testing.T, client any, expectedAu
 	cv := reflect.ValueOf(client)
 	ct := cv.Type()
 
-	for i := 0; i < ct.NumMethod(); i++ {
+	for i := range ct.NumMethod() {
 		mv := cv.Method(i)
 		methodName := ct.Method(i).Name
 		t.Run(methodName, func(t *testing.T) {
@@ -903,7 +1108,7 @@ func testAuthorization(ctx context.Context, t *testing.T, client any, expectedAu
 
 			var st *status.Status
 			if !out[1].IsNil() {
-				err, ok := out[1].Interface().(error)
+				err, ok := reflect.TypeAssert[error](out[1])
 				require.True(t, ok, "2nd output should have been nil or an error")
 				st = status.Convert(err)
 			}
@@ -936,7 +1141,7 @@ func assertServiceUnavailable(ctx context.Context, t *testing.T, client any) {
 	cv := reflect.ValueOf(client)
 	ct := cv.Type()
 
-	for i := 0; i < ct.NumMethod(); i++ {
+	for i := range ct.NumMethod() {
 		mv := cv.Method(i)
 		methodName := ct.Method(i).Name
 		t.Run(methodName, func(t *testing.T) {
@@ -946,7 +1151,7 @@ func assertServiceUnavailable(ctx context.Context, t *testing.T, client any) {
 
 			var st *status.Status
 			if !out[1].IsNil() {
-				err, ok := out[1].Interface().(error)
+				err, ok := reflect.TypeAssert[error](out[1])
 				require.True(t, ok, "2nd output should have been nil or an error")
 				st = status.Convert(err)
 			}
@@ -1005,6 +1210,11 @@ func (s *bundleEndpointServer) ListenAndServe(context.Context) error {
 	return nil
 }
 
+func (s *bundleEndpointServer) WaitForListening() {
+	// This method is a no-op for the bundle server since it does not have a
+	// separate listening hook.
+}
+
 func (s *bundleEndpointServer) Used() bool {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
@@ -1039,8 +1249,8 @@ func (o *svidObserver) State() svid.State {
 	}
 }
 
-type fakeJWTKeyPublisher struct {
-	manager.JwtKeyPublisher
+type fakeAuthorityManager struct {
+	manager.AuthorityManager
 }
 
 type agentServer struct {
@@ -1103,6 +1313,10 @@ func (bundleServer) AppendBundle(_ context.Context, _ *bundlev1.AppendBundleRequ
 
 func (bundleServer) PublishJWTAuthority(_ context.Context, _ *bundlev1.PublishJWTAuthorityRequest) (*bundlev1.PublishJWTAuthorityResponse, error) {
 	return &bundlev1.PublishJWTAuthorityResponse{}, nil
+}
+
+func (bundleServer) PublishWITAuthority(_ context.Context, _ *bundlev1.PublishWITAuthorityRequest) (*bundlev1.PublishWITAuthorityResponse, error) {
+	return &bundlev1.PublishWITAuthorityResponse{}, nil
 }
 
 func (bundleServer) ListFederatedBundles(_ context.Context, _ *bundlev1.ListFederatedBundlesRequest) (*bundlev1.ListFederatedBundlesResponse, error) {
@@ -1185,6 +1399,10 @@ func (healthServer) Watch(_ *grpc_health_v1.HealthCheckRequest, stream grpc_heal
 	return stream.Send(&grpc_health_v1.HealthCheckResponse{})
 }
 
+func (healthServer) List(context.Context, *grpc_health_v1.HealthListRequest) (*grpc_health_v1.HealthListResponse, error) {
+	return &grpc_health_v1.HealthListResponse{}, nil
+}
+
 type loggerServer struct {
 	loggerv1.UnsafeLoggerServer
 }
@@ -1213,12 +1431,20 @@ func (svidServer) MintJWTSVID(_ context.Context, _ *svidv1.MintJWTSVIDRequest) (
 	return &svidv1.MintJWTSVIDResponse{}, nil
 }
 
+func (svidServer) MintWITSVID(_ context.Context, _ *svidv1.MintWITSVIDRequest) (*svidv1.MintWITSVIDResponse, error) {
+	return &svidv1.MintWITSVIDResponse{}, nil
+}
+
 func (svidServer) BatchNewX509SVID(_ context.Context, _ *svidv1.BatchNewX509SVIDRequest) (*svidv1.BatchNewX509SVIDResponse, error) {
 	return &svidv1.BatchNewX509SVIDResponse{}, nil
 }
 
 func (svidServer) NewJWTSVID(_ context.Context, _ *svidv1.NewJWTSVIDRequest) (*svidv1.NewJWTSVIDResponse, error) {
 	return &svidv1.NewJWTSVIDResponse{}, nil
+}
+
+func (svidServer) BatchNewWITSVID(_ context.Context, _ *svidv1.BatchNewWITSVIDRequest) (*svidv1.BatchNewWITSVIDResponse, error) {
+	return &svidv1.BatchNewWITSVIDResponse{}, nil
 }
 
 func (svidServer) NewDownstreamX509CA(_ context.Context, _ *svidv1.NewDownstreamX509CARequest) (*svidv1.NewDownstreamX509CAResponse, error) {
@@ -1251,4 +1477,291 @@ func (trustDomainServer) BatchDeleteFederationRelationship(_ context.Context, _ 
 
 func (trustDomainServer) RefreshBundle(_ context.Context, _ *trustdomainv1.RefreshBundleRequest) (*emptypb.Empty, error) {
 	return &emptypb.Empty{}, nil
+}
+
+type localAuthorityServer struct {
+	localauthorityv1.UnsafeLocalAuthorityServer
+}
+
+func (localAuthorityServer) GetJWTAuthorityState(context.Context, *localauthorityv1.GetJWTAuthorityStateRequest) (*localauthorityv1.GetJWTAuthorityStateResponse, error) {
+	return &localauthorityv1.GetJWTAuthorityStateResponse{}, nil
+}
+
+func (localAuthorityServer) PrepareJWTAuthority(context.Context, *localauthorityv1.PrepareJWTAuthorityRequest) (*localauthorityv1.PrepareJWTAuthorityResponse, error) {
+	return &localauthorityv1.PrepareJWTAuthorityResponse{}, nil
+}
+
+func (localAuthorityServer) ActivateJWTAuthority(context.Context, *localauthorityv1.ActivateJWTAuthorityRequest) (*localauthorityv1.ActivateJWTAuthorityResponse, error) {
+	return &localauthorityv1.ActivateJWTAuthorityResponse{}, nil
+}
+
+func (localAuthorityServer) TaintJWTAuthority(context.Context, *localauthorityv1.TaintJWTAuthorityRequest) (*localauthorityv1.TaintJWTAuthorityResponse, error) {
+	return &localauthorityv1.TaintJWTAuthorityResponse{}, nil
+}
+
+func (localAuthorityServer) RevokeJWTAuthority(context.Context, *localauthorityv1.RevokeJWTAuthorityRequest) (*localauthorityv1.RevokeJWTAuthorityResponse, error) {
+	return &localauthorityv1.RevokeJWTAuthorityResponse{}, nil
+}
+
+func (localAuthorityServer) GetX509AuthorityState(context.Context, *localauthorityv1.GetX509AuthorityStateRequest) (*localauthorityv1.GetX509AuthorityStateResponse, error) {
+	return &localauthorityv1.GetX509AuthorityStateResponse{}, nil
+}
+
+func (localAuthorityServer) PrepareX509Authority(context.Context, *localauthorityv1.PrepareX509AuthorityRequest) (*localauthorityv1.PrepareX509AuthorityResponse, error) {
+	return &localauthorityv1.PrepareX509AuthorityResponse{}, nil
+}
+
+func (localAuthorityServer) ActivateX509Authority(context.Context, *localauthorityv1.ActivateX509AuthorityRequest) (*localauthorityv1.ActivateX509AuthorityResponse, error) {
+	return &localauthorityv1.ActivateX509AuthorityResponse{}, nil
+}
+
+func (localAuthorityServer) TaintX509Authority(context.Context, *localauthorityv1.TaintX509AuthorityRequest) (*localauthorityv1.TaintX509AuthorityResponse, error) {
+	return &localauthorityv1.TaintX509AuthorityResponse{}, nil
+}
+
+func (localAuthorityServer) TaintX509UpstreamAuthority(context.Context, *localauthorityv1.TaintX509UpstreamAuthorityRequest) (*localauthorityv1.TaintX509UpstreamAuthorityResponse, error) {
+	return &localauthorityv1.TaintX509UpstreamAuthorityResponse{}, nil
+}
+
+func (localAuthorityServer) RevokeX509Authority(context.Context, *localauthorityv1.RevokeX509AuthorityRequest) (*localauthorityv1.RevokeX509AuthorityResponse, error) {
+	return &localauthorityv1.RevokeX509AuthorityResponse{}, nil
+}
+
+func (localAuthorityServer) RevokeX509UpstreamAuthority(context.Context, *localauthorityv1.RevokeX509UpstreamAuthorityRequest) (*localauthorityv1.RevokeX509UpstreamAuthorityResponse, error) {
+	return &localauthorityv1.RevokeX509UpstreamAuthorityResponse{}, nil
+}
+
+func (localAuthorityServer) GetWITAuthorityState(context.Context, *localauthorityv1.GetWITAuthorityStateRequest) (*localauthorityv1.GetWITAuthorityStateResponse, error) {
+	return &localauthorityv1.GetWITAuthorityStateResponse{}, nil
+}
+
+func (localAuthorityServer) PrepareWITAuthority(context.Context, *localauthorityv1.PrepareWITAuthorityRequest) (*localauthorityv1.PrepareWITAuthorityResponse, error) {
+	return &localauthorityv1.PrepareWITAuthorityResponse{}, nil
+}
+
+func (localAuthorityServer) ActivateWITAuthority(context.Context, *localauthorityv1.ActivateWITAuthorityRequest) (*localauthorityv1.ActivateWITAuthorityResponse, error) {
+	return &localauthorityv1.ActivateWITAuthorityResponse{}, nil
+}
+
+func (localAuthorityServer) TaintWITAuthority(context.Context, *localauthorityv1.TaintWITAuthorityRequest) (*localauthorityv1.TaintWITAuthorityResponse, error) {
+	return &localauthorityv1.TaintWITAuthorityResponse{}, nil
+}
+
+func (localAuthorityServer) RevokeWITAuthority(context.Context, *localauthorityv1.RevokeWITAuthorityRequest) (*localauthorityv1.RevokeWITAuthorityResponse, error) {
+	return &localauthorityv1.RevokeWITAuthorityResponse{}, nil
+}
+
+func TestProxyProtocolTrustedCIDRsExtractsRealClientIP(t *testing.T) {
+	// Start a TCP listener wrapped with proxy protocol support and a
+	// strict whitelist policy that trusts 127.0.0.0/8 (localhost).
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	ppLn, err := wrapListenerWithProxyProtocol(ln, []string{"127.0.0.0/8"})
+	require.NoError(t, err)
+	defer ppLn.Close()
+
+	// Accept a connection in the background and check RemoteAddr
+	type result struct {
+		addr string
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		conn, err := ppLn.Accept()
+		if err != nil {
+			ch <- result{err: err}
+			return
+		}
+		defer conn.Close()
+		ch <- result{addr: conn.RemoteAddr().String()}
+	}()
+
+	// Connect from localhost (trusted) and send a PROXY protocol v1
+	// header indicating the real client IP is 10.1.2.3:12345
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	require.NoError(t, err)
+	defer conn.Close()
+
+	header := "PROXY TCP4 10.1.2.3 127.0.0.1 12345 " + fmt.Sprintf("%d", ln.Addr().(*net.TCPAddr).Port) + "\r\n"
+	_, err = conn.Write([]byte(header))
+	require.NoError(t, err)
+
+	// Verify the accepted connection sees the proxied IP
+	res := <-ch
+	require.NoError(t, res.err)
+	host, port, err := net.SplitHostPort(res.addr)
+	require.NoError(t, err)
+	assert.Equal(t, "10.1.2.3", host)
+	assert.Equal(t, "12345", port)
+}
+
+func TestProxyProtocolRejectsUntrustedSource(t *testing.T) {
+	// Create a listener that only trusts 192.168.0.0/16. Since we connect
+	// from 127.0.0.1 (not in that range), the PROXY header should be rejected.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	ppLn, err := wrapListenerWithProxyProtocol(ln, []string{"192.168.0.0/16"})
+	require.NoError(t, err)
+	defer ppLn.Close()
+
+	type result struct {
+		addr string
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		conn, err := ppLn.Accept()
+		if err != nil {
+			ch <- result{err: err}
+			return
+		}
+		defer conn.Close()
+		// Try to read -- this should fail because the policy rejects
+		buf := make([]byte, 1)
+		_, err = conn.Read(buf)
+		ch <- result{addr: conn.RemoteAddr().String(), err: err}
+	}()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	require.NoError(t, err)
+	defer conn.Close()
+
+	header := "PROXY TCP4 10.1.2.3 127.0.0.1 12345 " + fmt.Sprintf("%d", ln.Addr().(*net.TCPAddr).Port) + "\r\n"
+	_, err = conn.Write([]byte(header))
+	require.NoError(t, err)
+
+	res := <-ch
+	// The first read on a rejected connection returns ErrSuperfluousProxyHeader
+	// because the source IP is not in the trusted CIDRs.
+	require.ErrorIs(t, res.err, proxyproto.ErrSuperfluousProxyHeader)
+}
+
+func TestProxyProtocolOnlyAcceptsTCPSourceAddresses(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		header     *proxyproto.Header
+		expectErr  bool
+		expectAddr func(connAddr net.Addr) string
+	}{
+		{
+			name: "TCPv4",
+			header: &proxyproto.Header{
+				Version:           2,
+				Command:           proxyproto.PROXY,
+				TransportProtocol: proxyproto.TCPv4,
+				SourceAddr:        &net.TCPAddr{IP: net.ParseIP("10.1.2.3"), Port: 12345},
+				DestinationAddr:   &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 8081},
+			},
+			expectAddr: func(net.Addr) string { return "10.1.2.3:12345" },
+		},
+		{
+			name: "TCPv6",
+			header: &proxyproto.Header{
+				Version:           2,
+				Command:           proxyproto.PROXY,
+				TransportProtocol: proxyproto.TCPv6,
+				SourceAddr:        &net.TCPAddr{IP: net.ParseIP("2001:db8::1"), Port: 12345},
+				DestinationAddr:   &net.TCPAddr{IP: net.ParseIP("::1"), Port: 8081},
+			},
+			expectAddr: func(net.Addr) string { return "[2001:db8::1]:12345" },
+		},
+		{
+			name: "LOCAL",
+			header: &proxyproto.Header{
+				Version:           2,
+				Command:           proxyproto.LOCAL,
+				TransportProtocol: proxyproto.UNSPEC,
+			},
+			expectAddr: func(connAddr net.Addr) string { return connAddr.String() },
+		},
+		{
+			name: "UNIX stream",
+			header: &proxyproto.Header{
+				Version:           2,
+				Command:           proxyproto.PROXY,
+				TransportProtocol: proxyproto.UnixStream,
+				SourceAddr:        &net.UnixAddr{Net: "unix", Name: "/tmp/src.sock"},
+				DestinationAddr:   &net.UnixAddr{Net: "unix", Name: "/tmp/dst.sock"},
+			},
+			expectErr: true,
+		},
+		{
+			name: "UNIX datagram",
+			header: &proxyproto.Header{
+				Version:           2,
+				Command:           proxyproto.PROXY,
+				TransportProtocol: proxyproto.UnixDatagram,
+				SourceAddr:        &net.UnixAddr{Net: "unixgram", Name: "/tmp/src.sock"},
+				DestinationAddr:   &net.UnixAddr{Net: "unixgram", Name: "/tmp/dst.sock"},
+			},
+			expectErr: true,
+		},
+		{
+			name: "UDPv4",
+			header: &proxyproto.Header{
+				Version:           2,
+				Command:           proxyproto.PROXY,
+				TransportProtocol: proxyproto.UDPv4,
+				SourceAddr:        &net.UDPAddr{IP: net.ParseIP("10.1.2.3"), Port: 12345},
+				DestinationAddr:   &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 8081},
+			},
+			expectErr: true,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			require.NoError(t, err)
+			defer ln.Close()
+
+			ppLn, err := wrapListenerWithProxyProtocol(ln, []string{"127.0.0.0/8"})
+			require.NoError(t, err)
+			defer ppLn.Close()
+
+			type result struct {
+				addr     net.Addr
+				realAddr net.Addr
+				err      error
+			}
+			ch := make(chan result, 1)
+			go func() {
+				conn, err := ppLn.Accept()
+				if err != nil {
+					ch <- result{err: err}
+					return
+				}
+				defer conn.Close()
+				buf := make([]byte, 1)
+				_, err = conn.Read(buf)
+				ch <- result{
+					addr:     conn.RemoteAddr(),
+					realAddr: conn.(*proxyproto.Conn).Raw().RemoteAddr(),
+					err:      err,
+				}
+			}()
+
+			conn, err := net.Dial("tcp", ln.Addr().String())
+			require.NoError(t, err)
+			defer conn.Close()
+
+			_, err = tt.header.WriteTo(conn)
+			require.NoError(t, err)
+			_, err = conn.Write([]byte{0})
+			require.NoError(t, err)
+
+			res := <-ch
+			// Whatever happens, the peer address must never become non-TCP.
+			require.Equal(t, "tcp", res.addr.Network())
+			if tt.expectErr {
+				require.Error(t, res.err)
+				require.Equal(t, res.realAddr.String(), res.addr.String())
+				return
+			}
+			require.NoError(t, res.err)
+			require.Equal(t, tt.expectAddr(res.realAddr), res.addr.String())
+		})
+	}
 }

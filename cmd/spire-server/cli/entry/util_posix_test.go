@@ -8,6 +8,8 @@ const (
     	If set, the SPIFFE ID in this entry will be granted access to the SPIRE Server's management APIs
   -data string
     	Path to a file containing registration JSON (optional). If set to '-', read the JSON from stdin.
+  -disableX509SVIDPrefetch
+    	A boolean value that, when set, disables prefetching X509 SVID for this entry
   -dns value
     	A DNS name that will be included in SVIDs issued based on this entry, where appropriate. Can be used more than once
   -downstream
@@ -20,8 +22,11 @@ const (
     	SPIFFE ID of a trust domain to federate with. Can be used more than once
   -hint string
     	The entry hint, used to disambiguate entries with the same SPIFFE ID
-  -jwtSVIDTTL int
-    	The lifetime, in seconds, for JWT-SVIDs issued based on this registration entry. Overrides ttl flag
+  -instance string
+    	Instance name to substitute into socket templates (env SPIRE_SERVER_PRIVATE_SOCKET_TEMPLATE).
+  -jwtSVIDIncludeJTI
+` + "    \tA boolean value that, when set, includes a unique 'jti' claim in JWT-SVIDs issued for this entry and bypasses the agent JWT-SVID cache\n" + `  -jwtSVIDTTL int
+    	The lifetime, in seconds, for JWT-SVIDs issued based on this registration entry.
   -node
     	If set, this entry will be applied to matching nodes rather than workloads
   -output value
@@ -36,10 +41,8 @@ const (
     	The SPIFFE ID that this record represents
   -storeSVID
     	A boolean value that, when set, indicates that the resulting issued SVID from this entry must be stored through an SVIDStore plugin
-  -ttl int
-    	The lifetime, in seconds, for SVIDs issued based on this registration entry. This flag is deprecated in favor of x509SVIDTTL and jwtSVIDTTL and will be removed in a future version
   -x509SVIDTTL int
-    	The lifetime, in seconds, for x509-SVIDs issued based on this registration entry. Overrides ttl flag
+    	The lifetime, in seconds, for x509-SVIDs issued based on this registration entry.
 `
 	showUsage = `Usage of entry show:
   -downstream
@@ -50,6 +53,8 @@ const (
     	SPIFFE ID of a trust domain an entry is federate with. Can be used more than once
   -hint string
     	The Hint of the records to show (optional)
+  -instance string
+    	Instance name to substitute into socket templates (env SPIRE_SERVER_PRIVATE_SOCKET_TEMPLATE).
   -matchFederatesWithOn string
     	The match mode used when filtering by federates with. Options: exact, any, superset and subset (default "superset")
   -matchSelectorsOn string
@@ -70,6 +75,8 @@ const (
     	If set, the SPIFFE ID in this entry will be granted access to the SPIRE Server's management APIs
   -data string
     	Path to a file containing registration JSON (optional). If set to '-', read the JSON from stdin.
+  -disableX509SVIDPrefetch
+    	A boolean value that, when set, disables prefetching X509 SVID for this entry
   -dns value
     	A DNS name that will be included in SVIDs issued based on this entry, where appropriate. Can be used more than once
   -downstream
@@ -82,8 +89,11 @@ const (
     	SPIFFE ID of a trust domain to federate with. Can be used more than once
   -hint string
     	The entry hint, used to disambiguate entries with the same SPIFFE ID
-  -jwtSVIDTTL int
-    	The lifetime, in seconds, for JWT-SVIDs issued based on this registration entry. Overrides ttl flag
+  -instance string
+    	Instance name to substitute into socket templates (env SPIRE_SERVER_PRIVATE_SOCKET_TEMPLATE).
+  -jwtSVIDIncludeJTI
+` + "    \tA boolean value that, when set, includes a unique 'jti' claim in JWT-SVIDs issued for this entry and bypasses the agent JWT-SVID cache\n" + `  -jwtSVIDTTL int
+    	The lifetime, in seconds, for JWT-SVIDs issued based on this registration entry.
   -output value
     	Desired output format (pretty, json); default: pretty.
   -parentID string
@@ -96,25 +106,43 @@ const (
     	The SPIFFE ID that this record represents
   -storeSVID
     	A boolean value that, when set, indicates that the resulting issued SVID from this entry must be stored through an SVIDStore plugin
-  -ttl int
-    	The lifetime, in seconds, for SVIDs issued based on this registration entry. This flag is deprecated in favor of x509SVIDTTL and jwtSVIDTTL and will be removed in a future version
   -x509SVIDTTL int
-    	The lifetime, in seconds, for x509-SVIDs issued based on this registration entry. Overrides ttl flag
+    	The lifetime, in seconds, for x509-SVIDs issued based on this registration entry.
 `
 	deleteUsage = `Usage of entry delete:
   -entryID string
     	The Registration Entry ID of the record to delete.
   -file string
     	Path to a file containing a JSON structure for batch deletion (optional). If set to '-', read from stdin.
+  -instance string
+    	Instance name to substitute into socket templates (env SPIRE_SERVER_PRIVATE_SOCKET_TEMPLATE).
   -output value
     	Desired output format (pretty, json); default: pretty.
   -socketPath string
     	Path to the SPIRE Server API socket (default "/tmp/spire-server/private/api.sock")
 `
 	countUsage = `Usage of entry count:
+  -downstream
+    	A boolean value that, when set, indicates that the entry describes a downstream SPIRE server
+  -federatesWith value
+    	SPIFFE ID of a trust domain an entry is federate with. Can be used more than once
+  -hint string
+    	The Hint of the records to count (optional)
+  -instance string
+    	Instance name to substitute into socket templates (env SPIRE_SERVER_PRIVATE_SOCKET_TEMPLATE).
+  -matchFederatesWithOn string
+    	The match mode used when filtering by federates with. Options: exact, any, superset and subset (default "superset")
+  -matchSelectorsOn string
+    	The match mode used when filtering by selectors. Options: exact, any, superset and subset (default "superset")
   -output value
     	Desired output format (pretty, json); default: pretty.
+  -parentID string
+    	The Parent ID of the records to count
+  -selector value
+    	A colon-delimited type:value selector. Can be used more than once
   -socketPath string
     	Path to the SPIRE Server API socket (default "/tmp/spire-server/private/api.sock")
+  -spiffeID string
+    	The SPIFFE ID of the records to count
 `
 )

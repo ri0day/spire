@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"testing"
 	"time"
@@ -213,47 +214,52 @@ func TestCountAgents(t *testing.T) {
 			},
 		},
 	} {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			test := setupServiceTest(t, 0)
-			defer test.Cleanup()
+		for _, agentSpiffeIdAsSelector := range []bool{false, true} {
+			t.Run(tt.name, func(t *testing.T) {
+				test := setupServiceTest(t, 0, agentSpiffeIdAsSelector)
+				defer test.Cleanup()
 
-			for i := 0; i < int(tt.count); i++ {
-				now := time.Now()
-				_, err := test.ds.CreateAttestedNode(ctx, &common.AttestedNode{
-					SpiffeId:            ids[i].String(),
-					AttestationDataType: "t1",
-					CertSerialNumber:    "badcafe",
-					CertNotAfter:        now.Add(-time.Minute).Unix(),
-					NewCertNotAfter:     now.Add(time.Minute).Unix(),
-					NewCertSerialNumber: "new badcafe",
-					Selectors: []*common.Selector{
+				for i := range int(tt.count) {
+					now := time.Now()
+					selectors := []*common.Selector{
 						{Type: "a", Value: "1"},
 						{Type: "b", Value: "2"},
-					},
-				})
+					}
+					if agentSpiffeIdAsSelector {
+						selectors = append(selectors, &common.Selector{Type: "spiffe_id", Value: agentID.String()})
+					}
+					_, err := test.ds.CreateAttestedNode(ctx, &common.AttestedNode{
+						SpiffeId:            ids[i].String(),
+						AttestationDataType: "t1",
+						CertSerialNumber:    "badcafe",
+						CertNotAfter:        now.Add(-time.Minute).Unix(),
+						NewCertNotAfter:     now.Add(time.Minute).Unix(),
+						NewCertSerialNumber: "new badcafe",
+						Selectors:           selectors,
+					})
+					require.NoError(t, err)
+				}
+
+				test.ds.SetNextError(tt.dsError)
+				resp, err := test.client.CountAgents(ctx, &agentv1.CountAgentsRequest{})
+
+				spiretest.AssertLogs(t, test.logHook.AllEntries(), tt.expectLogs)
+				if tt.err != "" {
+					spiretest.RequireGRPCStatusContains(t, err, tt.code, tt.err)
+					require.Nil(t, resp)
+					return
+				}
+
 				require.NoError(t, err)
-			}
-
-			test.ds.SetNextError(tt.dsError)
-			resp, err := test.client.CountAgents(ctx, &agentv1.CountAgentsRequest{})
-
-			spiretest.AssertLogs(t, test.logHook.AllEntries(), tt.expectLogs)
-			if tt.err != "" {
-				spiretest.RequireGRPCStatusContains(t, err, tt.code, tt.err)
-				require.Nil(t, resp)
-				return
-			}
-
-			require.NoError(t, err)
-			require.NotNil(t, resp)
-			spiretest.AssertProtoEqual(t, tt.resp, resp)
-		})
+				require.NotNil(t, resp)
+				spiretest.AssertProtoEqual(t, tt.resp, resp)
+			})
+		}
 	}
 }
 
 func TestListAgents(t *testing.T) {
-	test := setupServiceTest(t, 0)
+	test := setupServiceTest(t, 0, false)
 	defer test.Cleanup()
 
 	notAfter := time.Now().Add(-time.Minute).Unix()
@@ -906,7 +912,6 @@ func TestListAgents(t *testing.T) {
 			},
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			test.logHook.Reset()
 			test.ds.SetNextError(tt.dsError)
@@ -1161,9 +1166,8 @@ func TestBanAgent(t *testing.T) {
 			},
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			test := setupServiceTest(t, 0)
+			test := setupServiceTest(t, 0, false)
 			defer test.Cleanup()
 			ctx := context.Background()
 
@@ -1405,9 +1409,8 @@ func TestDeleteAgent(t *testing.T) {
 			},
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			test := setupServiceTest(t, 0)
+			test := setupServiceTest(t, 0, false)
 			defer test.Cleanup()
 
 			_, err := test.ds.CreateAttestedNode(ctx, node1)
@@ -1637,9 +1640,8 @@ func TestGetAgent(t *testing.T) {
 			dsError: errors.New("datastore error"),
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			test := setupServiceTest(t, 0)
+			test := setupServiceTest(t, 0, false)
 			test.createTestNodes(ctx, t)
 			test.ds.SetNextError(tt.dsError)
 			agent, err := test.client.GetAgent(context.Background(), tt.req)
@@ -1666,7 +1668,11 @@ func TestRenewAgent(t *testing.T) {
 		AttestationDataType: "t",
 		CertNotAfter:        12345,
 		CertSerialNumber:    "6789",
+		AgentVersion:        "1.2.3",
 	}
+
+	reattestableNode := cloneAttestedNode(defaultNode)
+	reattestableNode.CanReattest = true
 
 	// Create a test CSR with empty template
 	csr, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{}, testKey)
@@ -1695,6 +1701,7 @@ func TestRenewAgent(t *testing.T) {
 		req            *agentv1.RenewAgentRequest
 		expectCode     codes.Code
 		expectMsg      string
+		expectDetail   proto.Message
 		rateLimiterErr error
 	}{
 		{
@@ -1951,11 +1958,35 @@ func TestRenewAgent(t *testing.T) {
 			expectCode: codes.Internal,
 			expectMsg:  "failed to fetch agent: some error",
 		},
+		{
+			name:       "can reattest instead",
+			createNode: reattestableNode,
+			expectLogs: []spiretest.LogEntry{
+				{
+					Level:   logrus.InfoLevel,
+					Message: "API accessed",
+					Data: logrus.Fields{
+						telemetry.Status:        "error",
+						telemetry.Type:          "audit",
+						telemetry.Csr:           csrHash,
+						telemetry.StatusCode:    "PermissionDenied",
+						telemetry.StatusMessage: "agent must reattest instead of renew",
+					},
+				},
+			},
+			req: &agentv1.RenewAgentRequest{
+				Params: &agentv1.AgentX509SVIDParams{
+					Csr: csr,
+				},
+			},
+			expectCode:   codes.PermissionDenied,
+			expectMsg:    "agent must reattest instead of renew",
+			expectDetail: &types.PermissionDeniedDetails{Reason: types.PermissionDeniedDetails_AGENT_MUST_REATTEST},
+		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			// Setup test
-			test := setupServiceTest(t, tt.agentSVIDTTL)
+			test := setupServiceTest(t, tt.agentSVIDTTL, false)
 			defer test.Cleanup()
 
 			if tt.createNode != nil {
@@ -1983,6 +2014,13 @@ func TestRenewAgent(t *testing.T) {
 			// Send param message
 			resp, err := test.client.RenewAgent(ctx, tt.req)
 			spiretest.RequireGRPCStatus(t, err, tt.expectCode, tt.expectMsg)
+			st := status.Convert(err)
+			if tt.expectDetail == nil {
+				require.Empty(t, st.Details())
+			} else {
+				require.Len(t, st.Details(), 1)
+				spiretest.RequireProtoEqual(t, tt.expectDetail, st.Details()[0].(proto.Message))
+			}
 
 			if tt.expectCode != codes.OK {
 				require.Nil(t, resp)
@@ -2021,11 +2059,125 @@ func TestRenewAgent(t *testing.T) {
 }
 
 func TestPostStatus(t *testing.T) {
-	test := setupServiceTest(t, 0)
+	for _, tt := range []struct {
+		name           string
+		request        *agentv1.PostStatusRequest
+		createAgent    bool
+		withCallerID   bool
+		expectCode     codes.Code
+		expectMsg      string
+		expectVersion  string
+		rateLimiterErr error
+	}{
+		{
+			name:         "missing caller ID",
+			request:      &agentv1.PostStatusRequest{AgentVersion: "1.0.0"},
+			createAgent:  true,
+			withCallerID: false,
+			expectCode:   codes.Internal,
+			expectMsg:    "caller ID missing from request context",
+		},
+		{
+			name:         "agent not found",
+			request:      &agentv1.PostStatusRequest{AgentVersion: "1.0.0"},
+			createAgent:  false,
+			withCallerID: true,
+			expectCode:   codes.NotFound,
+			expectMsg:    "agent not found",
+		},
+		{
+			name:          "success",
+			request:       &agentv1.PostStatusRequest{AgentVersion: "1.0.0", CurrentBundleSerial: 123},
+			createAgent:   true,
+			withCallerID:  true,
+			expectCode:    codes.OK,
+			expectVersion: "1.0.0",
+		},
+		{
+			name:          "success with empty version",
+			request:       &agentv1.PostStatusRequest{CurrentBundleSerial: 456},
+			createAgent:   true,
+			withCallerID:  true,
+			expectCode:    codes.OK,
+			expectVersion: "",
+		},
+		{
+			name: "agent version too long",
+			request: &agentv1.PostStatusRequest{
+				AgentVersion: string(make([]byte, 256)),
+			},
+			createAgent:  true,
+			withCallerID: true,
+			expectCode:   codes.InvalidArgument,
+			expectMsg:    "agent version is too long",
+		},
+		{
+			name: "agent version at max length",
+			request: &agentv1.PostStatusRequest{
+				AgentVersion: string(make([]byte, 255)),
+			},
+			createAgent:   true,
+			withCallerID:  true,
+			expectCode:    codes.OK,
+			expectVersion: string(make([]byte, 255)),
+		},
+		{
+			name: "agent version with invalid UTF-8",
+			request: &agentv1.PostStatusRequest{
+				AgentVersion: "1.0.0\xff\xfe",
+			},
+			createAgent:  true,
+			withCallerID: true,
+			expectCode:   codes.Internal,
+			expectMsg:    "grpc: error while marshaling: string field contains invalid UTF-8",
+		},
+		{
+			name:           "rate limit fails",
+			request:        &agentv1.PostStatusRequest{AgentVersion: "1.0.0", CurrentBundleSerial: 123},
+			createAgent:    true,
+			withCallerID:   true,
+			rateLimiterErr: status.Error(codes.Unknown, "rate limit fails"),
+			expectCode:     codes.Unknown,
+			expectMsg:      "rejecting request due to post status rate limiting: rate limit fails",
+		},
+	} {
+		for _, agentSpiffeIdAsSelector := range []bool{false, true} {
+			t.Run(tt.name, func(t *testing.T) {
+				test := setupServiceTest(t, 0, agentSpiffeIdAsSelector)
 
-	resp, err := test.client.PostStatus(context.Background(), &agentv1.PostStatusRequest{})
-	require.Nil(t, resp)
-	spiretest.RequireGRPCStatus(t, err, codes.Unimplemented, "unimplemented")
+				test.rateLimiter.count = 1
+				test.rateLimiter.err = tt.rateLimiterErr
+
+				if tt.createAgent {
+					_, err := test.ds.CreateAttestedNode(context.Background(), &common.AttestedNode{
+						SpiffeId:            agentID.String(),
+						AttestationDataType: "test_type",
+						CertSerialNumber:    "12345",
+						CertNotAfter:        time.Now().Add(time.Hour).Unix(),
+					})
+					require.NoError(t, err)
+				}
+
+				test.withCallerID = tt.withCallerID
+
+				resp, err := test.client.PostStatus(context.Background(), tt.request)
+
+				if tt.expectCode != codes.OK {
+					require.Nil(t, resp)
+					spiretest.RequireGRPCStatusHasPrefix(t, err, tt.expectCode, tt.expectMsg)
+				} else {
+					require.NoError(t, err)
+					require.NotNil(t, resp)
+
+					// Verify the agent version was updated in the datastore
+					node, err := test.ds.FetchAttestedNode(context.Background(), agentID.String())
+					require.NoError(t, err)
+					require.NotNil(t, node)
+					require.Equal(t, tt.expectVersion, node.AgentVersion)
+				}
+			})
+		}
+	}
 }
 
 func TestCreateJoinToken(t *testing.T) {
@@ -2127,9 +2279,8 @@ func TestCreateJoinToken(t *testing.T) {
 			},
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			test := setupServiceTest(t, 0)
+			test := setupServiceTest(t, 0, false)
 			test.ds.SetNextError(tt.dsError)
 
 			result, err := test.client.CreateJoinToken(context.Background(), tt.request)
@@ -2148,7 +2299,7 @@ func TestCreateJoinToken(t *testing.T) {
 }
 
 func TestCreateJoinTokenWithAgentId(t *testing.T) {
-	test := setupServiceTest(t, 0)
+	test := setupServiceTest(t, 0, false)
 
 	_, err := test.client.CreateJoinToken(context.Background(), &agentv1.CreateJoinTokenRequest{
 		Ttl:     1000,
@@ -2206,6 +2357,66 @@ func TestCreateJoinTokenWithAgentId(t *testing.T) {
 	require.Equal(t, "spiffe://example.org/spire/agent/join_token/"+token.Value, listEntries.Entries[0].Selectors[0].Value)
 }
 
+// TestCascadeDeleteJoinTokenAliasEntry exercises the real create→delete path: a
+// CreateJoinToken with an AgentId writes the auto-alias entry via
+// createJoinTokenRegistrationEntry, and DeleteAgent removes the join-token node, which
+// must cascade-delete that alias entry through deleteAttestedNodeAndSelectors in the
+// SQL datastore. If either side's notion of the alias shape drifts, this fails.
+// fakedatastore is backed by the real sqlstore, so the cascade actually runs.
+func TestCascadeDeleteJoinTokenAliasEntry(t *testing.T) {
+	test := setupServiceTest(t, 0, false)
+	defer test.Cleanup()
+
+	token, err := test.client.CreateJoinToken(ctx, &agentv1.CreateJoinTokenRequest{
+		Ttl:     1000,
+		AgentId: &types.SPIFFEID{TrustDomain: "example.org", Path: "/valid"},
+	})
+	require.NoError(t, err)
+
+	nodeID := "spiffe://example.org/spire/agent/join_token/" + token.Value
+
+	listEntries, err := test.ds.ListRegistrationEntries(ctx, &datastore.ListRegistrationEntriesRequest{})
+	require.NoError(t, err)
+	require.Len(t, listEntries.Entries, 1)
+	aliasEntryID := listEntries.Entries[0].EntryId
+	require.Equal(t, nodeID, listEntries.Entries[0].ParentId)
+
+	// Attest the node as a join-token node so it carries the SPIFFE ID and DataType
+	// the cascade keys on.
+	_, err = test.ds.CreateAttestedNode(ctx, &common.AttestedNode{
+		SpiffeId:            nodeID,
+		AttestationDataType: "join_token",
+		CertSerialNumber:    "badcafe",
+		CertNotAfter:        time.Now().Add(time.Hour).Unix(),
+	})
+	require.NoError(t, err)
+
+	beforeEvents, err := test.ds.ListRegistrationEntryEvents(ctx, &datastore.ListRegistrationEntryEventsRequest{})
+	require.NoError(t, err)
+	var lastEventID uint
+	if n := len(beforeEvents.Events); n > 0 {
+		lastEventID = beforeEvents.Events[n-1].EventID
+	}
+
+	_, err = test.client.DeleteAgent(ctx, &agentv1.DeleteAgentRequest{
+		Id: &types.SPIFFEID{TrustDomain: "example.org", Path: "/spire/agent/join_token/" + token.Value},
+	})
+	require.NoError(t, err)
+
+	// The alias entry is cascade-deleted...
+	entries, err := test.ds.FetchRegistrationEntries(ctx, []string{aliasEntryID})
+	require.NoError(t, err)
+	require.Nil(t, entries[aliasEntryID])
+
+	// ...and a registration entry event is emitted for it.
+	events, err := test.ds.ListRegistrationEntryEvents(ctx, &datastore.ListRegistrationEntryEventsRequest{
+		GreaterThanEventID: lastEventID,
+	})
+	require.NoError(t, err)
+	require.Len(t, events.Events, 1)
+	require.Equal(t, aliasEntryID, events.Events[0].EntryID)
+}
+
 func TestAttestAgent(t *testing.T) {
 	testCsr, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{}, testKey)
 	require.NoError(t, err)
@@ -2219,11 +2430,14 @@ func TestAttestAgent(t *testing.T) {
 		request           *agentv1.AttestAgentRequest
 		expectedID        spiffeid.ID
 		expectedSelectors []*common.Selector
+		expectedVersion   string
 		expectCode        codes.Code
 		expectMsg         string
 		expectLogs        []spiretest.LogEntry
 		rateLimiterErr    error
 		dsError           []error
+
+		allowNonconformingAgentIDs bool
 	}{
 		{
 			name:       "empty request",
@@ -2686,6 +2900,7 @@ func TestAttestAgent(t *testing.T) {
 			expectedSelectors: []*common.Selector{
 				{Type: "test_type", Value: "attested_before"},
 			},
+			expectedVersion: "1.2.3",
 			expectLogs: []spiretest.LogEntry{
 				{
 					Level:   logrus.InfoLevel,
@@ -3032,11 +3247,41 @@ func TestAttestAgent(t *testing.T) {
 		{
 			name:       "nodeattestor returns ID outside of its namespace",
 			request:    getAttestAgentRequest("test_type", []byte("payload_return_id_outside_namespace"), testCsr),
-			expectedID: spiffeid.RequireFromPath(td, "/id_outside_namespace"),
+			expectCode: codes.Internal,
+			expectMsg:  "node attestor produced an invalid agent ID; set the allow_nonconforming_agent_ids experimental setting to allow it",
+			expectLogs: []spiretest.LogEntry{
+				{
+					Level:   logrus.ErrorLevel,
+					Message: "Node attestor produced an invalid agent ID; set the allow_nonconforming_agent_ids experimental setting to allow it",
+					Data: logrus.Fields{
+						telemetry.NodeAttestorType: "test_type",
+						telemetry.AgentID:          spiffeid.RequireFromPath(td, "/id_outside_namespace").String(),
+						logrus.ErrorKey:            `"spiffe://example.org/id_outside_namespace" is not in the agent namespace for attestor "test_type"`,
+					},
+				},
+				{
+					Level:   logrus.InfoLevel,
+					Message: "API accessed",
+					Data: logrus.Fields{
+						telemetry.Status:           "error",
+						telemetry.Type:             "audit",
+						telemetry.StatusCode:       "Internal",
+						telemetry.StatusMessage:    `node attestor produced an invalid agent ID; set the allow_nonconforming_agent_ids experimental setting to allow it: "spiffe://example.org/id_outside_namespace" is not in the agent namespace for attestor "test_type"`,
+						telemetry.AgentID:          "spiffe://example.org/id_outside_namespace",
+						telemetry.NodeAttestorType: "test_type",
+					},
+				},
+			},
+		},
+		{
+			name:                       "nodeattestor returns ID outside of its namespace with nonconforming IDs allowed",
+			request:                    getAttestAgentRequest("test_type", []byte("payload_return_id_outside_namespace"), testCsr),
+			allowNonconformingAgentIDs: true,
+			expectedID:                 spiffeid.RequireFromPath(td, "/id_outside_namespace"),
 			expectLogs: []spiretest.LogEntry{
 				{
 					Level:   logrus.WarnLevel,
-					Message: "The node attestor produced an invalid agent ID; future releases will enforce that agent IDs are within the reserved agent namesepace for the node attestor",
+					Message: "The node attestor produced an invalid agent ID; allowed by the allow_nonconforming_agent_ids experimental setting",
 					Data: logrus.Fields{
 						telemetry.NodeAttestorType: "test_type",
 						telemetry.AgentID:          spiffeid.RequireFromPath(td, "/id_outside_namespace").String(),
@@ -3097,72 +3342,74 @@ func TestAttestAgent(t *testing.T) {
 			},
 		},
 	} {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			// setup
-			test := setupServiceTest(t, 0)
-			defer func() {
-				// Since this is a bidirectional streaming API, it's possible
-				// that the server is still emitting auditing logs even though
-				// we've received the last response from the server. In order
-				// to avoid racing on the log hook, clean up the test (to make
-				// sure the server has shut down) before checking for log
-				// entries.
-				test.Cleanup()
+		for _, agentSpiffeIdAsSelector := range []bool{false, true} {
+			t.Run(tt.name, func(t *testing.T) {
+				// setup
+				test := setupServiceTest(t, 0, agentSpiffeIdAsSelector, func(c *agent.Config) {
+					c.AllowNonconformingAgentIDs = tt.allowNonconformingAgentIDs
+				})
+				defer func() {
+					// Since this is a bidirectional streaming API, it's possible
+					// that the server is still emitting auditing logs even though
+					// we've received the last response from the server. In order
+					// to avoid racing on the log hook, clean up the test (to make
+					// sure the server has shut down) before checking for log
+					// entries.
+					test.Cleanup()
 
-				// Scrub out client address before comparing logs.
-				for _, e := range test.logHook.AllEntries() {
-					if _, ok := e.Data[telemetry.Address]; ok {
-						e.Data[telemetry.Address] = ""
+					// Scrub out client address before comparing logs.
+					for _, e := range test.logHook.AllEntries() {
+						if _, ok := e.Data[telemetry.Address]; ok {
+							e.Data[telemetry.Address] = ""
+						}
 					}
+
+					spiretest.AssertLogsAnyOrder(t, test.logHook.AllEntries(), tt.expectLogs)
+				}()
+
+				ctx := t.Context()
+
+				test.setupAttestor(t)
+				test.setupJoinTokens(ctx, t)
+				test.setupNodes(ctx, t)
+
+				test.rateLimiter.count = 1
+				test.rateLimiter.err = tt.rateLimiterErr
+				for _, err := range tt.dsError {
+					test.ds.AppendNextError(err)
 				}
 
-				spiretest.AssertLogsAnyOrder(t, test.logHook.AllEntries(), tt.expectLogs)
-			}()
-
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-
-			test.setupAttestor(t)
-			test.setupJoinTokens(ctx, t)
-			test.setupNodes(ctx, t)
-
-			test.rateLimiter.count = 1
-			test.rateLimiter.err = tt.rateLimiterErr
-			for _, err := range tt.dsError {
-				test.ds.AppendNextError(err)
-			}
-
-			// exercise
-			stream, err := test.client.AttestAgent(ctx)
-			require.NoError(t, err)
-			result, err := attest(t, stream, tt.request)
-			errClose := stream.CloseSend()
-			require.NoError(t, errClose)
-
-			if tt.retry {
-				// make sure that the first request went well
+				// exercise
+				stream, err := test.client.AttestAgent(ctx)
 				require.NoError(t, err)
-				require.NotNil(t, result)
-
-				// attest once more
-				stream, err = test.client.AttestAgent(ctx)
-				require.NoError(t, err)
-				result, err = attest(t, stream, tt.request)
+				result, err := attest(t, stream, tt.request)
 				errClose := stream.CloseSend()
 				require.NoError(t, errClose)
-			}
 
-			spiretest.RequireGRPCStatusContains(t, err, tt.expectCode, tt.expectMsg)
-			switch {
-			case tt.expectCode != codes.OK:
-				require.Nil(t, result)
-			default:
-				require.NotNil(t, result)
-				test.assertAttestAgentResult(t, tt.expectedID, result)
-				test.assertAgentWasStored(t, tt.expectedID.String(), tt.expectedSelectors)
-			}
-		})
+				if tt.retry {
+					// make sure that the first request went well
+					require.NoError(t, err)
+					require.NotNil(t, result)
+
+					// attest once more
+					stream, err = test.client.AttestAgent(ctx)
+					require.NoError(t, err)
+					result, err = attest(t, stream, tt.request)
+					errClose := stream.CloseSend()
+					require.NoError(t, errClose)
+				}
+
+				spiretest.RequireGRPCStatusContains(t, err, tt.expectCode, tt.expectMsg)
+				switch {
+				case tt.expectCode != codes.OK:
+					require.Nil(t, result)
+				default:
+					require.NotNil(t, result)
+					test.assertAttestAgentResult(t, tt.expectedID, result)
+					test.assertAgentWasStored(t, tt.expectedID.String(), tt.expectedSelectors, tt.expectedVersion, agentSpiffeIdAsSelector)
+				}
+			})
+		}
 	}
 }
 
@@ -3186,7 +3433,7 @@ func (s *serviceTest) Cleanup() {
 	}
 }
 
-func setupServiceTest(t *testing.T, agentSVIDTTL time.Duration) *serviceTest {
+func setupServiceTest(t *testing.T, agentSVIDTTL time.Duration, agentSpiffeIdAsSelector bool, opts ...func(*agent.Config)) *serviceTest {
 	ca := fakeserverca.New(t, td, &fakeserverca.Options{
 		AgentSVIDTTL: agentSVIDTTL,
 	})
@@ -3194,13 +3441,18 @@ func setupServiceTest(t *testing.T, agentSVIDTTL time.Duration) *serviceTest {
 	cat := fakeservercatalog.New()
 	clk := clock.NewMock(t)
 
-	service := agent.New(agent.Config{
-		ServerCA:    ca,
-		DataStore:   ds,
-		TrustDomain: td,
-		Clock:       clk,
-		Catalog:     cat,
-	})
+	config := agent.Config{
+		ServerCA:                ca,
+		DataStore:               ds,
+		TrustDomain:             td,
+		Clock:                   clk,
+		Catalog:                 cat,
+		AgentSpiffeIdAsSelector: agentSpiffeIdAsSelector,
+	}
+	for _, opt := range opts {
+		opt(&config)
+	}
+	service := agent.New(config)
 
 	log, logHook := test.NewNullLogger()
 	log.Level = logrus.DebugLevel
@@ -3229,10 +3481,10 @@ func setupServiceTest(t *testing.T, agentSVIDTTL time.Duration) *serviceTest {
 		agent.RegisterService(s, service)
 	},
 		grpctest.OverrideContext(overrideContext),
-		grpctest.Middleware(middleware.WithAuditLog(false)),
+		grpctest.Middleware(middleware.WithAuditLog(false, false)),
 	)
 
-	conn := server.Dial(t)
+	conn := server.NewGRPCClient(t)
 
 	test.client = agentv1.NewAgentClient(conn)
 	test.done = server.Stop
@@ -3273,6 +3525,7 @@ func (s *serviceTest) setupNodes(ctx context.Context, t *testing.T) {
 		AttestationDataType: "test_type",
 		SpiffeId:            spiffeid.RequireFromPath(td, "/spire/agent/test_type/id_attested_before").String(),
 		CertSerialNumber:    "test_serial_number",
+		AgentVersion:        "1.2.3",
 	}
 	_, err := s.ds.CreateAttestedNode(ctx, node)
 	require.NoError(t, err)
@@ -3347,7 +3600,7 @@ func (s *serviceTest) assertAttestAgentResult(t *testing.T, expectedID spiffeid.
 	require.Equal(t, []*url.URL{expectedID.URL()}, x509Svid.URIs)
 }
 
-func (s *serviceTest) assertAgentWasStored(t *testing.T, expectedID string, expectedSelectors []*common.Selector) {
+func (s *serviceTest) assertAgentWasStored(t *testing.T, expectedID string, expectedSelectors []*common.Selector, expectedVersion string, agentSpiffeIdAsSelector bool) {
 	attestedAgent, err := s.ds.FetchAttestedNode(ctx, expectedID)
 	require.NoError(t, err)
 	require.NotNil(t, attestedAgent)
@@ -3355,7 +3608,15 @@ func (s *serviceTest) assertAgentWasStored(t *testing.T, expectedID string, expe
 
 	agentSelectors, err := s.ds.GetNodeSelectors(ctx, expectedID, datastore.RequireCurrent)
 	require.NoError(t, err)
-	require.EqualValues(t, expectedSelectors, agentSelectors)
+
+	eSelectors := make([]*common.Selector, len(expectedSelectors))
+	copy(eSelectors, expectedSelectors)
+	if agentSpiffeIdAsSelector {
+		eSelectors = append(eSelectors, &common.Selector{Type: "spiffe_id", Value: expectedID})
+	}
+
+	require.ElementsMatch(t, eSelectors, agentSelectors)
+	require.Equal(t, attestedAgent.AgentVersion, expectedVersion)
 }
 
 type fakeRateLimiter struct {
@@ -3397,7 +3658,9 @@ func attest(t *testing.T, stream agentv1.Agent_AttestAgentClient, request *agent
 	for {
 		// send
 		err := stream.Send(request)
-		require.NoError(t, err)
+		if !errors.Is(err, io.EOF) {
+			require.NoError(t, err)
+		}
 
 		// recv
 		resp, err := stream.Recv()

@@ -18,13 +18,21 @@ var (
 			address = "unix:///some/socket/path"
 		}
 `
+	minimalEnvServerAPIConfig = `
+		domains = ["${SPIFFE_TRUST_DOMAIN}"]
+		acme {
+			email = "admin@${SPIFFE_TRUST_DOMAIN}"
+			tos_accepted = true
+		}
+		server_api {
+			address = "unix:///some/socket/path"
+		}
+`
 
 	serverAPIConfig = &ServerAPIConfig{
 		Address:      "unix:///some/socket/path",
 		PollInterval: defaultPollInterval,
 	}
-
-	fileDontExistMessage = "no such file or directory"
 )
 
 func parseConfigCasesOS() []parseConfigCase {
@@ -50,7 +58,7 @@ func parseConfigCasesOS() []parseConfigCase {
 					socket_path = "/other/socket/path"
 				}
 			`,
-			err: "either acme, serving_cert_file, insecure_addr or listen_socket_path must be configured",
+			err: "one of serving_cert_source, acme, serving_cert_file, insecure_addr or listen_socket_path must be configured",
 		},
 		{
 			name: "ACME ToS not accepted",
@@ -99,7 +107,7 @@ func parseConfigCasesOS() []parseConfigCase {
 					CacheDir:     "",
 					Email:        "admin@domain.test",
 					DirectoryURL: "https://directory.test",
-					RawCacheDir:  stringPtr(""),
+					RawCacheDir:  new(""),
 					ToSAccepted:  true,
 				},
 				ServerAPI: &ServerAPIConfig{
@@ -355,7 +363,47 @@ func parseConfigCasesOS() []parseConfigCase {
 				server_api { address = "unix:///some/socket/path" }
 				workload_api { socket_path = "/some/socket/path" trust_domain="foo.test" }
 			`,
-			err: "the server_api and workload_api sections are mutually exclusive",
+			err: "the server_api, workload_api, and file sections are mutually exclusive",
+		},
+		{
+			name: "more than one source section configured",
+			in: `
+				domains = ["domain.test"]
+				acme {
+					email = "admin@domain.test"
+					tos_accepted = true
+				}
+				server_api { address = "unix:///some/socket/path" }
+				file { path = "/some/file.spiffe" }
+			`,
+			err: "the server_api, workload_api, and file sections are mutually exclusive",
+		},
+		{
+			name: "more than one source section configured",
+			in: `
+				domains = ["domain.test"]
+				acme {
+					email = "admin@domain.test"
+					tos_accepted = true
+				}
+				workload_api { socket_path = "/some/socket/path" trust_domain="foo.test" }
+				file { path = "/some/file.spiffe" }
+			`,
+			err: "the server_api, workload_api, and file sections are mutually exclusive",
+		},
+		{
+			name: "more than one source section configured",
+			in: `
+				domains = ["domain.test"]
+				acme {
+					email = "admin@domain.test"
+					tos_accepted = true
+				}
+				server_api { address = "unix:///some/socket/path" }
+				workload_api { socket_path = "/some/socket/path" trust_domain="foo.test" }
+				file { path = "/some/file.spiffe" }
+			`,
+			err: "the server_api, workload_api, and file sections are mutually exclusive",
 		},
 		{
 			name: "minimal server API config",
@@ -634,6 +682,118 @@ func parseConfigCasesOS() []parseConfigCase {
 					CacheDir:    defaultCacheDir,
 					Email:       "admin@domain.test",
 					ToSAccepted: true,
+				},
+				ServerAPI: &ServerAPIConfig{
+					Address:      "unix:///some/socket/path",
+					PollInterval: defaultPollInterval,
+				},
+				HealthChecks: nil,
+			},
+		},
+		{
+			name: "with JWT issuer",
+			in: `
+				domains = ["domain.test"]
+				jwt_issuer = "https://domain.test/some/issuer/path/issuer1/"
+				serving_cert_file {
+					cert_file_path = "test"
+					key_file_path = "test"
+				}
+				server_api {
+					address = "unix:///some/socket/path"
+				}
+			`,
+			out: &Config{
+				LogLevel:  defaultLogLevel,
+				Domains:   []string{"domain.test"},
+				JWTIssuer: "https://domain.test/some/issuer/path/issuer1/",
+				ServingCertFile: &ServingCertFileConfig{
+					CertFilePath:     "test",
+					KeyFilePath:      "test",
+					FileSyncInterval: time.Minute,
+					Addr: &net.TCPAddr{
+						IP:   nil,
+						Port: 443,
+					},
+					RawAddr: ":443",
+				},
+				ServerAPI: &ServerAPIConfig{
+					Address:      "unix:///some/socket/path",
+					PollInterval: defaultPollInterval,
+				},
+				HealthChecks: nil,
+			},
+		},
+		{
+			name: "JWT issuer with missing scheme",
+			in: `
+				domains = ["domain.test"]
+				jwt_issuer = "domain.test/some/issuer/path/issuer1/"
+				serving_cert_file {
+					cert_file_path = "test"
+					key_file_path = "test"
+				}
+				server_api {
+					address = "unix:///some/socket/path"
+				}
+			`,
+			err: "the jwt_issuer url must contain a scheme",
+		},
+		{
+			name: "JWT issuer with missing host",
+			in: `
+				domains = ["domain.test"]
+				jwt_issuer = "https:///path"
+				serving_cert_file {
+					cert_file_path = "test"
+					key_file_path = "test"
+				}
+				server_api {
+					address = "unix:///some/socket/path"
+				}
+			`,
+			err: "the jwt_issuer url must contain a host",
+		},
+		{
+			name: "JWT issuer is invalid",
+			in: `
+				domains = ["domain.test"]
+				jwt_issuer = "http://domain.test:someportnumber/some/path"
+				serving_cert_file {
+					cert_file_path = "test"
+					key_file_path = "test"
+				}
+				server_api {
+					address = "unix:///some/socket/path"
+				}
+			`,
+			err: "the jwt_issuer url could not be parsed",
+		},
+		{
+			name: "JWT issuer is empty",
+			in: `
+				domains = ["domain.test"]
+				jwt_issuer = ""
+				serving_cert_file {
+					cert_file_path = "test"
+					key_file_path = "test"
+				}
+				server_api {
+					address = "unix:///some/socket/path"
+				}
+			`,
+			out: &Config{
+				LogLevel: defaultLogLevel,
+				Domains:  []string{"domain.test"},
+				ServingCertFile: &ServingCertFileConfig{
+					CertFilePath:     "test",
+					KeyFilePath:      "test",
+					FileSyncInterval: time.Minute,
+					Addr: &net.TCPAddr{
+						IP:   nil,
+						Port: 443,
+					},
+					RawAddr: ":443",
 				},
 				ServerAPI: &ServerAPIConfig{
 					Address:      "unix:///some/socket/path",

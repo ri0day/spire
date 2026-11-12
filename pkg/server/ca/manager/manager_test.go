@@ -10,20 +10,25 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"os"
-	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/sirupsen/logrus"
 	"github.com/sirupsen/logrus/hooks/test"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	upstreamauthorityv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/plugin/server/upstreamauthority/v1"
+	plugintypes "github.com/spiffe/spire-plugin-sdk/proto/spire/plugin/types"
+	"github.com/spiffe/spire/pkg/common/catalog"
+	"github.com/spiffe/spire/pkg/common/coretypes/x509certificate"
 	telemetry_server "github.com/spiffe/spire/pkg/common/telemetry/server"
+	"github.com/spiffe/spire/pkg/common/x509util"
 	"github.com/spiffe/spire/pkg/server/ca"
 	"github.com/spiffe/spire/pkg/server/credtemplate"
 	"github.com/spiffe/spire/pkg/server/credvalidator"
 	"github.com/spiffe/spire/pkg/server/datastore"
+	"github.com/spiffe/spire/pkg/server/plugin/credentialcomposer"
 	"github.com/spiffe/spire/pkg/server/plugin/keymanager"
 	"github.com/spiffe/spire/pkg/server/plugin/notifier"
 	"github.com/spiffe/spire/pkg/server/plugin/upstreamauthority"
@@ -37,9 +42,12 @@ import (
 	"github.com/spiffe/spire/test/fakes/fakeserverkeymanager"
 	"github.com/spiffe/spire/test/fakes/fakeupstreamauthority"
 	"github.com/spiffe/spire/test/spiretest"
+	"github.com/spiffe/spire/test/testca"
+	"github.com/spiffe/spire/test/testkey"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -58,6 +66,7 @@ func TestGetCurrentJWTKeySlot(t *testing.T) {
 
 	test := setupTest(t)
 	test.initSelfSignedManager()
+	require.False(t, test.m.IsUpstreamAuthority())
 
 	t.Run("no authority created", func(t *testing.T) {
 		currentSlot := test.m.GetCurrentJWTKeySlot()
@@ -116,6 +125,70 @@ func TestGetNextJWTKeySlot(t *testing.T) {
 	})
 }
 
+func TestGetCurrentWITKeySlot(t *testing.T) {
+	ctx := context.Background()
+
+	test := setupTest(t)
+	test.initSelfSignedManager()
+	require.False(t, test.m.IsUpstreamAuthority())
+
+	t.Run("no authority created", func(t *testing.T) {
+		currentSlot := test.m.GetCurrentWITKeySlot()
+
+		slot := currentSlot.(*witKeySlot)
+
+		require.True(t, slot.IsEmpty())
+		require.Empty(t, slot.issuedAt)
+		require.Empty(t, slot.authorityID)
+		require.Empty(t, slot.notAfter)
+	})
+
+	t.Run("slot returned", func(t *testing.T) {
+		expectIssuedAt := test.clock.Now()
+		expectNotAfter := expectIssuedAt.Add(test.m.caTTL)
+
+		require.NoError(t, test.m.PrepareWITKey(ctx))
+
+		currentSlot := test.m.GetCurrentWITKeySlot()
+		slot := currentSlot.(*witKeySlot)
+		require.NotNil(t, slot.witKey)
+		require.NotEmpty(t, slot.authorityID)
+		require.Equal(t, expectIssuedAt, slot.issuedAt)
+		require.Equal(t, expectNotAfter, slot.notAfter)
+	})
+}
+
+func TestGetNextWITKeySlot(t *testing.T) {
+	ctx := context.Background()
+
+	test := setupTest(t)
+	test.initAndActivateSelfSignedManager(ctx)
+
+	t.Run("no next created", func(t *testing.T) {
+		nextSlot := test.m.GetNextWITKeySlot()
+		slot := nextSlot.(*witKeySlot)
+
+		require.Nil(t, slot.witKey)
+		require.Empty(t, slot.issuedAt)
+		require.Empty(t, slot.authorityID)
+		require.Empty(t, slot.notAfter)
+	})
+
+	t.Run("next returned", func(t *testing.T) {
+		expectIssuedAt := test.clock.Now()
+		expectNotAfter := expectIssuedAt.Add(test.m.caTTL)
+
+		require.NoError(t, test.m.PrepareWITKey(ctx))
+
+		nextSlot := test.m.GetNextWITKeySlot()
+		slot := nextSlot.(*witKeySlot)
+		require.NotNil(t, slot.witKey)
+		require.NotEmpty(t, slot.authorityID)
+		require.Equal(t, expectIssuedAt, slot.issuedAt)
+		require.Equal(t, expectNotAfter, slot.notAfter)
+	})
+}
+
 func TestGetCurrentX509CASlot(t *testing.T) {
 	ctx := context.Background()
 
@@ -128,6 +201,7 @@ func TestGetCurrentX509CASlot(t *testing.T) {
 		slot := currentSlot.(*x509CASlot)
 		require.Nil(t, slot.x509CA)
 		require.Empty(t, slot.authorityID)
+		require.Empty(t, slot.upstreamAuthorityID)
 		require.Empty(t, slot.issuedAt)
 		require.Empty(t, slot.publicKey)
 		require.Empty(t, slot.notAfter)
@@ -143,9 +217,29 @@ func TestGetCurrentX509CASlot(t *testing.T) {
 		slot := currentSlot.(*x509CASlot)
 		require.NotNil(t, slot.x509CA)
 		require.NotEmpty(t, slot.authorityID)
+		require.Empty(t, slot.upstreamAuthorityID)
 		require.NotNil(t, slot.publicKey)
 		require.Equal(t, expectIssuedAt, slot.issuedAt)
 		require.Equal(t, expectNotAfter, slot.notAfter)
+	})
+}
+
+func TestCAPolicyIdentifiers(t *testing.T) {
+	ctx := context.Background()
+
+	test := setupTest(t)
+	test.initSelfSignedManager()
+	policy, err := x509.ParseOID("1.2.3.4")
+	require.NoError(t, err)
+	test.cc.policies = append(test.cc.policies, policy)
+
+	t.Run("contains policy identifiers", func(t *testing.T) {
+		require.NoError(t, test.m.PrepareX509CA(ctx))
+
+		currentSlot := test.m.GetCurrentX509CASlot()
+		slot := currentSlot.(*x509CASlot)
+		require.NotNil(t, slot.x509CA)
+		require.Equal(t, slot.x509CA.Certificate.Policies, test.cc.policies)
 	})
 }
 
@@ -161,6 +255,7 @@ func TestGetNextX509CASlot(t *testing.T) {
 
 		require.Nil(t, slot.x509CA)
 		require.Empty(t, slot.authorityID)
+		require.Empty(t, slot.upstreamAuthorityID)
 		require.Empty(t, slot.issuedAt)
 		require.Empty(t, slot.publicKey)
 		require.Empty(t, slot.notAfter)
@@ -176,6 +271,7 @@ func TestGetNextX509CASlot(t *testing.T) {
 		slot := nextSlot.(*x509CASlot)
 		require.NotNil(t, slot.x509CA)
 		require.NotEmpty(t, slot.authorityID)
+		require.Empty(t, slot.upstreamAuthorityID)
 		require.NotNil(t, slot.publicKey)
 		require.Equal(t, expectIssuedAt, slot.issuedAt)
 		require.Equal(t, expectNotAfter, slot.notAfter)
@@ -191,34 +287,43 @@ func TestPersistence(t *testing.T) {
 	test.initSelfSignedManager()
 	require.Nil(t, test.currentJWTKey())
 	require.Nil(t, test.currentX509CA())
+	require.Nil(t, test.currentWITKey())
 
 	// Prepare authority and activate authority
 	require.NoError(t, test.m.PrepareJWTKey(ctx))
 	test.m.ActivateJWTKey(ctx)
 	require.NoError(t, test.m.PrepareX509CA(ctx))
 	test.m.ActivateX509CA(ctx)
+	require.NoError(t, test.m.PrepareWITKey(ctx))
+	test.m.ActivateWITKey(ctx)
 
-	firstX509CA, firstJWTKey := test.currentX509CA(), test.currentJWTKey()
+	firstX509CA, firstJWTKey, firstWITKey := test.currentX509CA(), test.currentJWTKey(), test.currentWITKey()
 
 	// reinitialize against the same storage
 	test.initSelfSignedManager()
+
 	test.requireX509CAEqual(t, firstX509CA, test.currentX509CA())
 	test.requireJWTKeyEqual(t, firstJWTKey, test.currentJWTKey())
+	test.requireWITKeyEqual(t, firstWITKey, test.currentWITKey())
 
 	require.Nil(t, test.nextX509CA())
 	require.Nil(t, test.nextJWTKey())
+	require.Nil(t, test.nextWITKey())
 
 	// prepare the next and reinitialize, move time
 	test.clock.Add(prepareAfter + time.Minute)
 	require.NoError(t, test.m.PrepareJWTKey(ctx))
 	require.NoError(t, test.m.PrepareX509CA(ctx))
+	require.NoError(t, test.m.PrepareWITKey(ctx))
 
-	secondX509CA, secondJWTKey := test.nextX509CA(), test.nextJWTKey()
+	secondX509CA, secondJWTKey, secondWITKey := test.nextX509CA(), test.nextJWTKey(), test.nextWITKey()
 	test.initSelfSignedManager()
 	test.requireX509CAEqual(t, firstX509CA, test.currentX509CA())
 	test.requireJWTKeyEqual(t, firstJWTKey, test.currentJWTKey())
+	test.requireWITKeyEqual(t, firstWITKey, test.currentWITKey())
 	test.requireX509CAEqual(t, secondX509CA, test.nextX509CA())
 	test.requireJWTKeyEqual(t, secondJWTKey, test.nextJWTKey())
+	test.requireWITKeyEqual(t, secondWITKey, test.nextWITKey())
 }
 
 func TestSlotLoadedWhenJournalIsLost(t *testing.T) {
@@ -226,12 +331,13 @@ func TestSlotLoadedWhenJournalIsLost(t *testing.T) {
 
 	test := setupTest(t)
 	test.initAndActivateSelfSignedManager(ctx)
-	x509CA, jwtKey := test.currentX509CA(), test.currentJWTKey()
+	x509CA, jwtKey, witKey := test.currentX509CA(), test.currentJWTKey(), test.currentWITKey()
 
 	// After reinitialize keep current still there
 	test.initSelfSignedManager()
 	test.requireX509CAEqual(t, x509CA, test.currentX509CA())
 	test.requireJWTKeyEqual(t, jwtKey, test.currentJWTKey())
+	test.requireWITKeyEqual(t, witKey, test.currentWITKey())
 
 	// wipe the journal, reinitialize, and make sure the keys differ. this
 	// simulates the key manager having dangling keys.
@@ -240,6 +346,66 @@ func TestSlotLoadedWhenJournalIsLost(t *testing.T) {
 	// After journal is lost no slot is found
 	require.True(t, test.m.GetCurrentJWTKeySlot().IsEmpty())
 	require.True(t, test.m.GetCurrentX509CASlot().IsEmpty())
+	require.True(t, test.m.GetCurrentWITKeySlot().IsEmpty())
+}
+
+func TestNotifyTaintedX509Authority(t *testing.T) {
+	ctx := context.Background()
+	test := setupTest(t)
+	test.initSelfSignedManager()
+
+	// Create a test CA
+	ca := testca.New(t, testTrustDomain)
+	cert := ca.X509Authorities()[0]
+	bundle, err := test.ds.CreateBundle(ctx, &common.Bundle{
+		TrustDomainId: testTrustDomain.IDString(),
+		RootCas: []*common.Certificate{
+			{
+				DerBytes:   cert.Raw,
+				TaintedKey: true,
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	t.Run("notify tainted authority", func(t *testing.T) {
+		err = test.m.NotifyTaintedX509Authority(ctx, ca.GetSubjectKeyID())
+		require.NoError(t, err)
+		ctx, cancel := context.WithTimeout(ctx, time.Minute)
+		defer cancel()
+
+		expectedTaintedAuthorities := []*x509.Certificate{cert}
+		select {
+		case taintedAuthorities := <-test.ca.taintedAuthoritiesCh:
+			require.Equal(t, expectedTaintedAuthorities, taintedAuthorities)
+		case <-ctx.Done():
+			assert.Fail(t, "no notification received")
+		}
+	})
+
+	// Untaint authority
+	bundle.RootCas[0].TaintedKey = false
+	bundle, err = test.ds.UpdateBundle(ctx, bundle, nil)
+	require.NoError(t, err)
+
+	t.Run("no tainted authority", func(t *testing.T) {
+		err := test.m.NotifyTaintedX509Authority(ctx, ca.GetSubjectKeyID())
+
+		expectedErr := fmt.Sprintf("no tainted root CA found with authority ID: %q", ca.GetSubjectKeyID())
+		require.EqualError(t, err, expectedErr)
+	})
+
+	bundle.RootCas = append(bundle.RootCas, &common.Certificate{
+		DerBytes:   []byte("foh"),
+		TaintedKey: true,
+	})
+	_, err = test.ds.UpdateBundle(ctx, bundle, nil)
+	require.NoError(t, err)
+
+	t.Run("malformed root CA", func(t *testing.T) {
+		err := test.m.NotifyTaintedX509Authority(ctx, ca.GetSubjectKeyID())
+		require.EqualError(t, err, "failed to parse RootCA: x509: malformed certificate")
+	})
 }
 
 func TestSelfSigning(t *testing.T) {
@@ -264,19 +430,20 @@ func TestUpstreamSigned(t *testing.T) {
 	ctx := context.Background()
 	test := setupTest(t)
 
-	upstreamAuthority, fakeUA := fakeupstreamauthority.Load(t, fakeupstreamauthority.Config{
+	upstreamAuthority, fakeUA := test.newFakeUpstreamAuthority(t, fakeupstreamauthority.Config{
 		TrustDomain:           testTrustDomain,
 		DisallowPublishJWTKey: true,
 	})
 
 	test.initAndActivateUpstreamSignedManager(ctx, upstreamAuthority)
+	require.True(t, test.m.IsUpstreamAuthority())
 
 	// X509 CA should be set up to be an intermediate but only have itself
 	// in the chain since it was signed directly by the upstream root.
 	x509CA := test.currentX509CA()
 	assert.NotNil(t, x509CA.Signer)
 	if assert.NotNil(t, x509CA.Certificate) {
-		assert.Equal(t, fakeUA.X509Root().Subject, x509CA.Certificate.Issuer)
+		assert.Equal(t, fakeUA.X509Root().Certificate.Subject, x509CA.Certificate.Issuer)
 	}
 	if assert.Len(t, x509CA.UpstreamChain, 1) {
 		assert.Equal(t, x509CA.Certificate, x509CA.UpstreamChain[0])
@@ -292,12 +459,374 @@ func TestUpstreamSigned(t *testing.T) {
 			"by this server may have trouble communicating with workloads outside "+
 			"this cluster when using JWT-SVIDs."),
 	)
+
+	// Taint first root
+	err := fakeUA.TaintAuthority(0)
+	require.NoError(t, err)
+
+	// Get the roots again and verify that the first X.509 authority is tainted
+	x509Roots := fakeUA.X509Roots()
+	require.True(t, x509Roots[0].Tainted)
+
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+
+	select {
+	case taintedAuthorities := <-test.m.taintedUpstreamAuthoritiesCh:
+		expectedTaintedAuthorities := []*x509.Certificate{x509Roots[0].Certificate}
+		require.Equal(t, expectedTaintedAuthorities, taintedAuthorities)
+	case <-ctx.Done():
+		assert.Fail(t, "no notification received")
+	}
+}
+
+func TestUpstreamProcessTaintedAuthority(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	test := setupTest(t)
+
+	upstreamAuthority, fakeUA := test.newFakeUpstreamAuthority(t, fakeupstreamauthority.Config{
+		TrustDomain:           testTrustDomain,
+		DisallowPublishJWTKey: true,
+	})
+
+	test.initAndActivateUpstreamSignedManager(ctx, upstreamAuthority)
+	require.True(t, test.m.IsUpstreamAuthority())
+
+	go test.m.ProcessBundleUpdates(ctx)
+
+	// Taint first root
+	err := fakeUA.TaintAuthority(0)
+	require.NoError(t, err)
+
+	// Get the roots again and verify that the first X.509 authority is tainted
+	x509Roots := fakeUA.X509Roots()
+	require.True(t, x509Roots[0].Tainted)
+
+	expectedTaintedAuthorities := []*x509.Certificate{x509Roots[0].Certificate}
+	select {
+	case received := <-test.ca.taintedAuthoritiesCh:
+		require.Equal(t, expectedTaintedAuthorities, received)
+	case <-ctx.Done():
+		assert.Fail(t, "deadline reached")
+	}
+
+	bundle := test.fetchBundle(ctx)
+	expectRootCas := x509certificate.RequireToCommonProtos(x509Roots)
+	spiretest.AssertProtoListEqual(t, expectRootCas, bundle.RootCas)
+}
+
+func TestUpstreamProcessTaintedAuthorityBackoff(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	test := setupTest(t)
+
+	upstreamAuthority, fakeUA := test.newFakeUpstreamAuthority(t, fakeupstreamauthority.Config{
+		TrustDomain:           testTrustDomain,
+		DisallowPublishJWTKey: true,
+	})
+
+	test.initAndActivateUpstreamSignedManager(ctx, upstreamAuthority)
+	require.True(t, test.m.IsUpstreamAuthority())
+
+	test.m.triggerBackOffCh = make(chan error, 1)
+
+	// Prepared must be tainted too
+	go test.m.ProcessBundleUpdates(ctx)
+
+	// Set an invalid key type to make prepare fails
+	test.m.c.X509CAKeyType = 123
+	err := test.m.PrepareX509CA(ctx)
+	require.Error(t, err)
+
+	// Taint first root
+	err = fakeUA.TaintAuthority(0)
+	require.NoError(t, err)
+
+	// Get the roots again and verify that the first X.509 authority is tainted
+	x509Roots := fakeUA.X509Roots()
+	require.True(t, x509Roots[0].Tainted)
+
+	expectBackoffErr := func(t *testing.T) {
+		select {
+		case receivedErr := <-test.m.triggerBackOffCh:
+			require.EqualError(t, receivedErr, "failed to prepare x509 authority: rpc error: code = Internal desc = keymanager(fake): facade does not support key type \"UNKNOWN(123)\"")
+		case <-ctx.Done():
+			assert.Fail(t, "deadline reached")
+		}
+	}
+
+	test.clock.WaitForAfter(time.Second, "waiting for the retry to wait for next duration")
+	// Must fail due to the invalid key type
+	expectBackoffErr(t)
+
+	// Try again; expect to fail
+	test.clock.Add(6 * time.Second)
+
+	test.clock.WaitForAfter(time.Second, "waiting for the retry to wait for next duration")
+	expectBackoffErr(t)
+
+	// Restore to a valid key type, and advance time again
+	test.m.c.X509CAKeyType = keymanager.ECP256
+	test.clock.Add(10 * time.Second)
+
+	expectedTaintedAuthorities := []*x509.Certificate{x509Roots[0].Certificate}
+	select {
+	case received := <-test.ca.taintedAuthoritiesCh:
+		require.Equal(t, expectedTaintedAuthorities, received)
+	case <-ctx.Done():
+		assert.Fail(t, "deadline reached")
+	}
+
+	bundle := test.fetchBundle(ctx)
+	expectRootCas := x509certificate.RequireToCommonProtos(x509Roots)
+	spiretest.AssertProtoListEqual(t, expectRootCas, bundle.RootCas)
+}
+
+func TestProcessBundleUpdatesContinuesAfterTaintFailure(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	test := setupTest(t)
+
+	notifier, notifyCh := fakenotifier.NotifyBundleUpdatedWaiter(t)
+	test.setNotifier(notifier)
+	test.initAndActivateSelfSignedManager(ctx)
+	test.m.dropBundleUpdated()
+	test.m.triggerBackOffCh = make(chan error, 1)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		test.m.ProcessBundleUpdates(ctx)
+	}()
+
+	// Without an upstream authority, processing tainted authorities always fails.
+	test.m.notifyUpstreamAuthoritiesTainted([]*x509.Certificate{test.currentX509CA().Certificate})
+	gaveUp := func() bool {
+		for _, entry := range test.logHook.AllEntries() {
+			if entry.Message == "Failed to force intermediate bundle rotation" {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Advance past the max elapsed time until processing gives up.
+	for !gaveUp() {
+		select {
+		case <-test.m.triggerBackOffCh:
+			test.clock.WaitForAfter(time.Second, "waiting for the retry to wait for next duration")
+			test.clock.Add(taintBackoffMaxElapsedTime)
+		case <-time.After(10 * time.Millisecond):
+		case <-ctx.Done():
+			require.Fail(t, "deadline reached")
+		}
+	}
+
+	// Bundle updates are still processed.
+	test.m.bundleUpdated()
+	select {
+	case <-notifyCh:
+	case <-ctx.Done():
+		require.Fail(t, "deadline reached")
+	}
+
+	cancel()
+	<-done
+}
+
+func TestGetCurrentX509CASlotUpstreamSigned(t *testing.T) {
+	ctx := context.Background()
+
+	test := setupTest(t)
+
+	upstreamAuthority, ua := test.newFakeUpstreamAuthority(t, fakeupstreamauthority.Config{
+		TrustDomain:           testTrustDomain,
+		DisallowPublishJWTKey: true,
+	})
+
+	test.initAndActivateUpstreamSignedManager(ctx, upstreamAuthority)
+
+	expectIssuedAt := test.clock.Now()
+	expectNotAfter := expectIssuedAt.Add(test.m.caTTL).UTC()
+	expectUpstreamAuthorityID := x509util.SubjectKeyIDToString(ua.X509Root().Certificate.SubjectKeyId)
+
+	require.NoError(t, test.m.PrepareX509CA(ctx))
+
+	currentSlot := test.m.GetCurrentX509CASlot()
+	slot := currentSlot.(*x509CASlot)
+	require.NotNil(t, slot.x509CA)
+	require.NotEmpty(t, slot.authorityID)
+	require.Equal(t, expectUpstreamAuthorityID, slot.upstreamAuthorityID)
+	require.NotNil(t, slot.publicKey)
+	require.Equal(t, expectIssuedAt, slot.issuedAt)
+	require.Equal(t, expectNotAfter, slot.notAfter)
+}
+
+func TestGetNextX509CASlotUpstreamSigned(t *testing.T) {
+	ctx := context.Background()
+
+	test := setupTest(t)
+	upstreamAuthority, ua := test.newFakeUpstreamAuthority(t, fakeupstreamauthority.Config{
+		TrustDomain:           testTrustDomain,
+		DisallowPublishJWTKey: true,
+	})
+
+	test.initAndActivateUpstreamSignedManager(ctx, upstreamAuthority)
+
+	expectIssuedAt := test.clock.Now()
+	expectNotAfter := expectIssuedAt.Add(test.m.caTTL).UTC()
+	expectUpstreamAuthorityID := x509util.SubjectKeyIDToString(ua.X509Root().Certificate.SubjectKeyId)
+
+	require.NoError(t, test.m.PrepareX509CA(ctx))
+
+	nextSlot := test.m.GetNextX509CASlot()
+	slot := nextSlot.(*x509CASlot)
+	require.NotNil(t, slot.x509CA)
+	require.NotEmpty(t, slot.authorityID)
+	require.Equal(t, expectUpstreamAuthorityID, slot.upstreamAuthorityID)
+	require.NotNil(t, slot.publicKey)
+	require.Equal(t, expectIssuedAt, slot.issuedAt)
+	require.Equal(t, expectNotAfter, slot.notAfter)
+}
+
+func TestPrepareX509CALifetimeWarning(t *testing.T) {
+	for _, tt := range []struct {
+		name           string
+		loss           time.Duration
+		parentLifetime time.Duration
+		warn           bool
+	}{
+		{name: "full lifetime", parentLifetime: 2 * time.Hour},
+		{name: "timestamp rounding", loss: 500 * time.Millisecond, parentLifetime: 2 * time.Hour},
+		{name: "short certificate", loss: 20 * time.Minute, parentLifetime: 2 * time.Hour, warn: true},
+		{name: "short parent chain", parentLifetime: 40 * time.Minute, warn: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			test := setupTest(t)
+			now := test.clock.Now().Truncate(time.Second)
+			test.clock.Set(now)
+			root, rootKey := testca.CreateCACertificate(t, nil, nil,
+				testca.WithLifetime(now.Add(-time.Minute), now.Add(tt.parentLifetime)),
+				testca.WithKeyUsage(x509.KeyUsageCertSign|x509.KeyUsageCRLSign),
+			)
+			upstreamAuthority, _ := test.newFakeUpstreamAuthority(t, fakeupstreamauthority.Config{
+				TrustDomain: testTrustDomain,
+				MutateMintX509CAResponse: func(resp *upstreamauthorityv1.MintX509CAResponse) {
+					minted := x509certificate.RequireFromPluginProtos(resp.X509CaChain)[0].Certificate
+					template := *minted
+					template.NotAfter = now.Add(testCATTL - tt.loss)
+					template.AuthorityKeyId = root.SubjectKeyId
+					replacement := testca.CreateCertificate(t, &template, root, minted.PublicKey, rootKey)
+					resp.X509CaChain = x509certificate.RequireToPluginFromCertificates([]*x509.Certificate{replacement})
+					resp.UpstreamX509Roots = x509certificate.RequireToPluginProtos([]*x509certificate.X509Authority{{Certificate: root}})
+				},
+			})
+			test.initUpstreamSignedManager(upstreamAuthority)
+			t.Cleanup(test.m.Close)
+			require.NoError(t, test.m.PrepareX509CA(context.Background()))
+			count := test.countLogEntries(logrus.WarnLevel, "Upstream authority issued an X509 CA with a shorter usable lifetime than requested")
+			if tt.warn {
+				require.Equal(t, 1, count)
+			} else {
+				require.Zero(t, count)
+			}
+		})
+	}
+}
+
+func TestActivateX509CALifetimeWarning(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		remaining time.Duration
+		agentTTL  time.Duration
+		warn      bool
+	}{
+		{name: "full lifetime", remaining: time.Hour},
+		{name: "timestamp rounding", remaining: time.Hour - 500*time.Millisecond},
+		{name: "insufficient workload lifetime", remaining: 40 * time.Minute, warn: true},
+		{name: "insufficient agent lifetime", remaining: time.Hour, agentTTL: 2 * time.Hour, warn: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			test := setupTest(t)
+			test.initSelfSignedManager()
+			if tt.agentTTL != 0 {
+				config := test.m.c.CredBuilder.Config()
+				config.AgentSVIDTTL = tt.agentTTL
+				builder, err := credtemplate.NewBuilder(config)
+				require.NoError(t, err)
+				test.m.c.CredBuilder = builder
+			}
+			require.NoError(t, test.m.PrepareX509CA(context.Background()))
+			test.clock.Set(test.m.currentX509CA.NotAfter().Add(-tt.remaining))
+			test.m.ActivateX509CA(context.Background())
+			require.NotNil(t, test.ca.X509CA())
+			count := test.countLogEntries(logrus.WarnLevel, "Activating X509 CA with insufficient remaining lifetime for configured workload or agent SVID TTLs; shorter lifetimes may be issued")
+			if tt.warn {
+				require.Equal(t, 1, count)
+			} else {
+				require.Zero(t, count)
+			}
+		})
+	}
+}
+
+func TestPrepareX509CAUsesEffectiveUpstreamExpiry(t *testing.T) {
+	ctx := context.Background()
+	test := setupTest(t)
+	now := test.clock.Now()
+
+	root, rootKey := testca.CreateCACertificate(t, nil, nil,
+		testca.WithLifetime(now.Add(-time.Minute), now.Add(40*time.Minute)),
+		testca.WithKeyUsage(x509.KeyUsageCertSign|x509.KeyUsageCRLSign),
+	)
+	upstreamAuthority, _ := test.newFakeUpstreamAuthority(t, fakeupstreamauthority.Config{
+		TrustDomain: testTrustDomain,
+		MutateMintX509CAResponse: func(resp *upstreamauthorityv1.MintX509CAResponse) {
+			minted := x509certificate.RequireFromPluginProtos(resp.X509CaChain)[0].Certificate
+			template := *minted
+			template.NotAfter = now.Add(time.Hour)
+			template.AuthorityKeyId = root.SubjectKeyId
+			replacement := testca.CreateCertificate(t, &template, root, minted.PublicKey, rootKey)
+			resp.X509CaChain = x509certificate.RequireToPluginFromCertificates([]*x509.Certificate{replacement})
+			resp.UpstreamX509Roots = x509certificate.RequireToPluginProtos([]*x509certificate.X509Authority{{Certificate: root}})
+		},
+	})
+
+	test.cat.SetUpstreamAuthority(upstreamAuthority)
+	config := test.selfSignedConfig()
+	manager, err := NewManager(ctx, config)
+	require.NoError(t, err)
+	test.m = manager
+
+	require.NoError(t, manager.PrepareX509CA(ctx))
+	require.Equal(t, root.NotAfter, manager.GetCurrentX509CASlot().NotAfter())
+	require.True(t, manager.GetCurrentX509CASlot().ShouldPrepareNext(now.Add(20*time.Minute+time.Second)))
+	manager.ActivateX509CA(ctx)
+	manager.Close()
+
+	reloaded, err := NewManager(ctx, config)
+	require.NoError(t, err)
+	require.True(t, root.NotAfter.Equal(reloaded.GetCurrentX509CASlot().NotAfter()))
+	require.NotNil(t, test.ca.X509CA())
+	reloaded.Close()
+
+	test.ca.SetX509CA(nil)
+	test.clock.Set(root.NotAfter.Add(-5 * time.Minute))
+	reloaded, err = NewManager(ctx, config)
+	require.NoError(t, err)
+	defer reloaded.Close()
+	require.Nil(t, test.ca.X509CA())
+	require.True(t, reloaded.GetCurrentX509CASlot().ShouldActivateNext(test.clock.Now()))
 }
 
 func TestUpstreamSignedProducesInvalidChain(t *testing.T) {
 	ctx := context.Background()
 	test := setupTest(t)
-	upstreamAuthority, _ := fakeupstreamauthority.Load(t, fakeupstreamauthority.Config{
+	upstreamAuthority, _ := test.newFakeUpstreamAuthority(t, fakeupstreamauthority.Config{
 		TrustDomain: testTrustDomain,
 		// The verification code relies on go-spiffe, which for compat reasons,
 		// does not currently validate SPIFFE conformance beyond the leaf
@@ -328,7 +857,7 @@ func TestUpstreamSignedProducesInvalidChain(t *testing.T) {
 func TestUpstreamIntermediateSigned(t *testing.T) {
 	ctx := context.Background()
 	test := setupTest(t)
-	upstreamAuthority, fakeUA := fakeupstreamauthority.Load(t, fakeupstreamauthority.Config{
+	upstreamAuthority, fakeUA := test.newFakeUpstreamAuthority(t, fakeupstreamauthority.Config{
 		TrustDomain:           testTrustDomain,
 		DisallowPublishJWTKey: true,
 		UseIntermediate:       true,
@@ -350,7 +879,7 @@ func TestUpstreamIntermediateSigned(t *testing.T) {
 	// The trust bundle should contain the upstream root
 	test.requireBundleRootCAs(ctx, t, fakeUA.X509Root())
 
-	// We expect this warning because the UpstreamAuthority doesn't implements PublishJWTKey
+	// We expect this warning because the UpstreamAuthority doesn't implement PublishJWTKey
 	assert.Equal(t,
 		1,
 		test.countLogEntries(logrus.WarnLevel, "UpstreamAuthority plugin does not support JWT-SVIDs. Workloads managed "+
@@ -365,7 +894,7 @@ func TestUpstreamAuthorityWithPublishJWTKeyImplemented(t *testing.T) {
 	bundle := test.createBundle(ctx)
 	require.Len(t, bundle.JwtSigningKeys, 0)
 
-	upstreamAuthority, ua := fakeupstreamauthority.Load(t, fakeupstreamauthority.Config{
+	upstreamAuthority, ua := test.newFakeUpstreamAuthority(t, fakeupstreamauthority.Config{
 		TrustDomain: testTrustDomain,
 	})
 	test.initAndActivateUpstreamSignedManager(ctx, upstreamAuthority)
@@ -377,6 +906,199 @@ func TestUpstreamAuthorityWithPublishJWTKeyImplemented(t *testing.T) {
 			"by this server may have trouble communicating with workloads outside "+
 			"this cluster when using JWT-SVIDs."),
 	)
+}
+
+func TestUpstreamAuthorityWithPublishWITKeyImplemented(t *testing.T) {
+	ctx := context.Background()
+	test := setupTest(t)
+	bundle := test.createBundle(ctx)
+	require.Len(t, bundle.WitSigningKeys, 0)
+
+	upstreamAuthority, ua := test.newFakeUpstreamAuthority(t, fakeupstreamauthority.Config{
+		TrustDomain: testTrustDomain,
+	})
+	test.initAndActivateUpstreamSignedManager(ctx, upstreamAuthority)
+
+	require.Len(t, ua.WITKeys(), 1)
+	require.Equal(t, test.currentWITKey().Kid, ua.WITKeys()[0].Kid)
+	spiretest.AssertProtoListEqual(t, ua.WITKeys(), test.fetchBundle(ctx).WitSigningKeys)
+	assert.Equal(t,
+		0,
+		test.countLogEntries(logrus.WarnLevel, "UpstreamAuthority plugin does not support WIT-SVIDs. Workloads managed "+
+			"by this server may have trouble communicating with workloads outside "+
+			"this cluster when using WIT-SVIDs."),
+	)
+}
+
+func TestUpstreamAuthorityWithPublishWITKeyNotImplemented(t *testing.T) {
+	ctx := context.Background()
+	test := setupTest(t)
+
+	upstreamAuthority, ua := test.newFakeUpstreamAuthority(t, fakeupstreamauthority.Config{
+		TrustDomain:           testTrustDomain,
+		DisallowPublishWITKey: true,
+	})
+	test.initAndActivateUpstreamSignedManager(ctx, upstreamAuthority)
+
+	// The WIT key falls back to the local bundle
+	require.Empty(t, ua.WITKeys())
+	witSigningKeys := test.fetchBundle(ctx).WitSigningKeys
+	require.Len(t, witSigningKeys, 1)
+	require.Equal(t, test.currentWITKey().Kid, witSigningKeys[0].Kid)
+	assert.Equal(t,
+		1,
+		test.countLogEntries(logrus.WarnLevel, "UpstreamAuthority plugin does not support WIT-SVIDs. Workloads managed "+
+			"by this server may have trouble communicating with workloads outside "+
+			"this cluster when using WIT-SVIDs."),
+	)
+}
+
+func TestUpstreamAuthorityWithPublishWITKeyError(t *testing.T) {
+	ctx := context.Background()
+	test := setupTest(t)
+
+	upstreamAuthority, ua := test.newFakeUpstreamAuthority(t, fakeupstreamauthority.Config{
+		TrustDomain:      testTrustDomain,
+		PublishWITKeyErr: status.Error(codes.Internal, "oh no"),
+	})
+	test.initUpstreamSignedManager(upstreamAuthority)
+	require.NoError(t, test.m.PrepareJWTKey(ctx))
+	test.m.ActivateJWTKey(ctx)
+	require.NoError(t, test.m.PrepareX509CA(ctx))
+	test.m.ActivateX509CA(ctx)
+
+	err := test.m.PrepareWITKey(ctx)
+	spiretest.RequireGRPCStatus(t, err, codes.Internal, "upstreamauthority(fake): oh no")
+
+	// No WIT key is stored anywhere
+	require.True(t, test.m.currentWITKey.IsEmpty())
+	require.True(t, test.m.nextWITKey.IsEmpty())
+	require.Empty(t, test.m.journal.getEntries().WitKeys)
+	require.Empty(t, ua.WITKeys())
+	require.Empty(t, test.fetchBundle(ctx).WitSigningKeys)
+	assert.Equal(t,
+		0,
+		test.countLogEntries(logrus.WarnLevel, "UpstreamAuthority plugin does not support WIT-SVIDs. Workloads managed "+
+			"by this server may have trouble communicating with workloads outside "+
+			"this cluster when using WIT-SVIDs."),
+	)
+}
+
+func TestUpstreamAuthorityWithSubscribeToBundleUpdate(t *testing.T) {
+	ctx := context.Background()
+	test := setupTest(t)
+	upstreamAuthority, ua := test.newFakeUpstreamAuthority(t, fakeupstreamauthority.Config{
+		TrustDomain:               testTrustDomain,
+		UseSubscribeToLocalBundle: true,
+		UseIntermediate:           true,
+	})
+	bundle := test.createBundle(ctx)
+	require.Len(t, bundle.JwtSigningKeys, 0)
+
+	test.initAndActivateUpstreamSignedManager(ctx, upstreamAuthority)
+
+	// X509 CA should be set up to be an intermediate and have two certs in
+	// its chain: itself and the upstream intermediate that signed it.
+	x509CA := test.currentX509CA()
+	assert.NotNil(t, x509CA.Signer)
+	if assert.NotNil(t, x509CA.Certificate) {
+		assert.Equal(t, ua.X509Intermediate().Subject, x509CA.Certificate.Issuer)
+	}
+	if assert.Len(t, x509CA.UpstreamChain, 2) {
+		assert.Equal(t, x509CA.Certificate, x509CA.UpstreamChain[0])
+		assert.Equal(t, ua.X509Intermediate(), x509CA.UpstreamChain[1])
+	}
+
+	// The trust bundle should contain the upstream root
+	test.requireBundleRootCAs(ctx, t, ua.X509Root())
+
+	spiretest.AssertProtoListEqual(t, ua.JWTKeys(), test.fetchBundle(ctx).JwtSigningKeys)
+	spiretest.AssertProtoListEqual(t, ua.WITKeys(), test.fetchBundle(ctx).WitSigningKeys)
+}
+
+func TestUpstreamAuthorityWithBadWITKeyUpdate(t *testing.T) {
+	ctx := context.Background()
+	test := setupTest(t)
+
+	var sendBadWITKey atomic.Bool
+	upstreamAuthority, ua := test.newFakeUpstreamAuthority(t, fakeupstreamauthority.Config{
+		TrustDomain:               testTrustDomain,
+		UseSubscribeToLocalBundle: true,
+		MutateSubscribeToLocalBundleResponse: func(resp *upstreamauthorityv1.SubscribeToLocalBundleResponse) {
+			if sendBadWITKey.Load() {
+				// Missing key ID
+				resp.UpstreamWitKeys = []*plugintypes.WITKey{{PublicKey: []byte("bad")}}
+			}
+		},
+	})
+	test.initAndActivateUpstreamSignedManager(ctx, upstreamAuthority)
+	require.NoError(t, test.m.upstreamClient.SubscribeToLocalBundle(ctx))
+
+	witSigningKeys := test.fetchBundle(ctx).WitSigningKeys
+	require.Len(t, witSigningKeys, 1)
+	spiretest.AssertProtoListEqual(t, ua.WITKeys(), witSigningKeys)
+
+	// Trigger a bad update. The JWT key it carries shows the update was processed.
+	sendBadWITKey.Store(true)
+	pkixBytes, err := x509.MarshalPKIXPublicKey(testkey.NewEC256(t).Public())
+	require.NoError(t, err)
+	jwtKey := &common.PublicKey{Kid: "new-jwt-key", PkixBytes: pkixBytes}
+	ua.AppendJWTKey(jwtKey)
+	require.Eventually(t, func() bool {
+		for _, key := range test.fetchBundle(ctx).JwtSigningKeys {
+			if key.Kid == jwtKey.Kid {
+				return true
+			}
+		}
+		return false
+	}, time.Minute, 10*time.Millisecond)
+
+	spiretest.AssertProtoListEqual(t, witSigningKeys, test.fetchBundle(ctx).WitSigningKeys)
+}
+
+func TestSubscribeToLocalBundleRetriesOnUpstreamFailure(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	test := setupTest(t)
+
+	// Fail the first two subscription responses, as would happen while the
+	// upstream server is unreachable, and let the third one through.
+	var attempts atomic.Int32
+	upstreamAuthority, _ := test.newFakeUpstreamAuthority(t, fakeupstreamauthority.Config{
+		TrustDomain:               testTrustDomain,
+		UseSubscribeToLocalBundle: true,
+		MutateSubscribeToLocalBundleResponse: func(resp *upstreamauthorityv1.SubscribeToLocalBundleResponse) {
+			if attempts.Add(1) <= 2 {
+				// Unparsable root certificate, rejected by the upstream client
+				resp.UpstreamX509Roots = []*plugintypes.X509Certificate{{Asn1: []byte("OHNO")}}
+			}
+		},
+	})
+	test.initAndActivateUpstreamSignedManager(ctx, upstreamAuthority)
+	require.True(t, test.m.IsUpstreamAuthority())
+	require.Zero(t, attempts.Load())
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- test.m.SubscribeToLocalBundle(ctx)
+	}()
+
+	// Advance the mock clock through every backoff wait. Returning the
+	// subscription error would end the CA rotator task and take the whole
+	// server down, so it must be retried until it succeeds.
+	for {
+		select {
+		case err := <-errCh:
+			require.NoError(t, err)
+			require.GreaterOrEqual(t, attempts.Load(), int32(3), "subscription was not retried")
+			return
+		case wait := <-test.clock.WaitForAfterCh():
+			test.clock.Add(wait)
+		case <-ctx.Done():
+			t.Fatal("deadline reached waiting for the local bundle subscription to be retried")
+		}
+	}
 }
 
 func TestX509CARotation(t *testing.T) {
@@ -394,14 +1116,14 @@ func TestX509CARotation(t *testing.T) {
 	// kick off a goroutine to service bundle update notifications. This is
 	// typically handled by Run() but using it would complicate the test.
 	test.m.dropBundleUpdated()
-	go test.m.NotifyOnBundleUpdate(ctx)
+	go test.m.ProcessBundleUpdates(ctx)
 
 	// after initialization, we should have a current X509CA but no next.
 	first := test.currentX509CA()
 	require.Equal(t, journal.Status_ACTIVE, test.currentX509CAStatus())
 	assert.Nil(t, test.nextX509CA(), "second X509CA should not be prepared yet")
 	require.Equal(t, journal.Status_UNKNOWN, test.nextX509CAStatus())
-	test.requireBundleRootCAs(ctx, t, first.Certificate)
+	test.requireIntermediateRootCA(ctx, t, first.Certificate)
 
 	// Prepare new X509CA. the current X509CA should stay
 	// the same but the next X509CA should have been prepared and added to
@@ -413,14 +1135,14 @@ func TestX509CARotation(t *testing.T) {
 	second := test.nextX509CA()
 	assert.NotNil(t, second, "second X509CA should have been prepared")
 	require.Equal(t, journal.Status_PREPARED, test.nextX509CAStatus())
-	test.requireBundleRootCAs(ctx, t, first.Certificate, second.Certificate)
+	test.requireIntermediateRootCA(ctx, t, first.Certificate, second.Certificate)
 
 	// we should now have a bundle update notification due to the preparation
 	test.waitForBundleUpdatedNotification(ctx, notifyCh)
 
 	// Rotate "next" should become "current" and
 	// "next" should be reset.
-	test.m.RotateX509CA(ctx)
+	require.NoError(t, test.m.RotateX509CA(ctx))
 	test.requireX509CAEqual(t, second, test.currentX509CA())
 	require.Equal(t, journal.Status_ACTIVE, test.currentX509CAStatus())
 	assert.Nil(t, test.nextX509CA())
@@ -435,18 +1157,41 @@ func TestX509CARotation(t *testing.T) {
 	third := test.nextX509CA()
 	assert.NotNil(t, third, "third X509CA should have been prepared")
 	require.Equal(t, journal.Status_PREPARED, test.nextX509CAStatus())
-	test.requireBundleRootCAs(ctx, t, first.Certificate, second.Certificate, third.Certificate)
+	test.requireIntermediateRootCA(ctx, t, first.Certificate, second.Certificate, third.Certificate)
 
 	// we should now have another bundle update notification due to the preparation
 	test.waitForBundleUpdatedNotification(ctx, notifyCh)
 
 	// Rotate again, "next" should become "current" and
 	// "next" should be reset.
-	test.m.RotateX509CA(ctx)
+	require.NoError(t, test.m.RotateX509CA(ctx))
 	test.requireX509CAEqual(t, third, test.currentX509CA())
 	require.Equal(t, journal.Status_ACTIVE, test.currentX509CAStatus())
 	assert.Nil(t, test.nextX509CA())
 	require.Equal(t, journal.Status_OLD, test.nextX509CAStatus())
+}
+
+func TestX509CARotationRejectsExpiredPreparedCA(t *testing.T) {
+	ctx := context.Background()
+	test := setupTest(t)
+	test.initAndActivateSelfSignedManager(ctx)
+	current := test.currentX509CA()
+
+	require.NoError(t, test.m.PrepareX509CA(ctx))
+	expired := test.nextX509CA()
+	require.NotNil(t, expired)
+	test.clock.Set(expired.NotAfter)
+
+	require.EqualError(t, test.m.RotateX509CA(ctx), "prepared X509 CA has expired")
+	test.requireX509CAEqual(t, current, test.currentX509CA())
+	require.Nil(t, test.nextX509CA())
+	require.Equal(t, journal.Status_OLD, test.nextX509CAStatus())
+
+	require.NoError(t, test.m.PrepareX509CA(ctx))
+	replacement := test.nextX509CA()
+	require.NotNil(t, replacement)
+	require.True(t, replacement.NotAfter.After(test.clock.Now()))
+	require.NotEqual(t, expired.Certificate.SubjectKeyId, replacement.Certificate.SubjectKeyId)
 }
 
 func TestX509CARotationMetric(t *testing.T) {
@@ -460,15 +1205,33 @@ func TestX509CARotationMetric(t *testing.T) {
 
 	// reset the metrics rotate CA to activate mark
 	test.metrics.Reset()
-	test.m.RotateX509CA(ctx)
+	require.NoError(t, test.m.RotateX509CA(ctx))
 
 	// create expected metrics with ttl from certificate
 	expected := fakemetrics.New()
-	ttl := test.currentX509CA().Certificate.NotAfter.Sub(test.clock.Now())
 	telemetry_server.IncrActivateX509CAManagerCounter(expected)
-	telemetry_server.SetX509CARotateGauge(expected, test.m.c.TrustDomain.Name(), float32(ttl.Seconds()))
+	telemetry_server.SetX509CARotateGauge(expected, test.m.c.TrustDomain.Name(), test.currentX509CA().Certificate.NotAfter, test.clock.Now())
+	telemetry_server.SetX509CARotateMaxExpirationGauge(expected, test.m.c.TrustDomain.Name(), test.currentX509CA().Certificate.NotAfter)
+	telemetry_server.SetX509CARotateMaxTTLGauge(expected, test.m.c.TrustDomain.Name(), test.currentX509CA().Certificate.NotAfter, test.clock.Now())
 
 	require.Equal(t, expected.AllMetrics(), test.metrics.AllMetrics())
+}
+
+func TestX509CARotationMaxTTLGaugeIncludesPreparedCA(t *testing.T) {
+	ctx := context.Background()
+	test := setupTest(t)
+	test.initAndActivateSelfSignedManager(ctx)
+
+	test.clock.Set(test.clock.Now().Add(10 * time.Minute))
+	test.metrics.Reset()
+	require.NoError(t, test.m.PrepareX509CA(ctx))
+
+	expected := fakemetrics.New()
+	telemetry_server.SetX509CARotateMaxExpirationGauge(expected, test.m.c.TrustDomain.Name(), test.nextX509CA().NotAfter)
+	telemetry_server.SetX509CARotateMaxTTLGauge(expected, test.m.c.TrustDomain.Name(), test.nextX509CA().NotAfter, test.clock.Now())
+	for _, metric := range expected.AllMetrics() {
+		require.Contains(t, test.metrics.AllMetrics(), metric)
+	}
 }
 
 func TestJWTKeyRotation(t *testing.T) {
@@ -484,7 +1247,7 @@ func TestJWTKeyRotation(t *testing.T) {
 	// kick off a goroutine to service bundle update notifications. This is
 	// typically handled by Run() but using it would complicate the test.
 	test.m.dropBundleUpdated() // drop bundle update message produce by initialization
-	go test.m.NotifyOnBundleUpdate(ctx)
+	go test.m.ProcessBundleUpdates(ctx)
 
 	// after initialization, we should have a current JWTKey but no next.
 	first := test.currentJWTKey()
@@ -538,6 +1301,73 @@ func TestJWTKeyRotation(t *testing.T) {
 	require.Equal(t, journal.Status_OLD, test.nextJWTKeyStatus())
 }
 
+func TestWITKeyRotation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	test := setupTest(t)
+
+	notifier, notifyCh := fakenotifier.NotifyBundleUpdatedWaiter(t)
+	test.setNotifier(notifier)
+	test.initAndActivateSelfSignedManager(ctx)
+
+	// kick off a goroutine to service bundle update notifications. This is
+	// typically handled by Run() but using it would complicate the test.
+	test.m.dropBundleUpdated() // drop bundle update message produce by initialization
+	go test.m.ProcessBundleUpdates(ctx)
+
+	// after initialization, we should have a current WITKey but no next.
+	first := test.currentWITKey()
+	require.Equal(t, journal.Status_ACTIVE, test.currentWITKeyStatus())
+	assert.Nil(t, test.nextWITKey(), "second WITKey should not be prepared yet")
+	require.Equal(t, journal.Status_UNKNOWN, test.nextWITKeyStatus())
+	test.requireBundleWITKeys(ctx, t, first)
+
+	// prepare next. the current WITKey should stay
+	// the same but the next WITKey should have been prepared and added to
+	// the trust bundle.
+	require.NoError(t, test.m.PrepareWITKey(ctx))
+	test.requireWITKeyEqual(t, first, test.currentWITKey())
+	require.Equal(t, journal.Status_ACTIVE, test.currentWITKeyStatus())
+	second := test.nextWITKey()
+	require.Equal(t, journal.Status_PREPARED, test.nextWITKeyStatus())
+	assert.NotNil(t, second, "second WITKey should have been prepared")
+	test.requireBundleWITKeys(ctx, t, first, second)
+
+	// we should now have a bundle update notification due to the preparation
+	test.waitForBundleUpdatedNotification(ctx, notifyCh)
+
+	// rotate, "next" should become "current" and
+	// "next" should be reset.
+	test.m.RotateWITKey(ctx)
+	test.requireWITKeyEqual(t, second, test.currentWITKey())
+	require.Equal(t, journal.Status_ACTIVE, test.currentWITKeyStatus())
+	assert.Nil(t, test.nextWITKey())
+	require.Equal(t, journal.Status_OLD, test.nextWITKeyStatus())
+
+	// Prepare next, the current WITKey should stay
+	// the same but the next WITKey should have been prepared and added to
+	// the trust bundle.
+	require.NoError(t, test.m.PrepareWITKey(ctx))
+	test.requireWITKeyEqual(t, second, test.currentWITKey())
+	require.Equal(t, journal.Status_ACTIVE, test.currentWITKeyStatus())
+	third := test.nextWITKey()
+	assert.NotNil(t, second, "third WITKey should have been prepared")
+	require.Equal(t, journal.Status_PREPARED, test.nextWITKeyStatus())
+	test.requireBundleWITKeys(ctx, t, first, second, third)
+
+	// we should now have a bundle update notification due to the preparation
+	test.waitForBundleUpdatedNotification(ctx, notifyCh)
+
+	// rotate again. "next" should become "current" and
+	// "next" should be reset.
+	test.m.RotateWITKey(ctx)
+	test.requireWITKeyEqual(t, third, test.currentWITKey())
+	require.Equal(t, journal.Status_ACTIVE, test.currentWITKeyStatus())
+	assert.Nil(t, test.nextWITKey())
+	require.Equal(t, journal.Status_OLD, test.nextWITKeyStatus())
+}
+
 func TestPruneBundle(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
@@ -559,30 +1389,36 @@ func TestPruneBundle(t *testing.T) {
 	// prepare to have two bundles
 	require.NoError(t, test.m.PrepareJWTKey(ctx))
 	require.NoError(t, test.m.PrepareX509CA(ctx))
+	require.NoError(t, test.m.PrepareWITKey(ctx))
 
 	firstX509CA := test.currentX509CA()
 	firstJWTKey := test.currentJWTKey()
+	firstWITKey := test.currentWITKey()
 	secondX509CA := test.nextX509CA()
 	secondJWTKey := test.nextJWTKey()
-	test.requireBundleRootCAs(ctx, t, firstX509CA.Certificate, secondX509CA.Certificate)
+	secondWITKey := test.nextWITKey()
+	test.requireIntermediateRootCA(ctx, t, firstX509CA.Certificate, secondX509CA.Certificate)
 	test.requireBundleJWTKeys(ctx, t, firstJWTKey, secondJWTKey)
+	test.requireBundleWITKeys(ctx, t, firstWITKey, secondWITKey)
 
 	// kick off a goroutine to service bundle update notifications. This is
 	// typically handled by Run() but using it would complicate the test.
 	test.m.dropBundleUpdated() // drop bundle update message produce by initialization
-	go test.m.NotifyOnBundleUpdate(ctx)
+	go test.m.ProcessBundleUpdates(ctx)
 
 	// advance just past the expiration time of the first and prune. nothing
 	// should change.
 	test.setTimeAndPrune(firstExpiresTime.Add(time.Minute))
-	test.requireBundleRootCAs(ctx, t, firstX509CA.Certificate, secondX509CA.Certificate)
+	test.requireIntermediateRootCA(ctx, t, firstX509CA.Certificate, secondX509CA.Certificate)
 	test.requireBundleJWTKeys(ctx, t, firstJWTKey, secondJWTKey)
+	test.requireBundleWITKeys(ctx, t, firstWITKey, secondWITKey)
 
 	// advance beyond the safety threshold of the first, prune, and assert that
 	// the first has been pruned
 	test.addTimeAndPrune(safetyThresholdBundle)
-	test.requireBundleRootCAs(ctx, t, secondX509CA.Certificate)
+	test.requireIntermediateRootCA(ctx, t, secondX509CA.Certificate)
 	test.requireBundleJWTKeys(ctx, t, secondJWTKey)
+	test.requireBundleWITKeys(ctx, t, secondWITKey)
 
 	// we should now have a bundle update notification due to the pruning
 	test.waitForBundleUpdatedNotification(ctx, notifyCh)
@@ -591,8 +1427,9 @@ func TestPruneBundle(t *testing.T) {
 	// changes because we can't prune out the whole bundle.
 	test.clock.Set(secondExpiresTime.Add(time.Minute + safetyThresholdBundle))
 	require.EqualError(t, test.m.PruneBundle(context.Background()), "unable to prune bundle: rpc error: code = Unknown desc = prune failed: would prune all certificates")
-	test.requireBundleRootCAs(ctx, t, secondX509CA.Certificate)
+	test.requireIntermediateRootCA(ctx, t, secondX509CA.Certificate)
 	test.requireBundleJWTKeys(ctx, t, secondJWTKey)
+	test.requireBundleWITKeys(ctx, t, secondWITKey)
 }
 
 func TestPruneCAJournals(t *testing.T) {
@@ -622,21 +1459,19 @@ func TestPruneCAJournals(t *testing.T) {
 			name: "no journals with CAs expired before the threshold - no journals to be pruned",
 			testJournals: []*testJournal{
 				{
-					Journal: Journal{
-						config: jc,
-						entries: &journal.Entries{
-							X509CAs: []*journal.X509CAEntry{{NotAfter: now}, {NotAfter: tomorrow}},
-							JwtKeys: []*journal.JWTKeyEntry{{NotAfter: now}, {NotAfter: tomorrow}},
-						},
+					config: jc,
+					entries: &journal.Entries{
+						X509CAs: []*journal.X509CAEntry{{NotAfter: now}, {NotAfter: tomorrow}},
+						JwtKeys: []*journal.JWTKeyEntry{{NotAfter: now}, {NotAfter: tomorrow}},
+						WitKeys: []*journal.WITKeyEntry{{NotAfter: now}, {NotAfter: tomorrow}},
 					},
 				},
 				{
-					Journal: Journal{
-						config: jc,
-						entries: &journal.Entries{
-							X509CAs: []*journal.X509CAEntry{{NotAfter: now}, {NotAfter: tomorrow}},
-							JwtKeys: []*journal.JWTKeyEntry{{NotAfter: now}, {NotAfter: tomorrow}},
-						},
+					config: jc,
+					entries: &journal.Entries{
+						X509CAs: []*journal.X509CAEntry{{NotAfter: now}, {NotAfter: tomorrow}},
+						JwtKeys: []*journal.JWTKeyEntry{{NotAfter: now}, {NotAfter: tomorrow}},
+						WitKeys: []*journal.WITKeyEntry{{NotAfter: now}, {NotAfter: tomorrow}},
 					},
 				},
 			},
@@ -645,21 +1480,19 @@ func TestPruneCAJournals(t *testing.T) {
 			name: "some journals with CAs expired before the threshold, but not all - no journals to be pruned",
 			testJournals: []*testJournal{
 				{
-					Journal: Journal{
-						config: jc,
-						entries: &journal.Entries{
-							X509CAs: []*journal.X509CAEntry{{NotAfter: tomorrow}, {NotAfter: beforeThreshold}},
-							JwtKeys: []*journal.JWTKeyEntry{{NotAfter: beforeThreshold}, {NotAfter: tomorrow}},
-						},
+					config: jc,
+					entries: &journal.Entries{
+						X509CAs: []*journal.X509CAEntry{{NotAfter: tomorrow}, {NotAfter: beforeThreshold}},
+						JwtKeys: []*journal.JWTKeyEntry{{NotAfter: beforeThreshold}, {NotAfter: tomorrow}},
+						WitKeys: []*journal.WITKeyEntry{{NotAfter: beforeThreshold}, {NotAfter: tomorrow}},
 					},
 				},
 				{
-					Journal: Journal{
-						config: jc,
-						entries: &journal.Entries{
-							X509CAs: []*journal.X509CAEntry{{NotAfter: tomorrow}, {NotAfter: beforeThreshold}},
-							JwtKeys: []*journal.JWTKeyEntry{{NotAfter: beforeThreshold}, {NotAfter: tomorrow}},
-						},
+					config: jc,
+					entries: &journal.Entries{
+						X509CAs: []*journal.X509CAEntry{{NotAfter: tomorrow}, {NotAfter: beforeThreshold}},
+						JwtKeys: []*journal.JWTKeyEntry{{NotAfter: beforeThreshold}, {NotAfter: tomorrow}},
+						WitKeys: []*journal.WITKeyEntry{{NotAfter: beforeThreshold}, {NotAfter: tomorrow}},
 					},
 				},
 			},
@@ -669,21 +1502,19 @@ func TestPruneCAJournals(t *testing.T) {
 			testJournals: []*testJournal{
 				{
 					shouldBePruned: true,
-					Journal: Journal{
-						config: jc,
-						entries: &journal.Entries{
-							X509CAs: []*journal.X509CAEntry{{NotAfter: beforeThreshold}, {NotAfter: beforeThreshold}},
-							JwtKeys: []*journal.JWTKeyEntry{{NotAfter: beforeThreshold}, {NotAfter: beforeThreshold}},
-						},
+					config:         jc,
+					entries: &journal.Entries{
+						X509CAs: []*journal.X509CAEntry{{NotAfter: beforeThreshold}, {NotAfter: beforeThreshold}},
+						JwtKeys: []*journal.JWTKeyEntry{{NotAfter: beforeThreshold}, {NotAfter: beforeThreshold}},
+						WitKeys: []*journal.WITKeyEntry{{NotAfter: beforeThreshold}, {NotAfter: tomorrow}},
 					},
 				},
 				{
-					Journal: Journal{
-						config: jc,
-						entries: &journal.Entries{
-							X509CAs: []*journal.X509CAEntry{{NotAfter: tomorrow}, {NotAfter: beforeThreshold}},
-							JwtKeys: []*journal.JWTKeyEntry{{NotAfter: beforeThreshold}, {NotAfter: tomorrow}},
-						},
+					config: jc,
+					entries: &journal.Entries{
+						X509CAs: []*journal.X509CAEntry{{NotAfter: tomorrow}, {NotAfter: beforeThreshold}},
+						JwtKeys: []*journal.JWTKeyEntry{{NotAfter: beforeThreshold}, {NotAfter: tomorrow}},
+						WitKeys: []*journal.WITKeyEntry{{NotAfter: beforeThreshold}, {NotAfter: tomorrow}},
 					},
 				},
 			},
@@ -692,7 +1523,6 @@ func TestPruneCAJournals(t *testing.T) {
 
 	var expectedCAJournals []*datastore.CAJournal
 	for _, testCase := range testCases {
-		testCase := testCase
 		expectedCAJournals = []*datastore.CAJournal{}
 		t.Run(testCase.name, func(t *testing.T) {
 			// Have a fresh data store in each test case
@@ -783,14 +1613,66 @@ func TestActivationThresholdCap(t *testing.T) {
 	// Expect the activation threshold to get capped since 1/6 of the lifetime
 	// exceeds the seven day cap.
 	threshold := keyActivationThreshold(issuedAt, notAfter)
-	require.Equal(t, sevenDays, notAfter.Sub(threshold))
+	require.Equal(t, 7*24*time.Hour, notAfter.Sub(threshold))
+}
+
+func TestDisableJWTSVIDs(t *testing.T) {
+	test := setupTest(t)
+
+	manager, err := NewManager(ctx, test.selfSignedConfig())
+	require.NoError(t, err)
+	require.NotNil(t, manager)
+	assert.False(t, manager.IsJWTSVIDsDisabled())
+
+	config := test.selfSignedConfig()
+	config.DisableJWTSVIDs = true
+
+	manager, err = NewManager(ctx, config)
+	require.NoError(t, err)
+	require.NotNil(t, manager)
+	assert.True(t, manager.IsJWTSVIDsDisabled())
+
+	ctx := context.Background()
+	require.NoError(t, manager.PrepareJWTKey(ctx))
+
+	manager.ActivateJWTKey(ctx)
+	slot := manager.GetCurrentJWTKeySlot()
+	require.True(t, slot.IsEmpty())
+
+	manager.RotateJWTKey(ctx)
+	slot = manager.GetCurrentJWTKeySlot()
+	require.True(t, slot.IsEmpty())
+}
+
+func TestDisableWITSVIDs(t *testing.T) {
+	test := setupTest(t)
+
+	manager, err := NewManager(ctx, test.selfSignedConfig())
+	require.NoError(t, err)
+	require.NotNil(t, manager)
+	assert.False(t, manager.IsWITSVIDsDisabled())
+
+	config := test.selfSignedConfig()
+	config.DisableWITSVIDs = true
+
+	manager, err = NewManager(ctx, config)
+	require.NoError(t, err)
+	require.NotNil(t, manager)
+	assert.True(t, manager.IsWITSVIDsDisabled())
+
+	ctx := context.Background()
+	require.NoError(t, manager.PrepareWITKey(ctx))
+
+	manager.ActivateWITKey(ctx)
+	slot := manager.GetCurrentWITKeySlot()
+	require.True(t, slot.IsEmpty())
+
+	manager.RotateWITKey(ctx)
+	slot = manager.GetCurrentWITKeySlot()
+	require.True(t, slot.IsEmpty())
 }
 
 func TestAlternateKeyTypes(t *testing.T) {
-	upstreamAuthority, _ := fakeupstreamauthority.Load(t, fakeupstreamauthority.Config{
-		TrustDomain: testTrustDomain,
-	})
-
 	expectRSA := func(t *testing.T, signer crypto.Signer, keySize int) {
 		publicKey, ok := signer.Public().(*rsa.PublicKey)
 		t.Logf("PUBLIC KEY TYPE: %T", signer.Public())
@@ -825,97 +1707,123 @@ func TestAlternateKeyTypes(t *testing.T) {
 
 	testCases := []struct {
 		name              string
-		upstreamAuthority upstreamauthority.UpstreamAuthority
+		upstreamAuthority bool
 		x509CAKeyType     keymanager.KeyType
 		jwtKeyType        keymanager.KeyType
+		witKeyType        keymanager.KeyType
 		checkX509CA       func(*testing.T, crypto.Signer)
 		checkJWTKey       func(*testing.T, crypto.Signer)
+		checkWITKey       func(*testing.T, crypto.Signer)
 	}{
 		{
 			name:          "self-signed with RSA 2048",
 			x509CAKeyType: keymanager.RSA2048,
 			jwtKeyType:    keymanager.RSA2048,
+			witKeyType:    keymanager.RSA2048,
 			checkX509CA:   expectRSA2048,
 			checkJWTKey:   expectRSA2048,
+			checkWITKey:   expectRSA2048,
 		},
 		{
 			name:          "self-signed with RSA 4096",
 			x509CAKeyType: keymanager.RSA4096,
 			jwtKeyType:    keymanager.RSA4096,
+			witKeyType:    keymanager.RSA4096,
 			checkX509CA:   expectRSA4096,
 			checkJWTKey:   expectRSA4096,
+			checkWITKey:   expectRSA4096,
 		},
 		{
 			name:          "self-signed with EC P256",
 			x509CAKeyType: keymanager.ECP256,
 			jwtKeyType:    keymanager.ECP256,
+			witKeyType:    keymanager.ECP256,
 			checkX509CA:   expectEC256,
 			checkJWTKey:   expectEC256,
+			checkWITKey:   expectEC256,
 		},
 		{
 			name:          "self-signed with EC P384",
 			x509CAKeyType: keymanager.ECP384,
 			jwtKeyType:    keymanager.ECP384,
+			witKeyType:    keymanager.ECP384,
 			checkX509CA:   expectEC384,
 			checkJWTKey:   expectEC384,
+			checkWITKey:   expectEC384,
 		},
 		{
-			name:          "self-signed JWT with RSA 2048 and X509 with EC P384",
+			name:          "self-signed JWT with RSA 2048, X509 with EC P384, and WIT with RSA 4096",
 			x509CAKeyType: keymanager.ECP384,
 			jwtKeyType:    keymanager.RSA2048,
+			witKeyType:    keymanager.RSA4096,
 			checkX509CA:   expectEC384,
 			checkJWTKey:   expectRSA2048,
+			checkWITKey:   expectRSA4096,
 		},
 		{
 			name:              "upstream-signed with RSA 2048",
-			upstreamAuthority: upstreamAuthority,
+			upstreamAuthority: true,
 			x509CAKeyType:     keymanager.RSA2048,
 			jwtKeyType:        keymanager.RSA2048,
+			witKeyType:        keymanager.RSA2048,
 			checkX509CA:       expectRSA2048,
 			checkJWTKey:       expectRSA2048,
+			checkWITKey:       expectRSA2048,
 		},
 		{
 			name:              "upstream-signed with RSA 4096",
-			upstreamAuthority: upstreamAuthority,
+			upstreamAuthority: true,
 			x509CAKeyType:     keymanager.RSA4096,
 			jwtKeyType:        keymanager.RSA4096,
+			witKeyType:        keymanager.RSA4096,
 			checkX509CA:       expectRSA4096,
 			checkJWTKey:       expectRSA4096,
+			checkWITKey:       expectRSA4096,
 		},
 		{
 			name:              "upstream-signed with EC P256",
-			upstreamAuthority: upstreamAuthority,
+			upstreamAuthority: true,
 			x509CAKeyType:     keymanager.ECP256,
 			jwtKeyType:        keymanager.ECP256,
+			witKeyType:        keymanager.ECP256,
 			checkX509CA:       expectEC256,
 			checkJWTKey:       expectEC256,
+			checkWITKey:       expectEC256,
 		},
 		{
 			name:              "upstream-signed with EC P384",
-			upstreamAuthority: upstreamAuthority,
+			upstreamAuthority: true,
 			x509CAKeyType:     keymanager.ECP384,
 			jwtKeyType:        keymanager.ECP384,
+			witKeyType:        keymanager.ECP384,
 			checkX509CA:       expectEC384,
 			checkJWTKey:       expectEC384,
+			checkWITKey:       expectEC384,
 		},
 	}
 
 	for _, testCase := range testCases {
-		testCase := testCase
 		t.Run(testCase.name, func(t *testing.T) {
 			ctx := context.Background()
 
 			test := setupTest(t)
+
 			c := test.selfSignedConfig()
 			c.X509CAKeyType = testCase.x509CAKeyType
 			c.JWTKeyType = testCase.jwtKeyType
+			c.WITKeyType = testCase.witKeyType
 
 			// Reset the key manager for each test case to ensure a fresh
 			// rotation.
 			test.cat.SetKeyManager(fakeserverkeymanager.New(t))
 
 			// Optionally provide an upstream authority
-			test.cat.SetUpstreamAuthority(testCase.upstreamAuthority)
+			if testCase.upstreamAuthority {
+				upstreamAuthority, _ := test.newFakeUpstreamAuthority(t, fakeupstreamauthority.Config{
+					TrustDomain: testTrustDomain,
+				})
+				test.cat.SetUpstreamAuthority(upstreamAuthority)
+			}
 
 			manager, err := NewManager(ctx, c)
 			require.NoError(t, err)
@@ -926,9 +1834,12 @@ func TestAlternateKeyTypes(t *testing.T) {
 			test.m.ActivateJWTKey(ctx)
 			require.NoError(t, test.m.PrepareX509CA(ctx))
 			test.m.activateX509CA(ctx)
+			require.NoError(t, test.m.PrepareWITKey(ctx))
+			test.m.activateWITKey(ctx)
 
 			testCase.checkX509CA(t, test.currentX509CA().Signer)
 			testCase.checkJWTKey(t, test.currentJWTKey().Signer)
+			testCase.checkWITKey(t, test.currentWITKey().Signer)
 		})
 	}
 }
@@ -940,6 +1851,12 @@ type x509CAInfo struct {
 }
 
 type jwtKeyInfo struct {
+	Signer   signerInfo
+	Kid      string
+	NotAfter time.Time
+}
+
+type witKeyInfo struct {
 	Signer   signerInfo
 	Kid      string
 	NotAfter time.Time
@@ -961,13 +1878,16 @@ type managerTest struct {
 	km      keymanager.KeyManager
 	ds      *fakedatastore.DataStore
 	cat     *fakeservercatalog.Catalog
+	cc      fakeCC
 
 	m *Manager
 }
 
 func setupTest(t *testing.T) *managerTest {
 	clock := clock.NewMock(t)
-	ca := new(fakeCA)
+	ca := &fakeCA{
+		taintedAuthoritiesCh: make(chan []*x509.Certificate, 1),
+	}
 
 	log, logHook := test.NewNullLogger()
 	metrics := fakemetrics.New()
@@ -994,6 +1914,11 @@ func setupTest(t *testing.T) *managerTest {
 	}
 }
 
+func (m *managerTest) newFakeUpstreamAuthority(t *testing.T, config fakeupstreamauthority.Config) (upstreamauthority.UpstreamAuthority, *fakeupstreamauthority.UpstreamAuthority) {
+	config.Clock = m.clock
+	return fakeupstreamauthority.Load(t, config)
+}
+
 func (m *managerTest) initSelfSignedManager() {
 	m.cat.SetUpstreamAuthority(nil)
 	manager, err := NewManager(context.Background(), m.selfSignedConfig())
@@ -1010,6 +1935,8 @@ func (m *managerTest) initAndActivateSelfSignedManager(ctx context.Context) {
 	manager.ActivateJWTKey(ctx)
 	require.NoError(m.t, manager.PrepareX509CA(ctx))
 	manager.ActivateX509CA(ctx)
+	require.NoError(m.t, manager.PrepareWITKey(ctx))
+	manager.ActivateWITKey(ctx)
 
 	m.m = manager
 }
@@ -1035,18 +1962,21 @@ func (m *managerTest) initAndActivateUpstreamSignedManager(ctx context.Context, 
 	m.m.ActivateJWTKey(ctx)
 	require.NoError(m.t, m.m.PrepareX509CA(ctx))
 	m.m.ActivateX509CA(ctx)
+	require.NoError(m.t, m.m.PrepareWITKey(ctx))
+	m.m.ActivateWITKey(ctx)
 }
 
 func (m *managerTest) selfSignedConfig() Config {
-	return m.selfSignedConfigWithKeyTypes(keymanager.ECP256, keymanager.ECP256)
+	return m.selfSignedConfigWithKeyTypes(keymanager.ECP256, keymanager.ECP256, keymanager.ECP256)
 }
 
-func (m *managerTest) selfSignedConfigWithKeyTypes(x509CAKeyType, jwtKeyType keymanager.KeyType) Config {
+func (m *managerTest) selfSignedConfigWithKeyTypes(x509CAKeyType, jwtKeyType keymanager.KeyType, witKeyType keymanager.KeyType) Config {
 	credBuilder, err := credtemplate.NewBuilder(credtemplate.Config{
-		TrustDomain:   testTrustDomain,
-		X509CASubject: pkix.Name{CommonName: "SPIRE"},
-		Clock:         m.clock,
-		X509CATTL:     testCATTL,
+		TrustDomain:         testTrustDomain,
+		X509CASubject:       pkix.Name{CommonName: "SPIRE"},
+		Clock:               m.clock,
+		X509CATTL:           testCATTL,
+		CredentialComposers: []credentialcomposer.CredentialComposer{&m.cc},
 	})
 	require.NoError(m.t, err)
 
@@ -1062,7 +1992,7 @@ func (m *managerTest) selfSignedConfigWithKeyTypes(x509CAKeyType, jwtKeyType key
 		TrustDomain:   testTrustDomain,
 		X509CAKeyType: x509CAKeyType,
 		JWTKeyType:    jwtKeyType,
-		Dir:           m.dir,
+		WITKeyType:    witKeyType,
 		Metrics:       m.metrics,
 		Log:           m.log,
 		Clock:         m.clock,
@@ -1077,6 +2007,10 @@ func (m *managerTest) requireX509CAEqual(t *testing.T, expected, actual *ca.X509
 
 func (m *managerTest) requireJWTKeyEqual(t *testing.T, expected, actual *ca.JWTKey, msgAndArgs ...any) {
 	require.Equal(t, m.getJWTKeyInfo(expected), m.getJWTKeyInfo(actual), msgAndArgs...)
+}
+
+func (m *managerTest) requireWITKeyEqual(t *testing.T, expected, actual *ca.WITKey, msgAndArgs ...any) {
+	require.Equal(t, m.getWITKeyInfo(expected), m.getWITKeyInfo(actual), msgAndArgs...)
 }
 
 func (m *managerTest) getX509CAInfo(x509CA *ca.X509CA) x509CAInfo {
@@ -1101,6 +2035,17 @@ func (m *managerTest) getJWTKeyInfo(jwtKey *ca.JWTKey) jwtKeyInfo {
 	}
 }
 
+func (m *managerTest) getWITKeyInfo(witKey *ca.WITKey) witKeyInfo {
+	if witKey == nil {
+		return witKeyInfo{}
+	}
+	return witKeyInfo{
+		Signer:   m.getSignerInfo(witKey.Signer),
+		Kid:      witKey.Kid,
+		NotAfter: witKey.NotAfter,
+	}
+}
+
 func (m *managerTest) getSignerInfo(signer crypto.Signer) signerInfo {
 	ks, ok := signer.(interface{ ID() string })
 	require.True(m.t, ok, "signer is not a Key Manager")
@@ -1113,11 +2058,26 @@ func (m *managerTest) getSignerInfo(signer crypto.Signer) signerInfo {
 	}
 }
 
-func (m *managerTest) requireBundleRootCAs(ctx context.Context, t *testing.T, rootCAs ...*x509.Certificate) {
+func (m *managerTest) requireIntermediateRootCA(ctx context.Context, t *testing.T, rootCAs ...*x509.Certificate) {
 	expected := &common.Bundle{}
 	for _, rootCA := range rootCAs {
 		expected.RootCas = append(expected.RootCas, &common.Certificate{
 			DerBytes: rootCA.Raw,
+		})
+	}
+
+	bundle := m.fetchBundle(ctx)
+	spiretest.RequireProtoEqual(t, expected, &common.Bundle{
+		RootCas: bundle.RootCas,
+	})
+}
+
+func (m *managerTest) requireBundleRootCAs(ctx context.Context, t *testing.T, rootCAs ...*x509certificate.X509Authority) {
+	expected := &common.Bundle{}
+	for _, rootCA := range rootCAs {
+		expected.RootCas = append(expected.RootCas, &common.Certificate{
+			DerBytes:   rootCA.Certificate.Raw,
+			TaintedKey: rootCA.Tainted,
 		})
 	}
 
@@ -1138,6 +2098,20 @@ func (m *managerTest) requireBundleJWTKeys(ctx context.Context, t *testing.T, jw
 	bundle := m.fetchBundle(ctx)
 	spiretest.RequireProtoEqual(t, expected, &common.Bundle{
 		JwtSigningKeys: bundle.JwtSigningKeys,
+	})
+}
+
+func (m *managerTest) requireBundleWITKeys(ctx context.Context, t *testing.T, witKeys ...*ca.WITKey) {
+	expected := &common.Bundle{}
+	for _, witKey := range witKeys {
+		publicKey, err := publicKeyFromWITKey(witKey)
+		require.NoError(m.t, err)
+		expected.WitSigningKeys = append(expected.WitSigningKeys, publicKey)
+	}
+
+	bundle := m.fetchBundle(ctx)
+	spiretest.RequireProtoEqual(t, expected, &common.Bundle{
+		WitSigningKeys: bundle.WitSigningKeys,
 	})
 }
 
@@ -1179,6 +2153,15 @@ func (m *managerTest) currentJWTKeyStatus() journal.Status {
 	return m.m.currentJWTKey.status
 }
 
+func (m *managerTest) currentWITKey() *ca.WITKey {
+	m.requireWITKeyEqual(m.t, m.m.currentWITKey.witKey, m.ca.WITKey(), "current WITKey is not active")
+	return m.m.currentWITKey.witKey
+}
+
+func (m *managerTest) currentWITKeyStatus() journal.Status {
+	return m.m.currentWITKey.status
+}
+
 func (m *managerTest) nextX509CA() *ca.X509CA {
 	return m.m.nextX509CA.x509CA
 }
@@ -1195,6 +2178,14 @@ func (m *managerTest) nextJWTKeyStatus() journal.Status {
 	return m.m.nextJWTKey.status
 }
 
+func (m *managerTest) nextWITKey() *ca.WITKey {
+	return m.m.nextWITKey.witKey
+}
+
+func (m *managerTest) nextWITKeyStatus() journal.Status {
+	return m.m.nextWITKey.status
+}
+
 func (m *managerTest) setTimeAndPrune(t time.Time) {
 	m.clock.Set(t)
 	require.NoError(m.t, m.m.PruneBundle(context.Background()))
@@ -1206,10 +2197,6 @@ func (m *managerTest) addTimeAndPrune(d time.Duration) {
 }
 
 func (m *managerTest) wipeJournal(t *testing.T) {
-	// TODO: journal saved on this will no longer be supported in v1.10. Remove
-	// this.
-	require.NoError(t, os.Remove(filepath.Join(m.m.c.Dir, "journal.pem")))
-
 	// Have a clean datastore.
 	m.ds = fakedatastore.New(t)
 	m.cat.SetDataStore(m.ds)
@@ -1225,7 +2212,7 @@ func (m *managerTest) waitForBundleUpdatedNotification(ctx context.Context, ch <
 	}
 }
 
-func (m *managerTest) countLogEntries(level logrus.Level, message string) int {
+func (m *managerTest) countLogEntries(level logrus.Level, message string) int { //nolint:unparam
 	count := 0
 	for _, e := range m.logHook.AllEntries() {
 		if e.Message == message && level == e.Level {
@@ -1254,6 +2241,9 @@ type fakeCA struct {
 	mu     sync.Mutex
 	x509CA *ca.X509CA
 	jwtKey *ca.JWTKey
+	witKey *ca.WITKey
+
+	taintedAuthoritiesCh chan []*x509.Certificate
 }
 
 func (s *fakeCA) X509CA() *ca.X509CA {
@@ -1278,4 +2268,47 @@ func (s *fakeCA) SetJWTKey(jwtKey *ca.JWTKey) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.jwtKey = jwtKey
+}
+
+func (s *fakeCA) WITKey() *ca.WITKey {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.witKey
+}
+
+func (s *fakeCA) SetWITKey(witKey *ca.WITKey) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.witKey = witKey
+}
+
+func (s *fakeCA) NotifyTaintedX509Authorities(taintedAuthorities []*x509.Certificate) {
+	s.taintedAuthoritiesCh <- taintedAuthorities
+}
+
+type fakeCC struct {
+	catalog.PluginInfo
+
+	policies []x509.OID
+}
+
+func (cc fakeCC) ComposeServerX509CA(_ context.Context, attributes credentialcomposer.X509CAAttributes) (credentialcomposer.X509CAAttributes, error) {
+	attributes.Policies = append(attributes.Policies, cc.policies...)
+	return attributes, nil
+}
+
+func (cc fakeCC) ComposeServerX509SVID(_ context.Context, attributes credentialcomposer.X509SVIDAttributes) (credentialcomposer.X509SVIDAttributes, error) {
+	return attributes, nil
+}
+
+func (cc fakeCC) ComposeAgentX509SVID(_ context.Context, _ spiffeid.ID, _ crypto.PublicKey, attributes credentialcomposer.X509SVIDAttributes) (credentialcomposer.X509SVIDAttributes, error) {
+	return attributes, nil
+}
+
+func (cc fakeCC) ComposeWorkloadX509SVID(_ context.Context, _ spiffeid.ID, _ crypto.PublicKey, attributes credentialcomposer.X509SVIDAttributes) (credentialcomposer.X509SVIDAttributes, error) {
+	return attributes, nil
+}
+
+func (cc fakeCC) ComposeWorkloadJWTSVID(_ context.Context, _ spiffeid.ID, attributes credentialcomposer.JWTSVIDAttributes) (credentialcomposer.JWTSVIDAttributes, error) {
+	return attributes, nil
 }

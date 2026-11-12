@@ -12,6 +12,7 @@ import (
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	upstreamauthorityv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/plugin/server/upstreamauthority/v1"
 	plugintypes "github.com/spiffe/spire-plugin-sdk/proto/spire/plugin/types"
+	"github.com/spiffe/spire/pkg/common/coretypes/x509certificate"
 	"github.com/spiffe/spire/pkg/server/ca"
 	"github.com/spiffe/spire/pkg/server/credtemplate"
 	"github.com/spiffe/spire/proto/spire/common"
@@ -30,7 +31,7 @@ var (
 )
 
 func TestUpstreamClientMintX509CA_HandlesBundleUpdates(t *testing.T) {
-	client, updater, ua := setUpUpstreamClientTest(t, fakeupstreamauthority.Config{
+	client, updater, ua := setupUpstreamClientTest(t, fakeupstreamauthority.Config{
 		TrustDomain:     trustDomain,
 		UseIntermediate: true,
 	})
@@ -99,9 +100,8 @@ func TestUpstreamClientMintX509CA_FailsOnBadFirstResponse(t *testing.T) {
 			expectMsg:  "X509 CA minted by upstream authority is invalid: oh no",
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			client, _, _ := setUpUpstreamClientTest(t, fakeupstreamauthority.Config{
+			client, _, _ := setupUpstreamClientTest(t, fakeupstreamauthority.Config{
 				TrustDomain:              trustDomain,
 				MutateMintX509CAResponse: tt.mutate,
 			})
@@ -120,7 +120,7 @@ func TestUpstreamClientMintX509CA_FailsOnBadFirstResponse(t *testing.T) {
 }
 
 func TestUpstreamClientPublishJWTKey_HandlesBundleUpdates(t *testing.T) {
-	client, updater, ua := setUpUpstreamClientTest(t, fakeupstreamauthority.Config{
+	client, updater, ua := setupUpstreamClientTest(t, fakeupstreamauthority.Config{
 		TrustDomain: trustDomain,
 	})
 
@@ -141,7 +141,7 @@ func TestUpstreamClientPublishJWTKey_HandlesBundleUpdates(t *testing.T) {
 }
 
 func TestUpstreamClientPublishJWTKey_NotImplemented(t *testing.T) {
-	client, _, _ := setUpUpstreamClientTest(t, fakeupstreamauthority.Config{
+	client, _, _ := setupUpstreamClientTest(t, fakeupstreamauthority.Config{
 		TrustDomain:           trustDomain,
 		DisallowPublishJWTKey: true,
 	})
@@ -151,7 +151,87 @@ func TestUpstreamClientPublishJWTKey_NotImplemented(t *testing.T) {
 	require.Nil(t, jwtKeys)
 }
 
-func setUpUpstreamClientTest(t *testing.T, config fakeupstreamauthority.Config) (*ca.UpstreamClient, *fakeBundleUpdater, *fakeupstreamauthority.UpstreamAuthority) {
+func TestUpstreamClientPublishWITKey_HandlesBundleUpdates(t *testing.T) {
+	client, updater, ua := setupUpstreamClientTest(t, fakeupstreamauthority.Config{
+		TrustDomain: trustDomain,
+	})
+
+	key1 := makePublicKey(t, "KEY1")
+	key2 := makePublicKey(t, "KEY2")
+
+	witKeys, err := client.PublishWITKey(context.Background(), key1)
+	require.NoError(t, err)
+	spiretest.RequireProtoListEqual(t, witKeys, ua.WITKeys())
+
+	// Assert that the initial bundle update happened.
+	spiretest.RequireProtoListEqual(t, []*common.PublicKey{key1}, updater.WaitForAppendedWITKeys(t))
+
+	// Now trigger an update to the bundle by appending another key and wait
+	// for the bundle to receive the update.
+	ua.AppendWITKey(key2)
+	spiretest.RequireProtoListEqual(t, []*common.PublicKey{key1, key2}, updater.WaitForAppendedWITKeys(t))
+}
+
+func TestUpstreamClientPublishWITKey_NotImplemented(t *testing.T) {
+	client, _, _ := setupUpstreamClientTest(t, fakeupstreamauthority.Config{
+		TrustDomain:           trustDomain,
+		DisallowPublishWITKey: true,
+	})
+
+	witKeys, err := client.PublishWITKey(context.Background(), makePublicKey(t, "KEY"))
+	spiretest.RequireGRPCStatus(t, err, codes.Unimplemented, "upstreamauthority(fake): disallowed")
+	require.Nil(t, witKeys)
+}
+
+func TestUpstreamClientSubscribeToLocalBundle(t *testing.T) {
+	client, updater, ua := setupUpstreamClientTest(t, fakeupstreamauthority.Config{
+		TrustDomain:               trustDomain,
+		UseSubscribeToLocalBundle: true,
+	})
+
+	err := client.SubscribeToLocalBundle(t.Context())
+	require.NoError(t, err)
+
+	// We should get an update with the initial CA and a list of empty JWT and
+	// WIT keys since the fakeupstreamauthority does not create them by default.
+	require.Equal(t, ua.X509Roots(), updater.WaitForAppendedX509Roots(t))
+	require.Empty(t, updater.WaitForAppendedJWTKeys(t))
+	require.Empty(t, updater.WaitForAppendedWITKeys(t))
+
+	// Trigger an update to the upstream bundle by rotating the root
+	// certificate and wait for the bundle updater to receive the update.
+	ua.RotateX509CA()
+	require.Equal(t, ua.X509Roots(), updater.WaitForAppendedX509Roots(t))
+	require.Empty(t, updater.WaitForAppendedJWTKeys(t))
+	require.Empty(t, updater.WaitForAppendedWITKeys(t))
+
+	key1 := makePublicKey(t, "KEY1")
+	ua.AppendJWTKey(key1)
+	require.Equal(t, ua.X509Roots(), updater.WaitForAppendedX509Roots(t))
+	spiretest.RequireProtoListEqual(t, []*common.PublicKey{key1}, updater.WaitForAppendedJWTKeys(t))
+	require.Empty(t, updater.WaitForAppendedWITKeys(t))
+
+	// Trigger an update to the upstream bundle by rotating the root
+	// certificate and wait for the bundle updater to receive the update.
+	ua.RotateX509CA()
+	require.Equal(t, ua.X509Roots(), updater.WaitForAppendedX509Roots(t))
+	spiretest.RequireProtoListEqual(t, []*common.PublicKey{key1}, updater.WaitForAppendedJWTKeys(t))
+	require.Empty(t, updater.WaitForAppendedWITKeys(t))
+
+	key2 := makePublicKey(t, "KEY2")
+	ua.AppendJWTKey(key2)
+	require.Equal(t, ua.X509Roots(), updater.WaitForAppendedX509Roots(t))
+	spiretest.RequireProtoListEqual(t, []*common.PublicKey{key1, key2}, updater.WaitForAppendedJWTKeys(t))
+	require.Empty(t, updater.WaitForAppendedWITKeys(t))
+
+	witKey := makePublicKey(t, "WITKEY")
+	ua.AppendWITKey(witKey)
+	require.Equal(t, ua.X509Roots(), updater.WaitForAppendedX509Roots(t))
+	spiretest.RequireProtoListEqual(t, []*common.PublicKey{key1, key2}, updater.WaitForAppendedJWTKeys(t))
+	spiretest.RequireProtoListEqual(t, []*common.PublicKey{witKey}, updater.WaitForAppendedWITKeys(t))
+}
+
+func setupUpstreamClientTest(t *testing.T, config fakeupstreamauthority.Config) (*ca.UpstreamClient, *fakeBundleUpdater, *fakeupstreamauthority.UpstreamAuthority) {
 	plugin, upstreamAuthority := fakeupstreamauthority.Load(t, config)
 	updater := newFakeBundleUpdater()
 
@@ -172,20 +252,22 @@ type bundleUpdateErr struct {
 }
 
 type fakeBundleUpdater struct {
-	x509RootsCh chan []*x509.Certificate
+	x509RootsCh chan []*x509certificate.X509Authority
 	jwtKeysCh   chan []*common.PublicKey
+	witKeysCh   chan []*common.PublicKey
 	errorCh     chan bundleUpdateErr
 }
 
 func newFakeBundleUpdater() *fakeBundleUpdater {
 	return &fakeBundleUpdater{
-		x509RootsCh: make(chan []*x509.Certificate, 1),
+		x509RootsCh: make(chan []*x509certificate.X509Authority, 1),
 		jwtKeysCh:   make(chan []*common.PublicKey, 1),
+		witKeysCh:   make(chan []*common.PublicKey, 1),
 		errorCh:     make(chan bundleUpdateErr, 1),
 	}
 }
 
-func (u *fakeBundleUpdater) AppendX509Roots(ctx context.Context, x509Roots []*x509.Certificate) error {
+func (u *fakeBundleUpdater) SyncX509Roots(ctx context.Context, x509Roots []*x509certificate.X509Authority) error {
 	select {
 	case u.x509RootsCh <- x509Roots:
 		return nil
@@ -194,7 +276,7 @@ func (u *fakeBundleUpdater) AppendX509Roots(ctx context.Context, x509Roots []*x5
 	}
 }
 
-func (u *fakeBundleUpdater) WaitForAppendedX509Roots(t *testing.T) []*x509.Certificate {
+func (u *fakeBundleUpdater) WaitForAppendedX509Roots(t *testing.T) []*x509certificate.X509Authority {
 	select {
 	case <-time.After(time.Minute):
 		require.FailNow(t, "timed out waiting for X.509 roots to be appended")
@@ -220,6 +302,25 @@ func (u *fakeBundleUpdater) WaitForAppendedJWTKeys(t *testing.T) []*common.Publi
 		return nil // unreachable
 	case jwtKeys := <-u.jwtKeysCh:
 		return jwtKeys
+	}
+}
+
+func (u *fakeBundleUpdater) AppendWITKeys(ctx context.Context, witKeys []*common.PublicKey) ([]*common.PublicKey, error) {
+	select {
+	case u.witKeysCh <- witKeys:
+		return witKeys, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (u *fakeBundleUpdater) WaitForAppendedWITKeys(t *testing.T) []*common.PublicKey {
+	select {
+	case <-time.After(time.Minute):
+		require.FailNow(t, "timed out waiting for WIT keys to be appended")
+		return nil // unreachable
+	case witKeys := <-u.witKeysCh:
+		return witKeys
 	}
 }
 

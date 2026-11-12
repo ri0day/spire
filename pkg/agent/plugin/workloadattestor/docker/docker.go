@@ -3,28 +3,30 @@ package docker
 import (
 	"context"
 	"fmt"
-	"sort"
 	"strings"
 	"sync"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	dockerclient "github.com/docker/docker/client"
-	hclog "github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/hcl"
 	"github.com/hashicorp/hcl/hcl/token"
+	"github.com/moby/moby/api/types/container"
+	dockerclient "github.com/moby/moby/client"
 	workloadattestorv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/plugin/agent/workloadattestor/v1"
 	configv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/service/common/config/v1"
+	"github.com/spiffe/spire/pkg/agent/common/sigstore"
 	"github.com/spiffe/spire/pkg/common/catalog"
+	"github.com/spiffe/spire/pkg/common/pluginconf"
+	"github.com/spiffe/spire/pkg/common/telemetry"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
 const (
-	pluginName         = "docker"
-	subselectorLabel   = "label"
-	subselectorImageID = "image_id"
-	subselectorEnv     = "env"
+	pluginName                   = "docker"
+	subselectorLabel             = "label"
+	subselectorImageID           = "image_id"
+	subselectorEnv               = "env"
+	subselectorImageConfigDigest = "image_config_digest"
 )
 
 func BuiltIn() catalog.BuiltIn {
@@ -40,7 +42,13 @@ func builtin(p *Plugin) catalog.BuiltIn {
 
 // Docker is a subset of the docker client functionality, useful for mocking.
 type Docker interface {
-	ContainerInspect(ctx context.Context, containerID string) (types.ContainerJSON, error)
+	ContainerInspect(ctx context.Context, containerID string, options dockerclient.ContainerInspectOptions) (dockerclient.ContainerInspectResult, error)
+	ImageInspect(ctx context.Context, imageID string, inspectOpts ...dockerclient.ImageInspectOption) (dockerclient.ImageInspectResult, error)
+}
+
+type podmanDocker interface {
+	Docker
+	Close() error
 }
 
 type Plugin struct {
@@ -50,15 +58,24 @@ type Plugin struct {
 	log     hclog.Logger
 	retryer *retryer
 
-	mtx    sync.RWMutex
-	docker Docker
-	c      *containerHelper
+	mtx                 sync.RWMutex
+	docker              Docker
+	c                   *containerHelper
+	sigstoreVerifier    sigstore.Verifier
+	podmanClientFactory func(socketPath string) (podmanDocker, error)
 }
 
 func New() *Plugin {
 	return &Plugin{
-		retryer: newRetryer(),
+		retryer:             newRetryer(),
+		podmanClientFactory: defaultPodmanClientFactory,
 	}
+}
+
+func defaultPodmanClientFactory(socketPath string) (podmanDocker, error) {
+	return dockerclient.New(
+		dockerclient.WithHost(socketPath),
+	)
 }
 
 type dockerPluginConfig struct {
@@ -68,6 +85,43 @@ type dockerPluginConfig struct {
 	DockerVersion string `hcl:"docker_version" json:"docker_version"`
 
 	UnusedKeyPositions map[string][]token.Pos `hcl:",unusedKeyPositions"`
+
+	// Sigstore contains sigstore specific configs.
+	Sigstore *sigstore.HCLConfig `hcl:"sigstore,omitempty" json:"sigstore"`
+
+	containerHelper *containerHelper
+	dockerOpts      []dockerclient.Opt
+	sigstoreConfig  *sigstore.Config
+}
+
+func (p *Plugin) buildConfig(coreConfig catalog.CoreConfig, hclText string, status *pluginconf.Status) *dockerPluginConfig {
+	var err error
+	newConfig := &dockerPluginConfig{}
+	if err = hcl.Decode(newConfig, hclText); err != nil {
+		status.ReportErrorf("unable to decode configuration: %v", err)
+		return nil
+	}
+
+	pluginconf.ReportUnusedKeys(status, newConfig.UnusedKeyPositions)
+
+	newConfig.containerHelper = p.createHelper(newConfig, status)
+
+	dockerHost := getDockerHost(newConfig)
+	if dockerHost != "" {
+		newConfig.dockerOpts = append(newConfig.dockerOpts, dockerclient.WithHost(dockerHost))
+	}
+	if newConfig.DockerVersion != "" {
+		newConfig.dockerOpts = append(newConfig.dockerOpts, dockerclient.WithAPIVersion(newConfig.DockerVersion))
+	}
+
+	if newConfig.Sigstore != nil {
+		if err := newConfig.Sigstore.Validate(); err != nil {
+			status.ReportError(err.Error())
+		}
+		newConfig.sigstoreConfig = sigstore.NewConfigFromHCL(newConfig.Sigstore, p.log)
+	}
+
+	return newConfig
 }
 
 func (p *Plugin) SetLogger(log hclog.Logger) {
@@ -78,7 +132,7 @@ func (p *Plugin) Attest(ctx context.Context, req *workloadattestorv1.AttestReque
 	p.mtx.RLock()
 	defer p.mtx.RUnlock()
 
-	containerID, err := p.c.getContainerID(req.Pid, p.log)
+	containerID, podmanSocket, err := p.c.getContainerIDAndSocket(req.Pid, p.log)
 	switch {
 	case err != nil:
 		return nil, err
@@ -87,21 +141,84 @@ func (p *Plugin) Attest(ctx context.Context, req *workloadattestorv1.AttestReque
 		return &workloadattestorv1.AttestResponse{}, nil
 	}
 
-	var container types.ContainerJSON
-	err = p.retryer.Retry(ctx, func() error {
-		container, err = p.docker.ContainerInspect(ctx, containerID)
+	client := p.docker
+	if podmanSocket != "" {
+		podmanClient, err := p.podmanClientFactory(podmanSocket)
 		if err != nil {
-			return err
+			return nil, fmt.Errorf("unable to create Podman client for socket %q: %w", podmanSocket, err)
 		}
-		return nil
+		defer func() {
+			if closeErr := podmanClient.Close(); closeErr != nil {
+				p.log.Warn("Failed to close Podman client", telemetry.Error, closeErr)
+			}
+		}()
+		client = podmanClient
+	}
+
+	var containerResult dockerclient.ContainerInspectResult
+	err = p.retryer.Retry(ctx, func() error {
+		containerResult, err = client.ContainerInspect(ctx, containerID, dockerclient.ContainerInspectOptions{})
+		return err
 	})
 	if err != nil {
 		return nil, err
 	}
 
+	selectors := getSelectorValuesFromConfig(containerResult.Container.Config)
+
+	var imageJSON dockerclient.ImageInspectResult
+	var inspectErr error
+	imageName := containerResult.Container.Config.Image
+	if imageName != "" || p.sigstoreVerifier != nil {
+		imageJSON, inspectErr = client.ImageInspect(ctx, imageName)
+	}
+
+	// Add image_config_digest selector
+	if inspectErr == nil && imageJSON.ID != "" {
+		selectors = append(selectors, fmt.Sprintf("%s:%s", subselectorImageConfigDigest, imageJSON.ID))
+	}
+
+	if p.sigstoreVerifier != nil {
+		if inspectErr != nil {
+			return nil, fmt.Errorf("failed to inspect image %q: %w", imageName, inspectErr)
+		}
+
+		if len(imageJSON.RepoDigests) == 0 {
+			return nil, fmt.Errorf("sigstore signature verification failed: no repo digest found for image %s", imageName)
+		}
+
+		var verified bool
+		// RepoDigests is a list of content-addressable digests of locally available
+		// image manifests that the image is referenced from. Multiple manifests can
+		// refer to the same image.
+		var allErrors []string
+		for _, digest := range imageJSON.RepoDigests {
+			sigstoreSelectors, err := p.sigstoreVerifier.Verify(ctx, digest)
+			if err != nil {
+				p.log.Warn("Error verifying sigstore image signature", telemetry.ImageID, digest, telemetry.Error, err)
+				allErrors = append(allErrors, fmt.Sprintf("%s %s: %v", telemetry.ImageID, digest, err))
+				continue
+			}
+			selectors = append(selectors, sigstoreSelectors...)
+			verified = true
+			break
+		}
+
+		if !verified {
+			return nil, fmt.Errorf("sigstore signature verification failed for image %s: %v", imageName, fmt.Sprintf("errors: %s", strings.Join(allErrors, "; ")))
+		}
+	}
+
 	return &workloadattestorv1.AttestResponse{
-		SelectorValues: getSelectorValuesFromConfig(container.Config),
+		SelectorValues: selectors,
 	}, nil
+}
+
+// AttestReference returns Unimplemented. This plugin does not handle
+// reference-based workload attestation; the host falls back to PID-based
+// Attest when the reference is a WorkloadPIDReference.
+func (p *Plugin) AttestReference(_ context.Context, _ *workloadattestorv1.AttestReferenceRequest) (*workloadattestorv1.AttestReferenceResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "AttestReference not implemented")
 }
 
 func getSelectorValuesFromConfig(cfg *container.Config) []string {
@@ -118,48 +235,42 @@ func getSelectorValuesFromConfig(cfg *container.Config) []string {
 	return selectorValues
 }
 
-func (p *Plugin) Configure(_ context.Context, req *configv1.ConfigureRequest) (*configv1.ConfigureResponse, error) {
-	var err error
-	config := &dockerPluginConfig{}
-	if err = hcl.Decode(config, req.HclConfiguration); err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "unable to decode configuration: %v", err)
+func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) (*configv1.ConfigureResponse, error) {
+	newConfig, _, err := pluginconf.Build(req, p.buildConfig)
+	if err != nil {
+		return nil, err
 	}
 
-	if len(config.UnusedKeyPositions) > 0 {
-		var keys []string
-		for k := range config.UnusedKeyPositions {
-			keys = append(keys, k)
+	docker, err := dockerclient.New(newConfig.dockerOpts...)
+	if err != nil {
+		return nil, err
+	}
+
+	var sigstoreVerifier sigstore.Verifier
+	if newConfig.sigstoreConfig != nil {
+		verifier := sigstore.NewVerifier(newConfig.sigstoreConfig)
+		err = verifier.Init(ctx)
+		if err != nil {
+			_ = docker.Close()
+			return nil, status.Errorf(codes.InvalidArgument, "error initializing sigstore verifier: %v", err)
 		}
-
-		sort.Strings(keys)
-		return nil, status.Errorf(codes.InvalidArgument, "unknown configurations detected: %s", strings.Join(keys, ","))
-	}
-
-	containerHelper, err := createHelper(config)
-	if err != nil {
-		return nil, err
-	}
-
-	var opts []dockerclient.Opt
-	dockerHost := getDockerHost(config)
-	if dockerHost != "" {
-		opts = append(opts, dockerclient.WithHost(dockerHost))
-	}
-	switch {
-	case config.DockerVersion != "":
-		opts = append(opts, dockerclient.WithVersion(config.DockerVersion))
-	default:
-		opts = append(opts, dockerclient.WithAPIVersionNegotiation())
-	}
-
-	docker, err := dockerclient.NewClientWithOpts(opts...)
-	if err != nil {
-		return nil, err
+		sigstoreVerifier = verifier
 	}
 
 	p.mtx.Lock()
 	defer p.mtx.Unlock()
 	p.docker = docker
-	p.c = containerHelper
+	p.c = newConfig.containerHelper
+	p.sigstoreVerifier = sigstoreVerifier
+
 	return &configv1.ConfigureResponse{}, nil
+}
+
+func (p *Plugin) Validate(_ context.Context, req *configv1.ValidateRequest) (*configv1.ValidateResponse, error) {
+	_, notes, err := pluginconf.Build(req, p.buildConfig)
+
+	return &configv1.ValidateResponse{
+		Valid: err == nil,
+		Notes: notes,
+	}, nil
 }
